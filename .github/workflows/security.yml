@@ -82,6 +82,7 @@ jobs:
 
   codeql-rust:
     name: CodeQL Rust
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
