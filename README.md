@@ -1,12 +1,14 @@
-# Rayline
+# Rayline Local
 
-Rayline is a command-line tool that runs on your machine and sits between your
-coding agent and the AI models it talks to, deciding where each request should
-go. It provides the `rayline` CLI and `rld` daemon for local passthrough,
-selective subagent routing, local model support, and update checks.
+Rayline Local is the open-source local router in the broader Rayline stack. It
+runs on your machine and sits between your coding agent and the AI models it
+talks to, deciding where each request should go. It provides the `rayline` CLI
+and `rld` daemon for local passthrough, selective subagent routing, local model
+support, and update checks.
 
-Rayline defaults to local operation. Local-router-only use does not require a
-hosted Rayline account and does not connect to any remote Rayline service.
+This repository contains the Rayline Local router. Local-router-only use does
+not require a hosted Rayline account and does not connect to any remote Rayline
+service.
 
 ## How It Works
 
