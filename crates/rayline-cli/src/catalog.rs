@@ -20,24 +20,6 @@ use serde_json::{Value, json};
 
 const REGISTRY_PROD_URL: &str = "https://registry.rayline.ai/models.json";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Local-model families the cloud router actually delegates to. A model outside
-/// these families runs locally but never receives a routed request, so the CLI
-/// refuses to configure one.
-pub const ELIGIBLE_LOCAL_MODEL_PREFIXES: &[&str] = &[
-    "qwen3.6-35b-a3b-",
-    "qwen3.6-27b-",
-    "qwen3.5-35b-a3b-",
-    "gemma4-31b-",
-];
-
-/// Whether the router would delegate to a local model advertised as
-/// `model_id` (matches the router's lowercase prefix check).
-pub fn is_eligible_local_model(model_id: &str) -> bool {
-    let lower = model_id.to_lowercase();
-    ELIGIBLE_LOCAL_MODEL_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-}
 
 /// Context budgets mirroring the desktop's `recommendedContextLength`:
 /// 64K tokens on <=16 GB machines, 128K above.
@@ -53,6 +35,8 @@ pub struct CatalogModel {
     pub name: String,
     pub repo: String,
     pub filename: String,
+    pub revision: String,
+    pub sha256: String,
     pub size_bytes: u64,
     pub base_ram_bytes: u64,
     pub kv_cache_bytes_per_token: u64,
@@ -95,13 +79,11 @@ impl Fit {
 }
 
 /// Fetch the registry catalog and keep only the entries curated for this CLI,
-/// smallest first. Falls back to the bundled list whenever the registry is
-/// unreachable, malformed, or has no curated entries — the picker always
-/// works, and registry plumbing never leaks into user-facing output (the same
-/// graceful degradation as the desktop's bundled-catalog fallback). Multi-file
-/// (sharded) entries are skipped — the download path handles a single GGUF.
-/// `RAYLINE_MODELS_REGISTRY_URL` overrides the registry URL (testing against a
-/// local/staged catalog).
+/// smallest first. Entries without registry-provided revision/SHA pins are
+/// ignored, because curated downloads must be verifiable without embedding a
+/// model allowlist in the binary. Multi-file (sharded) entries are skipped —
+/// the download path handles a single GGUF. `RAYLINE_MODELS_REGISTRY_URL`
+/// overrides the registry URL (testing against a local/staged catalog).
 pub async fn fetch_curated(env_name: &str) -> Vec<CatalogModel> {
     match try_fetch_curated(env_name).await {
         Ok(models) if !models.is_empty() => models,
@@ -136,53 +118,12 @@ async fn try_fetch_curated(env_name: &str) -> Result<Vec<CatalogModel>, String> 
     Ok(parse_curated(&body))
 }
 
-/// Bundled subset of the curated catalog, used until the registry lists
-/// curated entries (and offline). Values mirror the matching entries in
-/// src/lib/local-models/catalog.ts — keep them in sync when retagging.
+/// There is intentionally no embedded trust fallback: model revision/SHA pins
+/// live in the registry so new curated models can be added without a CLI
+/// release. If the registry is unavailable or missing pins, the recommended
+/// picker shows no download candidates instead of starting an unverified model.
 fn fallback_curated() -> Vec<CatalogModel> {
-    vec![
-        CatalogModel {
-            id: "qwen3.6-27b-iq3xxs".to_owned(),
-            name: "Qwen3.6 27B (IQ3_XXS)".to_owned(),
-            repo: "unsloth/Qwen3.6-27B-GGUF".to_owned(),
-            filename: "Qwen3.6-27B-UD-IQ3_XXS.gguf".to_owned(),
-            size_bytes: 11_994_777_824,
-            base_ram_bytes: 13_194_000_000,
-            kv_cache_bytes_per_token: 65_536,
-            max_context_window: 262_144,
-            quality_score: 74,
-            description: "Compact Qwen3.6 27B. Fits tighter RAM budgets with some quality trade-off."
-                .to_owned(),
-        },
-        CatalogModel {
-            id: "qwen3.6-27b-q4km".to_owned(),
-            name: "Qwen3.6 27B (Q4_K_M)".to_owned(),
-            repo: "unsloth/Qwen3.6-27B-GGUF".to_owned(),
-            filename: "Qwen3.6-27B-Q4_K_M.gguf".to_owned(),
-            size_bytes: 16_817_244_384,
-            base_ram_bytes: 18_499_000_000,
-            kv_cache_bytes_per_token: 65_536,
-            max_context_window: 262_144,
-            quality_score: 81,
-            description:
-                "Best quality/size Qwen3.6 27B balance. Flagship agentic coding for 24GB+ machines."
-                    .to_owned(),
-        },
-        CatalogModel {
-            id: "qwen3.6-35b-a3b-q4km".to_owned(),
-            name: "Qwen3.6 35B A3B (Q4_K_M)".to_owned(),
-            repo: "unsloth/Qwen3.6-35B-A3B-GGUF".to_owned(),
-            filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".to_owned(),
-            size_bytes: 22_134_528_992,
-            base_ram_bytes: 24_348_000_000,
-            kv_cache_bytes_per_token: 20_480,
-            max_context_window: 262_144,
-            quality_score: 76,
-            description:
-                "Best quality/size Qwen3.6 MoE balance. Improved agentic coding. Recommended for 32GB+."
-                    .to_owned(),
-        },
-    ]
+    Vec::new()
 }
 
 fn registry_url(_env_name: &str) -> &'static str {
@@ -203,18 +144,21 @@ fn parse_curated(body: &Value) -> Vec<CatalogModel> {
                 && entry.get("shardedFilenames").is_none()
         })
         .filter_map(parse_model)
-        .filter(|model| is_eligible_local_model(&model.id))
         .collect::<Vec<_>>();
     models.sort_by_key(|model| model.base_ram_bytes);
     models
 }
 
 fn parse_model(entry: &Value) -> Option<CatalogModel> {
+    let revision = parse_revision(entry)?;
+    let sha256 = parse_sha256(entry)?;
     Some(CatalogModel {
-        id: entry.get("id")?.as_str()?.to_owned(),
-        name: entry.get("name")?.as_str()?.to_owned(),
-        repo: entry.get("repo")?.as_str()?.to_owned(),
-        filename: entry.get("filename")?.as_str()?.to_owned(),
+        id: string_field(entry, "id")?,
+        name: string_field(entry, "name")?,
+        repo: string_field(entry, "repo")?,
+        filename: string_field(entry, "filename")?,
+        revision,
+        sha256,
         size_bytes: entry.get("sizeBytes")?.as_u64()?,
         base_ram_bytes: entry.get("baseRamBytes")?.as_u64()?,
         kv_cache_bytes_per_token: entry.get("kvCacheBytesPerToken")?.as_u64()?,
@@ -222,6 +166,31 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
         quality_score: entry.get("qualityScore")?.as_u64()?,
         description: entry.get("description")?.as_str()?.to_owned(),
     })
+}
+
+fn string_field(entry: &Value, field: &str) -> Option<String> {
+    let value = entry.get(field)?.as_str()?.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn parse_revision(entry: &Value) -> Option<String> {
+    let revision = entry
+        .get("revision")
+        .or_else(|| entry.get("hfRevision"))?
+        .as_str()?
+        .trim();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(revision.to_ascii_lowercase())
+}
+
+fn parse_sha256(entry: &Value) -> Option<String> {
+    let digest = entry
+        .get("sha256")
+        .or_else(|| entry.get("digest"))?
+        .as_str()?;
+    rayline_hf::normalize_sha256(digest).ok()
 }
 
 /// RAM the model needs at the context length this machine would run it with.
@@ -334,7 +303,8 @@ fn detect_total_ram_uncached() -> Option<u64> {
     }
 }
 
-/// Whether the model's GGUF is present in the HF hub cache (any snapshot).
+/// Whether the model's GGUF is present in the HF hub cache at its pinned
+/// revision and with its expected digest.
 pub fn is_downloaded(model: &CatalogModel) -> bool {
     downloaded_path(model).is_some()
 }
@@ -361,10 +331,14 @@ fn choose_auto_pick(downloaded: Vec<CatalogModel>, total_ram: Option<u64>) -> Op
 }
 
 fn downloaded_path(model: &CatalogModel) -> Option<PathBuf> {
-    rayline_hf::scan_hf_cache_gguf()
-        .into_iter()
-        .find(|entry| entry.repo == model.repo && entry.filename == model.filename)
-        .map(|entry| entry.path)
+    rayline_hf::verified_hf_cache_file(
+        &model.repo,
+        &model.filename,
+        &model.revision,
+        Some(&model.sha256),
+    )
+    .ok()
+    .flatten()
 }
 
 /// A curated model annotated with this machine's status, for `local models`.
@@ -537,15 +511,10 @@ pub async fn download(model: &CatalogModel, json: bool) -> Result<PathBuf, Strin
         );
     }
 
-    let commit = {
-        let repo = model.repo.clone();
-        tokio::task::spawn_blocking(move || rayline_hf::hf_api_get_commit(&repo))
-            .await
-            .map_err(|error| format!("download task failed: {error}"))??
-    };
-
     let repo = model.repo.clone();
     let filename = model.filename.clone();
+    let revision = model.revision.clone();
+    let sha256 = model.sha256.clone();
     let path = tokio::task::spawn_blocking(move || {
         let callback = |progress: rayline_hf::DownloadProgress| {
             if json {
@@ -565,7 +534,8 @@ pub async fn download(model: &CatalogModel, json: bool) -> Result<PathBuf, Strin
         rayline_hf::download_to_hf_cache(
             &repo,
             &filename,
-            &commit,
+            &revision,
+            Some(&sha256),
             Some(&callback),
             "model",
             None,
@@ -812,6 +782,8 @@ mod tests {
             "name": id,
             "repo": "example/repo",
             "filename": "model.gguf",
+            "revision": "ffffffffffffffffffffffffffffffffffffffff",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "sizeBytes": 1,
             "baseRamBytes": base_ram_bytes,
             "kvCacheBytesPerToken": 1,
@@ -823,10 +795,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_curated_filters_router_ineligible_models() {
+    fn parse_curated_trusts_pinned_registry_curated_entries() {
         let body = json!({
             "models": [
-                registry_model("not-router-eligible", 1),
+                registry_model("qwen2.5-coder-7b-q5km", 1),
                 registry_model("qwen3.6-27b-q4km", 2),
             ],
         });
@@ -838,7 +810,106 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["qwen3.6-27b-q4km"]
+            vec!["qwen2.5-coder-7b-q5km", "qwen3.6-27b-q4km"]
         );
+    }
+
+    #[test]
+    fn parse_curated_uses_registry_revision_and_sha_for_dynamic_model() {
+        let body = json!({ "models": [registry_model("qwen3.6-27b-new", 2)] });
+
+        let models = parse_curated(&body);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3.6-27b-new");
+        assert_eq!(models[0].repo, "example/repo");
+        assert_eq!(models[0].filename, "model.gguf");
+        assert_eq!(
+            models[0].revision,
+            "ffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            models[0].sha256,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn parse_curated_rejects_entry_without_registry_revision_or_sha() {
+        let mut model = registry_model("qwen3.6-27b-q4km", 2);
+        let object = model.as_object_mut().unwrap();
+        object.remove("revision");
+        object.remove("sha256");
+        let body = json!({ "models": [model] });
+
+        let models = parse_curated(&body);
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn parse_curated_rejects_invalid_registry_revision_or_sha() {
+        let mut bad_revision = registry_model("qwen3.6-27b-bad-revision", 1);
+        bad_revision
+            .as_object_mut()
+            .unwrap()
+            .insert("revision".to_owned(), Value::String("main".to_owned()));
+        let mut bad_sha = registry_model("qwen3.6-27b-bad-sha", 2);
+        bad_sha
+            .as_object_mut()
+            .unwrap()
+            .insert("sha256".to_owned(), Value::String("bad".to_owned()));
+        let body = json!({ "models": [bad_revision, bad_sha] });
+
+        let models = parse_curated(&body);
+
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn parse_curated_accepts_prefixed_registry_sha_and_revision_alias() {
+        let mut model = registry_model("qwen3.6-27b-q4km", 2);
+        let object = model.as_object_mut().unwrap();
+        object.remove("revision");
+        object.insert(
+            "hfRevision".to_owned(),
+            Value::String("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".to_owned()),
+        );
+        object.insert(
+            "sha256".to_owned(),
+            Value::String(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            ),
+        );
+        let body = json!({ "models": [model] });
+
+        let models = parse_curated(&body);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].revision,
+            "ffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            models[0].sha256,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn parse_curated_accepts_new_curated_model_when_registry_supplies_pins() {
+        let mut model = registry_model("qwen3.5-9b-q4km", 2);
+        model
+            .as_object_mut()
+            .unwrap()
+            .insert("filename".to_owned(), Value::String("new.gguf".to_owned()));
+        let body = json!({ "models": [model] });
+
+        let models = parse_curated(&body);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "qwen3.5-9b-q4km");
+        assert_eq!(models[0].filename, "new.gguf");
     }
 }

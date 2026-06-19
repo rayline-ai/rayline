@@ -5,7 +5,7 @@
 //!
 //! - **Recommended** (`mode: "recommended"`, legacy `"auto"`): the bundled
 //!   llama.cpp server run by the daemon, serving a model picked from the
-//!   curated catalog (`model_id`/`model_repo`/`model_file`). Without a pick
+//!   curated catalog (`model_id`/repo/file plus revision/SHA). Without a pick
 //!   the bundled default model applies.
 //! - **Custom** (`mode: "custom"`): the user's own Ollama / LM Studio /
 //!   llama.cpp server, specified by `base_url` + `model`.
@@ -61,7 +61,7 @@ pub struct SavedCustomEndpoint {
 }
 
 /// The stored `local_model` config. `base_url`/`model` are only meaningful in
-/// `Custom` mode and `model_id`/`model_repo`/`model_file` in `Recommended`
+/// `Custom` mode and model identity/trust metadata in `Recommended`
 /// mode, but each set is retained across a mode flip so the user can switch
 /// back without re-picking.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +75,10 @@ pub struct LocalModelConfig {
     pub model_repo: Option<String>,
     /// GGUF filename of the recommended pick.
     pub model_file: Option<String>,
+    /// HuggingFace revision/commit for the recommended pick.
+    pub model_revision: Option<String>,
+    /// Expected GGUF SHA256 for the recommended pick.
+    pub model_sha256: Option<String>,
     /// All saved custom endpoints, including a complete active `base_url`/
     /// `model` pair written by another Rayline client.
     pub custom_endpoints: Vec<SavedCustomEndpoint>,
@@ -82,7 +86,7 @@ pub struct LocalModelConfig {
 
 impl LocalModelConfig {
     /// Whether this config can actually drive `rayline claude` local routing.
-    /// Recommended needs an explicit pick (`model_repo` + `model_file`) —
+    /// Recommended needs an explicit verified pick (repo/file + revision/SHA) —
     /// there is deliberately NO bundled-default fallback. A pickless config
     /// (e.g. legacy `mode: "auto"`) is resolved at engagement time: the best
     /// already-downloaded curated model is adopted as the pick, else routing
@@ -96,9 +100,12 @@ impl LocalModelConfig {
         }
     }
 
-    /// Whether a Recommended-mode model has been picked.
+    /// Whether a Recommended-mode model has been picked with trust metadata.
     pub fn has_recommended_pick(&self) -> bool {
-        self.model_repo.is_some() && self.model_file.is_some()
+        self.model_repo.is_some()
+            && self.model_file.is_some()
+            && self.model_revision.is_some()
+            && self.model_sha256.is_some()
     }
 }
 
@@ -152,6 +159,8 @@ pub fn read_from_home(home: &Path) -> Option<LocalModelConfig> {
     let model_id = string_field("model_id");
     let model_repo = string_field("model_repo");
     let model_file = string_field("model_file");
+    let model_revision = string_field("model_revision");
+    let model_sha256 = string_field("model_sha256");
 
     let mode = match entry.get("mode").and_then(Value::as_str) {
         // "auto" predates the catalog picker; it means the same bundled-server
@@ -200,6 +209,8 @@ pub fn read_from_home(home: &Path) -> Option<LocalModelConfig> {
         model_id,
         model_repo,
         model_file,
+        model_revision,
+        model_sha256,
         custom_endpoints,
     })
 }
@@ -226,6 +237,8 @@ pub(crate) fn set_recommended_in_home(
         model_id: Some(model.id.clone()),
         model_repo: Some(model.repo.clone()),
         model_file: Some(model.filename.clone()),
+        model_revision: Some(model.revision.clone()),
+        model_sha256: Some(model.sha256.clone()),
         custom_endpoints: Vec::new(), // read-only mirror; never written
     };
     write_in_home(home, &config)?;
@@ -285,11 +298,9 @@ fn set_custom_in_home(
         Some(_) => None, // explicit empty --model clears the stored model
         None => existing.as_ref().and_then(|config| config.model.clone()),
     };
-    // No family allowlist here: custom endpoints use the legacy custom-route
-    // signal, and the router deliberately bypasses isEligibleLocalModel() for
-    // that path (the user has opted into an arbitrary model, for example
-    // Ollama `llama3:70b`).
-    // The allowlist only governs the recommended/bundled catalog path.
+    // No client-side family allowlist here: custom endpoints use the legacy
+    // custom-route signal, and curated registry entries are validated before
+    // publication.
 
     let config = LocalModelConfig {
         mode: LocalModelMode::Custom,
@@ -298,7 +309,9 @@ fn set_custom_in_home(
         // Preserve the recommended pick so flipping back needs no re-pick.
         model_id: existing.as_ref().and_then(|c| c.model_id.clone()),
         model_repo: existing.as_ref().and_then(|c| c.model_repo.clone()),
-        model_file: existing.and_then(|c| c.model_file),
+        model_file: existing.as_ref().and_then(|c| c.model_file.clone()),
+        model_revision: existing.as_ref().and_then(|c| c.model_revision.clone()),
+        model_sha256: existing.and_then(|c| c.model_sha256),
         custom_endpoints: Vec::new(), // read-only mirror; never written
     };
     write_in_home(home, &config).map_err(|error| format!("failed to write settings: {error}"))?;
@@ -319,6 +332,8 @@ pub(crate) fn activate_custom_endpoint_in_home(
         model_id: None,
         model_repo: None,
         model_file: None,
+        model_revision: None,
+        model_sha256: None,
         custom_endpoints: Vec::new(),
     });
     config.mode = LocalModelMode::Custom;
@@ -337,6 +352,8 @@ pub(crate) fn clear_recommended_pick_in_home(home: &Path) -> io::Result<()> {
     config.model_id = None;
     config.model_repo = None;
     config.model_file = None;
+    config.model_revision = None;
+    config.model_sha256 = None;
     write_in_home(home, &config)
 }
 
@@ -367,6 +384,8 @@ fn write_in_home(home: &Path, config: &LocalModelConfig) -> io::Result<()> {
         ("model_id", &config.model_id),
         ("model_repo", &config.model_repo),
         ("model_file", &config.model_file),
+        ("model_revision", &config.model_revision),
+        ("model_sha256", &config.model_sha256),
     ] {
         match value {
             Some(value) => entry.insert(key.to_owned(), Value::String(value.clone())),
