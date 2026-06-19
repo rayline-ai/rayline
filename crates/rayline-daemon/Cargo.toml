@@ -1,0 +1,36 @@
+[package]
+name = "rayline-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Rayline local-router runtime: llama-server + adapter + header-injector"
+
+[[bin]]
+name = "rld"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+rayline-hf = { path = "../rayline-hf" }
+rayline-llama = { path = "../rayline-llama" }
+rayline-metrics = { path = "../rayline-metrics" }
+rayline-local-router = { path = "../rayline-local-router" }
+rayline-adapter = { path = "../rayline-adapter" }
+rayline-injector = { path = "../rayline-injector" }
+rayline-proxy = { path = "../rayline-proxy" }
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots"] }
+
+[build-dependencies]
+serde_json.workspace = true

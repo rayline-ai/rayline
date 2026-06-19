@@ -1,0 +1,19 @@
+{
+  "endpoints": [
+    {
+      "id": "openrouter",
+      "protocol": "openai_chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "models": ["anthropic/claude-sonnet-4.6"]
+    }
+  ],
+  "routes": {
+    "subagents": {
+      "Explore": {
+        "endpoint": "openrouter",
+        "model": "anthropic/claude-sonnet-4.6"
+      }
+    }
+  }
+}

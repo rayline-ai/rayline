@@ -1,0 +1,13 @@
+{
+  "routes": {
+    "main": {
+      "endpoint": "anthropic",
+      "model": "claude-sonnet-4-6"
+    },
+    "subagents": {
+      "Explore": {
+        "endpoint": "local"
+      }
+    }
+  }
+}

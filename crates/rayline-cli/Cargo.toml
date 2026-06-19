@@ -1,0 +1,32 @@
+[package]
+name = "rayline-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Rayline public Rust CLI launcher"
+
+[[bin]]
+name = "rayline"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+crossterm = "0.28"
+dirs.workspace = true
+rand = "0.9"
+reqwest.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tar = "0.4"
+tokio.workspace = true
+url = "2"
+rayline-hf = { path = "../rayline-hf" }
+rayline-metrics = { path = "../rayline-metrics" }
+zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+opener = "0.6"

@@ -1,0 +1,11 @@
+[package]
+name = "rayline-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-memory Rayline router metrics model"
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true

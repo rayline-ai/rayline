@@ -1,0 +1,12 @@
+* @chilang @madamowski
+
+/.github/ @chilang @madamowski
+/Cargo.lock @chilang @madamowski
+/Cargo.toml @chilang @madamowski
+/LICENSE @chilang @madamowski
+/NOTICE @chilang @madamowski
+/SECURITY.md @chilang @madamowski
+/TRADEMARK.md @chilang @madamowski
+/crates/rayline-proxy/ @chilang @madamowski
+/crates/rayline-injector/ @chilang @madamowski
+/crates/rayline-cli/src/update.rs @chilang @madamowski

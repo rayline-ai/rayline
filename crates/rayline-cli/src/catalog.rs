@@ -1,0 +1,844 @@
+//! Curated local-model catalog for the `<cli> local` Recommended picker.
+//!
+//! The list comes from the published Rayline model registry
+//! (`registry.rayline.ai/models.json`) filtered to entries whose `curated` tags
+//! include this build's CLI binary name.
+//! Hardware fit is computed client-side with the same
+//! formula as the desktop's `recommendation.ts`:
+//! `baseRamBytes + kvCacheBytesPerToken * context`, green below 70% of total
+//! RAM, amber below 90%, red above.
+//!
+//! Downloads reuse `rayline-hf` — the identical implementation the `rld`
+//! daemon uses — so files land in the standard HF hub cache and the daemon
+//! sees them as a warm cache on its next start.
+
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+const REGISTRY_PROD_URL: &str = "https://registry.rayline.ai/models.json";
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Local-model families the cloud router actually delegates to. A model outside
+/// these families runs locally but never receives a routed request, so the CLI
+/// refuses to configure one.
+pub const ELIGIBLE_LOCAL_MODEL_PREFIXES: &[&str] = &[
+    "qwen3.6-35b-a3b-",
+    "qwen3.6-27b-",
+    "qwen3.5-35b-a3b-",
+    "gemma4-31b-",
+];
+
+/// Whether the router would delegate to a local model advertised as
+/// `model_id` (matches the router's lowercase prefix check).
+pub fn is_eligible_local_model(model_id: &str) -> bool {
+    let lower = model_id.to_lowercase();
+    ELIGIBLE_LOCAL_MODEL_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Context budgets mirroring the desktop's `recommendedContextLength`:
+/// 64K tokens on <=16 GB machines, 128K above.
+const SMALL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const CONTEXT_SMALL: u64 = 65_536;
+const CONTEXT_LARGE: u64 = 131_072;
+
+/// One curated registry entry (the subset of `ModelEntry` fields this CLI
+/// needs; unknown fields are ignored).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogModel {
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub base_ram_bytes: u64,
+    pub kv_cache_bytes_per_token: u64,
+    pub max_context_window: u64,
+    pub quality_score: u64,
+    pub description: String,
+}
+
+/// Hardware fit at the recommended context length, matching the desktop's
+/// green/amber/red thresholds (70% / 90% of total RAM).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fit {
+    Green,
+    Amber,
+    Red,
+    /// RAM could not be detected on this platform; no verdict.
+    Unknown,
+}
+
+impl Fit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Amber => "amber",
+            Self::Red => "red",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Preference order for the auto-pick: comfortable fits first, but a red
+    /// fit still ranks (a legacy download on a small machine beats nothing).
+    fn rank(self) -> u8 {
+        match self {
+            Self::Green => 0,
+            Self::Amber => 1,
+            Self::Unknown => 2,
+            Self::Red => 3,
+        }
+    }
+}
+
+/// Fetch the registry catalog and keep only the entries curated for this CLI,
+/// smallest first. Falls back to the bundled list whenever the registry is
+/// unreachable, malformed, or has no curated entries — the picker always
+/// works, and registry plumbing never leaks into user-facing output (the same
+/// graceful degradation as the desktop's bundled-catalog fallback). Multi-file
+/// (sharded) entries are skipped — the download path handles a single GGUF.
+/// `RAYLINE_MODELS_REGISTRY_URL` overrides the registry URL (testing against a
+/// local/staged catalog).
+pub async fn fetch_curated(env_name: &str) -> Vec<CatalogModel> {
+    match try_fetch_curated(env_name).await {
+        Ok(models) if !models.is_empty() => models,
+        _ => fallback_curated(),
+    }
+}
+
+/// One client per process: reuses the connection pool / TLS session across
+/// the catalog fetch and any retries within a command.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .expect("default reqwest client config is infallible")
+    })
+}
+
+async fn try_fetch_curated(env_name: &str) -> Result<Vec<CatalogModel>, String> {
+    let override_url = std::env::var("RAYLINE_MODELS_REGISTRY_URL").ok();
+    let url = override_url.as_deref().unwrap_or(registry_url(env_name));
+    let response = http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(response.status().to_string());
+    }
+    let body: Value = response.json().await.map_err(|error| error.to_string())?;
+    Ok(parse_curated(&body))
+}
+
+/// Bundled subset of the curated catalog, used until the registry lists
+/// curated entries (and offline). Values mirror the matching entries in
+/// src/lib/local-models/catalog.ts — keep them in sync when retagging.
+fn fallback_curated() -> Vec<CatalogModel> {
+    vec![
+        CatalogModel {
+            id: "qwen3.6-27b-iq3xxs".to_owned(),
+            name: "Qwen3.6 27B (IQ3_XXS)".to_owned(),
+            repo: "unsloth/Qwen3.6-27B-GGUF".to_owned(),
+            filename: "Qwen3.6-27B-UD-IQ3_XXS.gguf".to_owned(),
+            size_bytes: 11_994_777_824,
+            base_ram_bytes: 13_194_000_000,
+            kv_cache_bytes_per_token: 65_536,
+            max_context_window: 262_144,
+            quality_score: 74,
+            description: "Compact Qwen3.6 27B. Fits tighter RAM budgets with some quality trade-off."
+                .to_owned(),
+        },
+        CatalogModel {
+            id: "qwen3.6-27b-q4km".to_owned(),
+            name: "Qwen3.6 27B (Q4_K_M)".to_owned(),
+            repo: "unsloth/Qwen3.6-27B-GGUF".to_owned(),
+            filename: "Qwen3.6-27B-Q4_K_M.gguf".to_owned(),
+            size_bytes: 16_817_244_384,
+            base_ram_bytes: 18_499_000_000,
+            kv_cache_bytes_per_token: 65_536,
+            max_context_window: 262_144,
+            quality_score: 81,
+            description:
+                "Best quality/size Qwen3.6 27B balance. Flagship agentic coding for 24GB+ machines."
+                    .to_owned(),
+        },
+        CatalogModel {
+            id: "qwen3.6-35b-a3b-q4km".to_owned(),
+            name: "Qwen3.6 35B A3B (Q4_K_M)".to_owned(),
+            repo: "unsloth/Qwen3.6-35B-A3B-GGUF".to_owned(),
+            filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".to_owned(),
+            size_bytes: 22_134_528_992,
+            base_ram_bytes: 24_348_000_000,
+            kv_cache_bytes_per_token: 20_480,
+            max_context_window: 262_144,
+            quality_score: 76,
+            description:
+                "Best quality/size Qwen3.6 MoE balance. Improved agentic coding. Recommended for 32GB+."
+                    .to_owned(),
+        },
+    ]
+}
+
+fn registry_url(_env_name: &str) -> &'static str {
+    REGISTRY_PROD_URL
+}
+
+fn parse_curated(body: &Value) -> Vec<CatalogModel> {
+    let Some(entries) = body.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut models = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("curated")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(crate::CLI_BIN)))
+                && entry.get("shardedFilenames").is_none()
+        })
+        .filter_map(parse_model)
+        .filter(|model| is_eligible_local_model(&model.id))
+        .collect::<Vec<_>>();
+    models.sort_by_key(|model| model.base_ram_bytes);
+    models
+}
+
+fn parse_model(entry: &Value) -> Option<CatalogModel> {
+    Some(CatalogModel {
+        id: entry.get("id")?.as_str()?.to_owned(),
+        name: entry.get("name")?.as_str()?.to_owned(),
+        repo: entry.get("repo")?.as_str()?.to_owned(),
+        filename: entry.get("filename")?.as_str()?.to_owned(),
+        size_bytes: entry.get("sizeBytes")?.as_u64()?,
+        base_ram_bytes: entry.get("baseRamBytes")?.as_u64()?,
+        kv_cache_bytes_per_token: entry.get("kvCacheBytesPerToken")?.as_u64()?,
+        max_context_window: entry.get("maxContextWindow")?.as_u64()?,
+        quality_score: entry.get("qualityScore")?.as_u64()?,
+        description: entry.get("description")?.as_str()?.to_owned(),
+    })
+}
+
+/// RAM the model needs at the context length this machine would run it with.
+pub fn required_ram_bytes(model: &CatalogModel, total_ram_bytes: u64) -> u64 {
+    let context = if total_ram_bytes <= SMALL_RAM_BYTES {
+        CONTEXT_SMALL
+    } else {
+        CONTEXT_LARGE
+    }
+    .min(model.max_context_window);
+    model.base_ram_bytes + model.kv_cache_bytes_per_token * context
+}
+
+/// Coarse fit verdict against **total physical RAM**.
+///
+/// KNOWN LIMITATION (follow-up: GPU-aware fit + context autosizing): this
+/// compares against total RAM, but the real ceiling for the local model is
+/// the GPU memory budget, which is smaller — on Apple Silicon the OS caps
+/// GPU-wired memory at ~⅔ of RAM, and on discrete GPUs it is VRAM, not system
+/// RAM. It also assumes a fixed context tier that may not match the context
+/// the daemon actually loads. As a result a `green`/`amber` verdict can still
+/// OOM at llama-server warmup on memory-constrained machines (e.g. a 27B model
+/// on a 24GB Mac). `rayline_llama::detect_hardware()` already exposes gpu_type /
+/// gpu_vram_bytes; a future revision should budget against those and size the
+/// context to fit, passing the same value to the daemon as `RAYLINE_CTX_SIZE`.
+pub fn fit(model: &CatalogModel, total_ram_bytes: Option<u64>) -> Fit {
+    let Some(total) = total_ram_bytes.filter(|total| *total > 0) else {
+        return Fit::Unknown;
+    };
+    let required = required_ram_bytes(model, total) as f64;
+    let ratio = required / total as f64;
+    if ratio <= 0.70 {
+        Fit::Green
+    } else if ratio <= 0.90 {
+        Fit::Amber
+    } else {
+        Fit::Red
+    }
+}
+
+/// Total physical RAM, detected once per process (the macOS path spawns a
+/// `sysctl` subprocess — no reason to repeat it within a command).
+/// `None` when detection fails (no fit verdict then).
+pub fn detect_total_ram() -> Option<u64> {
+    static TOTAL_RAM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TOTAL_RAM.get_or_init(detect_total_ram_uncached)
+}
+
+fn detect_total_ram_uncached() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = meminfo
+            .lines()
+            .find(|line| line.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        // SAFETY: `status` is a properly initialized MEMORYSTATUSEX with
+        // `length` set, as the Win32 API requires.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+            Some(status.total_phys)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Whether the model's GGUF is present in the HF hub cache (any snapshot).
+pub fn is_downloaded(model: &CatalogModel) -> bool {
+    downloaded_path(model).is_some()
+}
+
+/// Resolve the model to serve when local routing is enabled but no model has
+/// been picked yet: the best already-downloaded curated model, or `None` when
+/// nothing is downloaded. Never downloads anything.
+pub async fn auto_select_downloaded(env_name: &str) -> Option<CatalogModel> {
+    let models = fetch_curated(env_name).await;
+    let total_ram = detect_total_ram();
+    let downloaded = models.into_iter().filter(is_downloaded).collect::<Vec<_>>();
+    choose_auto_pick(downloaded, total_ram)
+}
+
+/// Best of the already-downloaded curated models: hardware fit first, quality
+/// second. Pure so the policy is unit-testable.
+fn choose_auto_pick(downloaded: Vec<CatalogModel>, total_ram: Option<u64>) -> Option<CatalogModel> {
+    downloaded.into_iter().min_by_key(|model| {
+        (
+            fit(model, total_ram).rank(),
+            std::cmp::Reverse(model.quality_score),
+        )
+    })
+}
+
+fn downloaded_path(model: &CatalogModel) -> Option<PathBuf> {
+    rayline_hf::scan_hf_cache_gguf()
+        .into_iter()
+        .find(|entry| entry.repo == model.repo && entry.filename == model.filename)
+        .map(|entry| entry.path)
+}
+
+/// A curated model annotated with this machine's status, for `local models`.
+pub struct ModelListing {
+    pub model: CatalogModel,
+    pub fit: Fit,
+    pub downloaded: bool,
+    pub selected: bool,
+}
+
+pub fn listings(
+    models: Vec<CatalogModel>,
+    total_ram_bytes: Option<u64>,
+    selected_id: Option<&str>,
+) -> Vec<ModelListing> {
+    models
+        .into_iter()
+        .map(|model| ModelListing {
+            fit: fit(&model, total_ram_bytes),
+            downloaded: is_downloaded(&model),
+            selected: selected_id == Some(model.id.as_str()),
+            model,
+        })
+        .collect()
+}
+
+/// Machine-readable `local models --json` payload (consumed by the menu bar
+/// app). One JSON object on stdout.
+pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+    let models = listings
+        .iter()
+        .map(|listing| {
+            json!({
+                "id": listing.model.id,
+                "name": listing.model.name,
+                "repo": listing.model.repo,
+                "filename": listing.model.filename,
+                "size_bytes": listing.model.size_bytes,
+                "quality_score": listing.model.quality_score,
+                "description": listing.model.description,
+                "required_ram_bytes": total_ram_bytes
+                    .map(|total| required_ram_bytes(&listing.model, total)),
+                "fit": listing.fit.as_str(),
+                "downloaded": listing.downloaded,
+                "selected": listing.selected,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "total_ram_bytes": total_ram_bytes,
+        "models": models,
+    });
+    format!("{payload}\n")
+}
+
+/// Two sections: installed models (selectable, whatever their fit — they are
+/// already on disk) and suitable downloads (red-fit entries hidden as noise,
+/// with a count so the omission is visible).
+pub fn render_listings_human(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+    let cli = crate::CLI_BIN;
+    let mut output = String::new();
+    match total_ram_bytes {
+        Some(total) => output.push_str(&format!(
+            "Recommended local models (this machine: {} RAM):\n",
+            format_bytes(total)
+        )),
+        None => output.push_str("Recommended local models:\n"),
+    }
+
+    let fit_label = |fit: Fit| match fit {
+        Fit::Green => "fits well",
+        Fit::Amber => "tight fit",
+        Fit::Red => "too large for this machine",
+        Fit::Unknown => "fit unknown",
+    };
+    let entry = |listing: &ModelListing| {
+        format!(
+            "{marker} {id}\n    {name} — {size}, {fit}\n    {description}\n",
+            marker = if listing.selected { "*" } else { " " },
+            id = listing.model.id,
+            name = listing.model.name,
+            size = format_bytes(listing.model.size_bytes),
+            fit = fit_label(listing.fit),
+            description = listing.model.description,
+        )
+    };
+
+    output.push_str("\nInstalled:\n");
+    let installed = listings.iter().filter(|l| l.downloaded).collect::<Vec<_>>();
+    if installed.is_empty() {
+        output.push_str("  (none yet)\n");
+    }
+    for listing in installed {
+        output.push_str(&entry(listing));
+    }
+
+    output.push_str("\nAvailable to download:\n");
+    let available = listings
+        .iter()
+        .filter(|l| !l.downloaded && l.fit != Fit::Red)
+        .collect::<Vec<_>>();
+    let hidden = listings
+        .iter()
+        .filter(|l| !l.downloaded && l.fit == Fit::Red)
+        .count();
+    if available.is_empty() {
+        output.push_str("  No models suitable to download for this machine.\n");
+    }
+    for listing in available {
+        output.push_str(&entry(listing));
+    }
+    if hidden > 0 {
+        output.push_str(&format!(
+            "  ({hidden} larger model{s} hidden — too large for this machine)\n",
+            s = if hidden == 1 { "" } else { "s" },
+        ));
+    }
+
+    output.push_str(&format!(
+        "\nSelect (downloading first if needed) with `{cli} local use <model-id>`.\n"
+    ));
+    output
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    const MB: f64 = 1_000_000.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else {
+        format!("{:.0} MB", bytes / MB)
+    }
+}
+
+/// Download `model` into the HF hub cache, reporting progress. With
+/// `json` the progress stream is NDJSON on stdout (`download_progress`
+/// events mirroring the daemon's `RAYLINE_PROGRESS` payload, then `complete`);
+/// otherwise a live progress bar is drawn on stderr. Resumes partial
+/// downloads (rayline-hf keeps a `.tmp` + URL sidecar).
+pub async fn download(model: &CatalogModel, json: bool) -> Result<PathBuf, String> {
+    if let Some(path) = downloaded_path(model) {
+        if json {
+            emit_json_line(&json!({
+                "event": "complete",
+                "id": model.id,
+                "path": path.display().to_string(),
+                "cached": true,
+            }));
+        } else {
+            eprintln!("{} is already downloaded ({}).", model.id, path.display());
+        }
+        return Ok(path);
+    }
+
+    if json {
+        emit_json_line(&json!({
+            "event": "start",
+            "id": model.id,
+            "repo": model.repo,
+            "filename": model.filename,
+            "total": model.size_bytes,
+        }));
+    } else {
+        eprintln!(
+            "Downloading {} ({}) from {}…",
+            model.id,
+            format_bytes(model.size_bytes),
+            model.repo
+        );
+    }
+
+    let commit = {
+        let repo = model.repo.clone();
+        tokio::task::spawn_blocking(move || rayline_hf::hf_api_get_commit(&repo))
+            .await
+            .map_err(|error| format!("download task failed: {error}"))??
+    };
+
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        let callback = |progress: rayline_hf::DownloadProgress| {
+            if json {
+                emit_json_line(&json!({
+                    "event": "download_progress",
+                    "stage": progress.stage,
+                    "filename": progress.filename,
+                    "bytes": progress.bytes_downloaded,
+                    "total": progress.total_bytes,
+                    "percent": progress.percent,
+                }));
+            } else {
+                render_progress_bar(&progress);
+            }
+        };
+        // Report the real GGUF name in progress events, not the `.tmp` blob.
+        rayline_hf::download_to_hf_cache(
+            &repo,
+            &filename,
+            &commit,
+            Some(&callback),
+            "model",
+            None,
+            0,
+            0,
+            Some(filename.as_str()),
+        )
+    })
+    .await
+    .map_err(|error| format!("download task failed: {error}"))??;
+
+    if json {
+        emit_json_line(&json!({
+            "event": "complete",
+            "id": model.id,
+            "path": path.display().to_string(),
+            "cached": false,
+        }));
+    } else {
+        // Terminate the in-place progress bar line before the summary.
+        eprintln!();
+        eprintln!("Downloaded to {}.", path.display());
+    }
+    Ok(path)
+}
+
+/// `<cli> local models [--json]`.
+pub async fn models_command(env_name: Option<&str>, json: bool) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let env_name = crate::status::resolve_env(env_name, Some(&home));
+    let models = fetch_curated(&env_name).await;
+    let total_ram = detect_total_ram();
+    // Only a Recommended-mode pick counts as the selected catalog model. In
+    // Custom mode `model_id` is still populated (preserved for switching back),
+    // but the active selection is the custom endpoint, not this row.
+    let selected_id = crate::local_model::read_from_home(&home).and_then(|config| {
+        matches!(config.mode, crate::local_model::LocalModelMode::Recommended)
+            .then_some(config.model_id)
+            .flatten()
+    });
+    let listings = listings(models, total_ram, selected_id.as_deref());
+    Ok(if json {
+        render_listings_json(&listings, total_ram)
+    } else {
+        render_listings_human(&listings, total_ram)
+    })
+}
+
+/// `<cli> local download <model-id> [--json]`. One catalog fetch serves both
+/// the id lookup and the post-download auto-select.
+pub async fn download_command(
+    env_name: Option<&str>,
+    model_id: &str,
+    json: bool,
+) -> Result<(), String> {
+    let (home, models) = fetch_for_command(env_name).await?;
+    let model = find_in(&models, model_id)?;
+    download(&model, json).await?;
+    auto_select_if_sole_model(&home, &models, &model, json);
+    Ok(())
+}
+
+/// Resolve home + env and fetch the curated catalog once for a command.
+async fn fetch_for_command(
+    env_name: Option<&str>,
+) -> Result<(std::path::PathBuf, Vec<CatalogModel>), String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let env_name = crate::status::resolve_env(env_name, Some(&home));
+    let models = fetch_curated(&env_name).await;
+    Ok((home, models))
+}
+
+/// After a successful download, adopt the model as the selection when it is
+/// the only added model on this machine (nothing else downloaded, no complete
+/// custom endpoint) — a first download shouldn't need a second "select" step.
+/// Other Rayline clients can reload config afterwards; unknown NDJSON events are
+/// ignored by older consumers.
+fn auto_select_if_sole_model(
+    home: &std::path::Path,
+    models: &[CatalogModel],
+    model: &CatalogModel,
+    json: bool,
+) {
+    let cfg = crate::local_model::read_from_home(home);
+    let downloaded_ids = models
+        .iter()
+        .filter(|m| is_downloaded(m))
+        .map(|m| m.id.clone())
+        .collect::<Vec<_>>();
+    if !should_auto_select(cfg.as_ref(), &downloaded_ids, &model.id) {
+        return;
+    }
+    if crate::local_model::set_recommended_in_home(home, model).is_ok() {
+        if json {
+            emit_json_line(&json!({ "event": "auto_selected", "id": model.id }));
+        } else {
+            eprintln!("Selected `{}` — your only added model.", model.id);
+        }
+    }
+}
+
+/// `<cli> local remove <model-id>`: delete the model's GGUF from the local
+/// cache. Clears the pick when the removed model was the selected one (the
+/// selection would otherwise point at a file that no longer exists).
+pub async fn remove_command(env_name: Option<&str>, model_id: &str) -> Result<String, String> {
+    let (home, models) = fetch_for_command(env_name).await?;
+    let model = find_in(&models, model_id)?;
+    let Some(path) = downloaded_path(&model) else {
+        return Err(format!("`{model_id}` is not downloaded."));
+    };
+    rayline_hf::delete_model_and_shards_from_hf_cache(&path)?;
+
+    let mut output = format!(
+        "Removed {id} ({size} freed). The file came out of the shared Hugging Face cache, so other apps using it lose it too.",
+        id = model.id,
+        size = format_bytes(model.size_bytes),
+    );
+    if let Some(cfg) = crate::local_model::read_from_home(&home) {
+        if cfg.model_id.as_deref() == Some(model.id.as_str()) {
+            crate::local_model::clear_recommended_pick_in_home(&home)
+                .map_err(|error| format!("failed to update settings: {error}"))?;
+            output.push_str("\nIt was your selected model — the selection has been cleared.");
+        }
+    }
+    // When exactly one added model remains and nothing valid is selected,
+    // select it — even a custom endpoint.
+    if let Some(note) = ensure_sole_added_model_selected(&models, &home) {
+        output.push_str(&note);
+    }
+    Ok(output)
+}
+
+/// When no valid selection exists and the added-models list (downloaded
+/// curated models + saved custom endpoints) has exactly one entry, select it.
+/// Returns a user-facing note when a selection was made.
+fn ensure_sole_added_model_selected(
+    models: &[CatalogModel],
+    home: &std::path::Path,
+) -> Option<String> {
+    let cfg = crate::local_model::read_from_home(home);
+    if cfg.as_ref().is_some_and(|cfg| cfg.is_engageable()) {
+        return None;
+    }
+    let downloaded = models
+        .iter()
+        .filter(|m| is_downloaded(m))
+        .cloned()
+        .collect::<Vec<_>>();
+    let endpoints = cfg.map(|cfg| cfg.custom_endpoints).unwrap_or_default();
+    match (downloaded.as_slice(), endpoints.as_slice()) {
+        ([model], []) => crate::local_model::set_recommended_in_home(home, model)
+            .ok()
+            .map(|_| format!("\nSelected `{}` — your only added model.", model.id)),
+        ([], [endpoint]) => crate::local_model::activate_custom_endpoint_in_home(home, endpoint)
+            .ok()
+            .map(|_| {
+                format!(
+                    "\nSelected your custom endpoint `{}` ({}) — your only added model.",
+                    endpoint.model, endpoint.base_url,
+                )
+            }),
+        _ => None,
+    }
+}
+
+/// Pure decision: auto-select only when the just-downloaded model is the sole
+/// added model — no other curated download and no saved custom endpoint
+/// (`read_from_home` already counts a bare active URL+model pair as one).
+fn should_auto_select(
+    cfg: Option<&crate::local_model::LocalModelConfig>,
+    downloaded_ids: &[String],
+    just_downloaded: &str,
+) -> bool {
+    let endpoints_added = cfg.is_some_and(|cfg| !cfg.custom_endpoints.is_empty());
+    !endpoints_added && downloaded_ids == [just_downloaded]
+}
+
+/// `<cli> local use <model-id>`: download if missing, then select.
+pub async fn use_command(env_name: Option<&str>, model_id: &str) -> Result<String, String> {
+    let (_, models) = fetch_for_command(env_name).await?;
+    let model = find_in(&models, model_id)?;
+    download(&model, false).await?;
+    crate::local_model::set_recommended(&model)?;
+    let cli = crate::CLI_BIN;
+    Ok(format!(
+        "Local model set to {id} ({name}).\nLocal routing uses it once enabled for your account (`{cli} local on`).",
+        id = model.id,
+        name = model.name,
+    ))
+}
+
+fn find_in(models: &[CatalogModel], model_id: &str) -> Result<CatalogModel, String> {
+    models
+        .iter()
+        .find(|model| model.id == model_id)
+        .cloned()
+        .ok_or_else(|| {
+            let available = models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Unknown model id `{model_id}`. Available: {available}")
+        })
+}
+
+/// Final `error` NDJSON event for `--json` consumers (the menu bar app).
+pub fn emit_error_json(message: &str) {
+    emit_json_line(&json!({ "event": "error", "message": message }));
+}
+
+fn emit_json_line(payload: &Value) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+}
+
+fn render_progress_bar(progress: &rayline_hf::DownloadProgress) {
+    const WIDTH: usize = 30;
+    let percent = progress.percent.clamp(0.0, 100.0);
+    let filled = ((percent / 100.0) * WIDTH as f64).round() as usize;
+    let bar = format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled));
+    let total = if progress.total_bytes > 0 {
+        format_bytes(progress.total_bytes)
+    } else {
+        "?".to_owned()
+    };
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(
+        stderr,
+        "\r  [{bar}] {percent:5.1}%  {downloaded} / {total}   ",
+        downloaded = format_bytes(progress.bytes_downloaded),
+    );
+    let _ = stderr.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry_model(id: &str, base_ram_bytes: u64) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "repo": "example/repo",
+            "filename": "model.gguf",
+            "sizeBytes": 1,
+            "baseRamBytes": base_ram_bytes,
+            "kvCacheBytesPerToken": 1,
+            "maxContextWindow": 1024,
+            "qualityScore": 1,
+            "description": "test model",
+            "curated": [crate::CLI_BIN],
+        })
+    }
+
+    #[test]
+    fn parse_curated_filters_router_ineligible_models() {
+        let body = json!({
+            "models": [
+                registry_model("not-router-eligible", 1),
+                registry_model("qwen3.6-27b-q4km", 2),
+            ],
+        });
+
+        let models = parse_curated(&body);
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["qwen3.6-27b-q4km"]
+        );
+    }
+}

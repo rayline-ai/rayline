@@ -1,0 +1,2121 @@
+//! Local-only static router for Claude Code-compatible Anthropic traffic.
+//!
+//! This crate deliberately mirrors the small HTTP surface the current
+//! transparent proxy already expects from the hosted router. It keeps the first
+//! OSS-shaped milestone local/client-side only: static rules, configured
+//! provider endpoints, and local-model redirects.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::header::{HeaderName, HeaderValue};
+use hyper::service::service_fn;
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+pub const DEFAULT_PORT: u16 = 20811;
+pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
+pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-router";
+pub const DEFAULT_SUBAGENT_MODEL: &str = "rayline-subagent";
+pub const CONFIG_ENV: &str = "RAYLINE_ROUTER_CONFIG";
+pub const MAIN_ENDPOINT_ENV: &str = "RAYLINE_MAIN_ENDPOINT";
+pub const MAIN_MODEL_ENV: &str = "RAYLINE_MAIN_MODEL";
+pub const SUBAGENT_ENDPOINT_ENV: &str = "RAYLINE_SUBAGENT_ENDPOINT";
+pub const SUBAGENT_MODEL_ENV: &str = "RAYLINE_SUBAGENT_MODEL";
+const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
+const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
+
+#[derive(Clone)]
+pub struct LocalRouterOptions {
+    pub port: u16,
+    pub local_adapter_port: u16,
+    pub local_model_id: String,
+    pub config_path: Option<PathBuf>,
+    pub metrics: Option<SharedMetricsSink>,
+}
+
+impl Default for LocalRouterOptions {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            local_adapter_port: DEFAULT_LOCAL_ADAPTER_PORT,
+            local_model_id: "qwen3.6-35b-a3b-q4-k-m".to_owned(),
+            config_path: None,
+            metrics: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouterConfig {
+    #[serde(default)]
+    pub endpoints: Vec<EndpointConfig>,
+    #[serde(default)]
+    pub routes: RoutesConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EndpointConfig {
+    pub id: String,
+    #[serde(default = "default_endpoint_kind")]
+    pub kind: String,
+    pub protocol: EndpointProtocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_endpoint_kind() -> String {
+    "provider".to_owned()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointProtocol {
+    AnthropicMessages,
+    #[serde(rename = "openai_chat", alias = "open_ai_chat")]
+    OpenAIChat,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouteTarget {
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+impl RouteTarget {
+    fn local(model: impl Into<String>) -> Self {
+        Self {
+            endpoint: "local".to_owned(),
+            model: model.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RoutesConfig {
+    #[serde(default)]
+    pub main: Option<RouteTarget>,
+    #[serde(default)]
+    pub subagent: Option<RouteTarget>,
+    #[serde(default)]
+    pub default: Option<RouteTarget>,
+    #[serde(default)]
+    pub model_routes: HashMap<String, RouteTarget>,
+    #[serde(default)]
+    pub subagents: HashMap<String, RouteTarget>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    opts: Arc<LocalRouterOptions>,
+    config: Arc<RouterConfig>,
+    http: reqwest::Client,
+    route_counter: Arc<AtomicU64>,
+    started_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteDecision {
+    target: RouteSelection,
+    requested_model: String,
+    selected_model: String,
+    policy: String,
+    task_class: String,
+    route_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RouteSelection {
+    Local,
+    Endpoint(String),
+}
+
+pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
+    let config = load_config(&opts)?;
+    let mut subagent_keys = config.routes.subagents.keys().cloned().collect::<Vec<_>>();
+    subagent_keys.sort();
+    let endpoint_ids = config
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.id.clone())
+        .collect::<Vec<_>>();
+    let config_source = opts
+        .config_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| std::env::var(CONFIG_ENV).ok())
+        .unwrap_or_else(|| "<default>".to_owned());
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), opts.port);
+    let listener = TcpListener::bind(addr).await?;
+    info!(
+        "local router listening on 127.0.0.1:{} (adapter :{}, local_model={}, config={}, endpoints=[{}], subagents=[{}], main={}, subagent_default={})",
+        opts.port,
+        opts.local_adapter_port,
+        opts.local_model_id,
+        config_source,
+        endpoint_ids.join(","),
+        subagent_keys.join(","),
+        route_summary(config.routes.main.as_ref()),
+        route_summary(config.routes.subagent.as_ref())
+    );
+    let state = AppState {
+        opts: Arc::new(opts),
+        config: Arc::new(config),
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+        route_counter: Arc::new(AtomicU64::new(1)),
+        started_at: chrono_like_now(),
+    };
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let state = state.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req| {
+                let state = state.clone();
+                async move { Ok::<_, Infallible>(handle(state, req).await) }
+            });
+            if let Err(error) = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await
+            {
+                warn!("local router connection error: {error}");
+            }
+        });
+    }
+}
+
+fn route_summary(route: Option<&RouteTarget>) -> String {
+    route
+        .map(|route| format!("{}:{}", route.endpoint, route.model))
+        .unwrap_or_else(|| "<default>".to_owned())
+}
+
+fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
+    let path = opts
+        .config_path
+        .clone()
+        .map(|path| (path, "--router-config-path"))
+        .or_else(|| std::env::var_os(CONFIG_ENV).map(|path| (PathBuf::from(path), CONFIG_ENV)));
+    let mut config = default_config(&opts.local_model_id);
+    if let Some((path, source)) = path {
+        if !path.is_file() {
+            return Err(anyhow!(
+                "{source} points to missing router config {}",
+                path.display()
+            ));
+        }
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let overrides = serde_json::from_str::<RouterConfig>(&raw)
+            .with_context(|| format!("parse router config {}", path.display()))?;
+        merge_config(&mut config, overrides);
+    }
+    apply_env_overrides(&mut config);
+    normalize_config(&mut config, &opts.local_model_id)?;
+    Ok(config)
+}
+
+fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
+    for endpoint in overrides.endpoints {
+        if let Some(existing) = config
+            .endpoints
+            .iter_mut()
+            .find(|existing| existing.id == endpoint.id)
+        {
+            *existing = endpoint;
+        } else {
+            config.endpoints.push(endpoint);
+        }
+    }
+
+    if overrides.routes.main.is_some() {
+        config.routes.main = overrides.routes.main;
+    }
+    if overrides.routes.subagent.is_some() {
+        config.routes.subagent = overrides.routes.subagent;
+    }
+    if overrides.routes.default.is_some() {
+        config.routes.default = overrides.routes.default;
+    }
+    config
+        .routes
+        .model_routes
+        .extend(overrides.routes.model_routes);
+    config.routes.subagents.extend(overrides.routes.subagents);
+}
+
+fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<()> {
+    if let Some(route) = config.routes.main.as_mut() {
+        normalize_route_target(route, local_model_id)?;
+    }
+    if let Some(route) = config.routes.subagent.as_mut() {
+        normalize_route_target(route, local_model_id)?;
+    }
+    if let Some(route) = config.routes.default.as_mut() {
+        normalize_route_target(route, local_model_id)?;
+    }
+    for route in config.routes.model_routes.values_mut() {
+        normalize_route_target(route, local_model_id)?;
+    }
+    for route in config.routes.subagents.values_mut() {
+        normalize_route_target(route, local_model_id)?;
+    }
+    Ok(())
+}
+
+fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Result<()> {
+    route.endpoint = route.endpoint.trim().to_owned();
+    route.model = route.model.trim().to_owned();
+    if route.endpoint.is_empty() {
+        return Err(anyhow!("route endpoint must not be empty"));
+    }
+    if route.model.is_empty() {
+        if route.endpoint == "local" {
+            route.model = local_model_id.to_owned();
+        } else {
+            return Err(anyhow!(
+                "route to endpoint {:?} must include a model",
+                route.endpoint
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn default_config(local_model_id: &str) -> RouterConfig {
+    RouterConfig {
+        endpoints: vec![
+            EndpointConfig {
+                id: "anthropic".to_owned(),
+                kind: "provider".to_owned(),
+                protocol: EndpointProtocol::AnthropicMessages,
+                base_url: "https://api.anthropic.com".to_owned(),
+                api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
+                models: vec!["claude-sonnet-4-6".to_owned(), "claude-opus-4-7".to_owned()],
+                headers: HashMap::new(),
+            },
+            EndpointConfig {
+                id: "openai".to_owned(),
+                kind: "provider".to_owned(),
+                protocol: EndpointProtocol::OpenAIChat,
+                base_url: "https://api.openai.com/v1".to_owned(),
+                api_key_env: Some("OPENAI_API_KEY".to_owned()),
+                models: vec!["gpt-5.2".to_owned(), "gpt-5.2-codex".to_owned()],
+                headers: HashMap::new(),
+            },
+            EndpointConfig {
+                id: "openrouter".to_owned(),
+                kind: "provider".to_owned(),
+                protocol: EndpointProtocol::OpenAIChat,
+                base_url: "https://openrouter.ai/api/v1".to_owned(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
+                models: vec![
+                    "openai/gpt-5.2".to_owned(),
+                    "anthropic/claude-sonnet-4.6".to_owned(),
+                ],
+                headers: HashMap::new(),
+            },
+        ],
+        routes: RoutesConfig {
+            main: Some(RouteTarget {
+                endpoint: "anthropic".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+            }),
+            subagent: Some(RouteTarget::local(local_model_id)),
+            default: Some(RouteTarget {
+                endpoint: "anthropic".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+            }),
+            model_routes: HashMap::from([
+                (
+                    DEFAULT_SUBAGENT_MODEL.to_owned(),
+                    RouteTarget::local(local_model_id),
+                ),
+                (
+                    "rayline-local".to_owned(),
+                    RouteTarget::local(local_model_id),
+                ),
+            ]),
+            subagents: HashMap::new(),
+        },
+    }
+}
+
+fn apply_env_overrides(config: &mut RouterConfig) {
+    if let Ok(model) = std::env::var(MAIN_MODEL_ENV) {
+        let endpoint = std::env::var(MAIN_ENDPOINT_ENV).unwrap_or_else(|_| {
+            config
+                .routes
+                .main
+                .as_ref()
+                .map(|route| route.endpoint.clone())
+                .unwrap_or_else(|| "anthropic".to_owned())
+        });
+        config.routes.main = Some(RouteTarget { endpoint, model });
+    } else if let Ok(endpoint) = std::env::var(MAIN_ENDPOINT_ENV) {
+        if let Some(route) = config.routes.main.as_mut() {
+            route.endpoint = endpoint;
+        }
+    }
+
+    if let Ok(model) = std::env::var(SUBAGENT_MODEL_ENV) {
+        let endpoint = std::env::var(SUBAGENT_ENDPOINT_ENV).unwrap_or_else(|_| {
+            config
+                .routes
+                .subagent
+                .as_ref()
+                .map(|route| route.endpoint.clone())
+                .unwrap_or_else(|| "local".to_owned())
+        });
+        config.routes.subagent = Some(RouteTarget { endpoint, model });
+    } else if let Ok(endpoint) = std::env::var(SUBAGENT_ENDPOINT_ENV) {
+        if let Some(route) = config.routes.subagent.as_mut() {
+            route.endpoint = endpoint;
+        }
+    }
+}
+
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+fn full_body(s: impl Into<Bytes>) -> BoxBody {
+    Full::new(s.into()).map_err(|never| match never {}).boxed()
+}
+
+fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(body))
+        .unwrap()
+}
+
+async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
+    let path = req.uri().path().to_owned();
+    let method = req.method().clone();
+    match (method, path.as_str()) {
+        (Method::GET, "/healthz") => healthz_response(&state),
+        (Method::GET, "/v1/models" | "/v1/models/") => models_response(&state),
+        (Method::GET, path) if path.starts_with("/v1/models/") => model_response(&state, path),
+        (Method::POST, "/v1/messages/count_tokens") => count_tokens_response(req).await,
+        (Method::POST, "/v1/usage/update") => json_response(StatusCode::OK, json!({"ok": true})),
+        (Method::GET, "/v1/settings") => json_response(
+            StatusCode::OK,
+            json!({"settings": {"enable_local_router": true, "local_gateway_port": state.opts.local_adapter_port}}),
+        ),
+        (Method::PATCH, "/v1/settings") => json_response(
+            StatusCode::OK,
+            json!({"settings": {"enable_local_router": true, "local_gateway_port": state.opts.local_adapter_port}}),
+        ),
+        (Method::POST, "/v1/messages") => match handle_messages(state, req).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!("local router /v1/messages error: {error}");
+                json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"type":"error","error":{"type":"api_error","message":error.to_string()}}),
+                )
+            }
+        },
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full_body("not found"))
+            .unwrap(),
+    }
+}
+
+fn healthz_response(state: &AppState) -> Response<BoxBody> {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "runtime": "rayline-local-router",
+            "router_url": format!("http://127.0.0.1:{}", state.opts.port),
+            "local_adapter_port": state.opts.local_adapter_port,
+            "local_model_id": state.opts.local_model_id,
+            "startedAt": state.started_at,
+        }),
+    )
+}
+
+fn models_response(state: &AppState) -> Response<BoxBody> {
+    let mut models = vec![
+        model_json(DEFAULT_VIRTUAL_MODEL),
+        model_json(DEFAULT_SUBAGENT_MODEL),
+        model_json("rayline-local"),
+    ];
+    for endpoint in &state.config.endpoints {
+        for model in &endpoint.models {
+            models.push(model_json(model));
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        json!({
+            "object": "list",
+            "data": models,
+            "has_more": false,
+        }),
+    )
+}
+
+fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
+    let Some(model) = path.strip_prefix("/v1/models/").filter(|id| !id.is_empty()) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"type":"error","error":{"type":"not_found_error","message":"model not found"}}),
+        );
+    };
+    let model = percent_decode_minimal(model);
+    if model == DEFAULT_VIRTUAL_MODEL
+        || model == DEFAULT_SUBAGENT_MODEL
+        || model == "rayline-local"
+        || state
+            .config
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.models.iter().any(|m| m == &model))
+    {
+        return json_response(StatusCode::OK, model_json(&model));
+    }
+    json_response(
+        StatusCode::NOT_FOUND,
+        json!({"type":"error","error":{"type":"not_found_error","message":"model not found"}}),
+    )
+}
+
+fn model_json(id: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "model",
+        "type": "model",
+        "display_name": id,
+    })
+}
+
+async fn count_tokens_response(req: Request<Incoming>) -> Response<BoxBody> {
+    let bytes = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"type":"error","error":{"type":"invalid_request_error","message":format!("read body: {error}")}}),
+            );
+        }
+    };
+    let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    json_response(
+        StatusCode::OK,
+        json!({"input_tokens": approximate_input_tokens(&value)}),
+    )
+}
+
+async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
+    let t_start = Instant::now();
+    let headers = req.headers().clone();
+    let body = req.into_body().collect().await?.to_bytes();
+    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let decision = select_route(&state, &headers, &parsed);
+    let request_id = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(header_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(new_request_id);
+    let agent_id = headers
+        .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .and_then(header_str)
+        .unwrap_or("<none>");
+    let agent_type = headers
+        .get(RAYLINE_AGENT_TYPE_HEADER)
+        .and_then(header_str)
+        .unwrap_or("<none>");
+    info!(
+        "local route {} requested={} selected={} policy={} task={} agent_id={} agent_type={} elapsed_ms={}",
+        route_target_label(&decision.target),
+        decision.requested_model,
+        decision.selected_model,
+        decision.policy,
+        decision.task_class,
+        agent_id,
+        agent_type,
+        t_start.elapsed().as_millis()
+    );
+    if let Some(metrics) = state.opts.metrics.as_ref() {
+        metrics.record(MetricsUpdate::RouteDecided {
+            request_id: request_id.clone(),
+            route_id: Some(decision.route_id.clone()),
+            target: match &decision.target {
+                RouteSelection::Local => "local".to_owned(),
+                RouteSelection::Endpoint(_) => "remote".to_owned(),
+            },
+            endpoint_id: match &decision.target {
+                RouteSelection::Local => Some("local".to_owned()),
+                RouteSelection::Endpoint(endpoint_id) => Some(endpoint_id.clone()),
+            },
+            selected_model: Some(decision.selected_model.clone()),
+            requested_model: Some(decision.requested_model.clone()),
+            policy: Some(decision.policy.clone()),
+            task_class: Some(decision.task_class.clone()),
+            agent_id: (agent_id != "<none>").then(|| agent_id.to_owned()),
+            agent_type: (agent_type != "<none>").then(|| agent_type.to_owned()),
+        });
+    }
+    match &decision.target {
+        RouteSelection::Local => Ok(local_redirect_response(&state, &decision, &request_id)),
+        RouteSelection::Endpoint(endpoint_id) => {
+            let endpoint = match state
+                .config
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == *endpoint_id)
+            {
+                Some(endpoint) => endpoint,
+                None => {
+                    record_request_error(
+                        state.opts.metrics.as_ref(),
+                        &request_id,
+                        None,
+                        format!("endpoint {endpoint_id:?} not found"),
+                    );
+                    return Err(anyhow!("endpoint {endpoint_id:?} not found"));
+                }
+            };
+            let response = match endpoint.protocol {
+                EndpointProtocol::AnthropicMessages => {
+                    forward_anthropic_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &headers,
+                        body,
+                        &request_id,
+                        approximate_input_tokens(&parsed),
+                    )
+                    .await
+                }
+                EndpointProtocol::OpenAIChat => {
+                    forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
+                        .await
+                }
+            };
+            if let Err(error) = response.as_ref() {
+                record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
+            }
+            response
+        }
+    }
+}
+
+fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(normalize_model_name)
+        .unwrap_or_else(|| DEFAULT_VIRTUAL_MODEL.to_owned());
+    let agent_id = headers
+        .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .and_then(header_str);
+    let agent_type = headers.get(RAYLINE_AGENT_TYPE_HEADER).and_then(header_str);
+    let is_subagent =
+        agent_type.is_some() || agent_id.is_some() || requested_model == DEFAULT_SUBAGENT_MODEL;
+    let mut policy = if is_subagent { "subagent" } else { "main" }.to_owned();
+    let mut route = if let Some(route) = state.config.routes.model_routes.get(&requested_model) {
+        policy = format!("model:{requested_model}");
+        route.clone()
+    } else if is_subagent {
+        if let Some((configured_key, route)) =
+            subagent_route(&state.config.routes.subagents, agent_type, agent_id)
+        {
+            policy = format!("subagent:{configured_key}");
+            route.clone()
+        } else {
+            state
+                .config
+                .routes
+                .subagent
+                .clone()
+                .or_else(|| state.config.routes.default.clone())
+                .unwrap_or_else(|| RouteTarget::local(&state.opts.local_model_id))
+        }
+    } else if requested_model == DEFAULT_VIRTUAL_MODEL {
+        state
+            .config
+            .routes
+            .main
+            .clone()
+            .or_else(|| state.config.routes.default.clone())
+            .unwrap_or_else(default_main_route)
+    } else if let Some((endpoint, model)) = route_direct_model(&state.config, &requested_model) {
+        policy = "direct-model".to_owned();
+        RouteTarget { endpoint, model }
+    } else {
+        state
+            .config
+            .routes
+            .main
+            .clone()
+            .or_else(|| state.config.routes.default.clone())
+            .unwrap_or_else(default_main_route)
+    };
+
+    if route.endpoint == "local" && !local_available(headers) {
+        policy.push_str(":local-unavailable-fallback");
+        route = state
+            .config
+            .routes
+            .main
+            .clone()
+            .or_else(|| state.config.routes.default.clone())
+            .unwrap_or_else(default_main_route);
+    }
+
+    let target = if route.endpoint == "local" {
+        RouteSelection::Local
+    } else {
+        RouteSelection::Endpoint(route.endpoint.clone())
+    };
+    let route_id = format!(
+        "local-{}",
+        state.route_counter.fetch_add(1, Ordering::Relaxed)
+    );
+    RouteDecision {
+        target,
+        requested_model,
+        selected_model: route.model,
+        policy,
+        task_class: if is_subagent {
+            "subagent".to_owned()
+        } else {
+            "main".to_owned()
+        },
+        route_id,
+    }
+}
+
+fn header_str(value: &HeaderValue) -> Option<&str> {
+    value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn subagent_route<'a>(
+    routes: &'a HashMap<String, RouteTarget>,
+    agent_type: Option<&str>,
+    agent_id: Option<&str>,
+) -> Option<(String, &'a RouteTarget)> {
+    for key in [agent_type, agent_id].into_iter().flatten() {
+        if let Some(route) = routes.get(key) {
+            return Some((key.to_owned(), route));
+        }
+        if let Some((configured_key, route)) = routes
+            .iter()
+            .find(|(configured_key, _)| configured_key.eq_ignore_ascii_case(key))
+        {
+            return Some((configured_key.clone(), route));
+        }
+    }
+    None
+}
+
+fn default_main_route() -> RouteTarget {
+    RouteTarget {
+        endpoint: "anthropic".to_owned(),
+        model: "claude-sonnet-4-6".to_owned(),
+    }
+}
+
+fn route_direct_model(config: &RouterConfig, requested_model: &str) -> Option<(String, String)> {
+    for endpoint in &config.endpoints {
+        if endpoint.models.iter().any(|model| model == requested_model) {
+            return Some((endpoint.id.clone(), requested_model.to_owned()));
+        }
+    }
+    None
+}
+
+fn local_available(headers: &HeaderMap) -> bool {
+    for name in ["x-rayline-local-available", "x-rayline-local-hint"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            return !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no"
+            );
+        }
+    }
+    true
+}
+
+fn local_redirect_response(
+    state: &AppState,
+    decision: &RouteDecision,
+    request_id: &str,
+) -> Response<BoxBody> {
+    let location = format!(
+        "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}&rayline_request_id={}",
+        state.opts.local_adapter_port,
+        query_escape(&decision.route_id),
+        query_escape(request_id)
+    );
+    let mut builder = Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("location", location)
+        .header(REQUEST_ID_HEADER, request_id);
+    add_decision_headers(builder.headers_mut().unwrap(), decision);
+    builder.body(full_body(Bytes::new())).unwrap()
+}
+
+fn query_escape(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+async fn forward_anthropic_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: Bytes,
+    request_id: &str,
+    estimated_input_tokens: u64,
+) -> Result<Response<BoxBody>> {
+    let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    rewrite_body_model(&mut parsed, &decision.selected_model);
+    let outbound_body = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
+    let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
+    let mut outbound = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .header(
+            "anthropic-version",
+            inbound_headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("2023-06-01"),
+        )
+        .body(outbound_body);
+    if let Some(beta) = inbound_headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+    {
+        outbound = outbound.header("anthropic-beta", beta);
+    }
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    response_from_reqwest(
+        resp,
+        status,
+        Some(decision),
+        state.opts.metrics.clone(),
+        Some(request_id.to_owned()),
+        Some(estimated_input_tokens),
+    )
+    .await
+}
+
+async fn forward_openai_chat_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    body: Value,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let estimated_input_tokens = approximate_input_tokens(&body);
+    let request_body = build_openai_chat_request(&body, &decision.selected_model);
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    let mut outbound = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .json(&request_body);
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return response_from_reqwest(
+            resp,
+            status,
+            Some(decision),
+            state.opts.metrics.clone(),
+            Some(request_id.to_owned()),
+            Some(estimated_input_tokens),
+        )
+        .await;
+    }
+    let value = resp.json::<Value>().await?;
+    let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
+    record_remote_completion(
+        state.opts.metrics.as_ref(),
+        request_id,
+        StatusCode::OK.as_u16(),
+        usage_u64(&anthropic, "input_tokens").or(Some(estimated_input_tokens)),
+        usage_u64(&anthropic, "output_tokens"),
+        Some(decision.selected_model.clone()),
+    );
+    if want_stream {
+        Ok(synthetic_anthropic_sse(decision, &anthropic))
+    } else {
+        let mut response = json_response(StatusCode::OK, anthropic);
+        add_decision_headers(response.headers_mut(), decision);
+        Ok(response)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AuthStyle {
+    Anthropic,
+    Bearer,
+}
+
+fn apply_endpoint_headers(
+    mut request: reqwest::RequestBuilder,
+    endpoint: &EndpointConfig,
+    auth_style: AuthStyle,
+) -> Result<reqwest::RequestBuilder> {
+    for (name, value) in &endpoint.headers {
+        request = request.header(name, value);
+    }
+    if let Some(env_name) = endpoint.api_key_env.as_deref() {
+        let key = std::env::var(env_name).with_context(|| {
+            format!(
+                "endpoint {} requires ${env_name}; set it or change router config",
+                endpoint.id
+            )
+        })?;
+        request = match auth_style {
+            AuthStyle::Anthropic => request.header("x-api-key", key),
+            AuthStyle::Bearer => request.bearer_auth(key),
+        };
+    }
+    Ok(request)
+}
+
+async fn response_from_reqwest(
+    resp: reqwest::Response,
+    status: reqwest::StatusCode,
+    decision: Option<&RouteDecision>,
+    metrics: Option<SharedMetricsSink>,
+    request_id: Option<String>,
+    estimated_input_tokens: Option<u64>,
+) -> Result<Response<BoxBody>> {
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<none>")
+        .to_owned();
+    let mut headers_out = HeaderMap::new();
+    for (k, v) in resp.headers().iter() {
+        if is_hop_by_hop_str(k.as_str()) {
+            continue;
+        }
+        let name = match HeaderName::from_bytes(k.as_str().as_bytes()) {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let value = match HeaderValue::from_bytes(v.as_bytes()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        headers_out.append(name, value);
+    }
+    if let Some(decision) = decision {
+        add_decision_headers(&mut headers_out, decision);
+    }
+
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
+    let selected_model = decision.map(|decision| decision.selected_model.clone());
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut body = Vec::new();
+        let mut sse_buffer = String::new();
+        let mut input_tokens = estimated_input_tokens;
+        let mut output_tokens = None;
+        let mut saw_first_token = false;
+        let mut downstream_open = true;
+        let mut stream_error = None;
+        record_remote_token_usage(
+            metrics.as_ref(),
+            request_id.as_deref(),
+            input_tokens,
+            output_tokens,
+            selected_model.clone(),
+        );
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if !saw_first_token {
+                        saw_first_token = true;
+                        if let (Some(metrics), Some(request_id)) =
+                            (metrics.as_ref(), request_id.as_ref())
+                        {
+                            metrics.record(MetricsUpdate::FirstToken {
+                                request_id: request_id.clone(),
+                            });
+                        }
+                    }
+                    let previous_input_tokens = input_tokens;
+                    let previous_output_tokens = output_tokens;
+                    observe_anthropic_sse_chunk(
+                        &bytes,
+                        &mut sse_buffer,
+                        &mut input_tokens,
+                        &mut output_tokens,
+                    );
+                    if input_tokens != previous_input_tokens
+                        || output_tokens != previous_output_tokens
+                    {
+                        record_remote_token_usage(
+                            metrics.as_ref(),
+                            request_id.as_deref(),
+                            input_tokens,
+                            output_tokens,
+                            selected_model.clone(),
+                        );
+                    }
+                    body.extend_from_slice(&bytes);
+                    if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
+                        downstream_open = false;
+                    }
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    if downstream_open {
+                        let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let previous_input_tokens = input_tokens;
+        let previous_output_tokens = output_tokens;
+        observe_anthropic_sse_chunk(
+            b"\n\n",
+            &mut sse_buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+        );
+        if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
+            record_remote_token_usage(
+                metrics.as_ref(),
+                request_id.as_deref(),
+                input_tokens,
+                output_tokens,
+                selected_model.clone(),
+            );
+        }
+        let previous_input_tokens = input_tokens;
+        let previous_output_tokens = output_tokens;
+        usage_from_anthropic_body(&body).merge_into(&mut input_tokens, &mut output_tokens);
+        if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
+            record_remote_token_usage(
+                metrics.as_ref(),
+                request_id.as_deref(),
+                input_tokens,
+                output_tokens,
+                selected_model.clone(),
+            );
+        }
+        if let (Some(metrics), Some(request_id)) = (metrics.as_ref(), request_id.as_ref()) {
+            if let Some(error) = stream_error {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(status.as_u16()),
+                    error,
+                });
+            } else if !status.is_success() {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(status.as_u16()),
+                    error: format!("upstream returned HTTP {}", status.as_u16()),
+                });
+            } else {
+                if output_tokens.is_none() && estimated_input_tokens.unwrap_or(0) > 1 {
+                    info!(
+                        "local-router metrics completed without output usage request_id={} status={} input_tokens={} body_bytes={} content_type={} trailing_sse_bytes={}",
+                        request_id,
+                        status.as_u16(),
+                        display_optional_u64(input_tokens),
+                        body.len(),
+                        content_type,
+                        sse_buffer.len()
+                    );
+                }
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(status.as_u16()),
+                    input_tokens,
+                    output_tokens,
+                    selected_model,
+                });
+            }
+        }
+    });
+
+    let mut builder = Response::builder().status(status.as_u16());
+    if let Some(headers) = builder.headers_mut() {
+        *headers = headers_out;
+    }
+    Ok(builder.body(body_out).unwrap())
+}
+
+fn observe_anthropic_sse_chunk(
+    bytes: &[u8],
+    buffer: &mut String,
+    input_tokens: &mut Option<u64>,
+    output_tokens: &mut Option<u64>,
+) {
+    buffer.push_str(&String::from_utf8_lossy(bytes));
+    while let Some(event) = drain_sse_event(buffer) {
+        for line in event.lines() {
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                continue;
+            };
+            usage_from_value(&value).merge_into(input_tokens, output_tokens);
+        }
+    }
+}
+
+fn drain_sse_event(buffer: &mut String) -> Option<String> {
+    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+    let (idx, delimiter_len) = match (lf, crlf) {
+        (Some(left), Some(right)) => {
+            if left.0 <= right.0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => return None,
+    };
+    let event = buffer[..idx].to_owned();
+    buffer.drain(..idx + delimiter_len);
+    Some(event)
+}
+
+fn usage_u64(value: &Value, key: &str) -> Option<u64> {
+    value
+        .get("usage")
+        .and_then(|usage| usage.get(key))
+        .and_then(Value::as_u64)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ObservedUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl ObservedUsage {
+    fn merge_into(self, input_tokens: &mut Option<u64>, output_tokens: &mut Option<u64>) {
+        if self.input_tokens.is_some() {
+            *input_tokens = self.input_tokens;
+        }
+        if self.output_tokens.is_some() {
+            *output_tokens = self.output_tokens;
+        }
+    }
+}
+
+fn usage_from_anthropic_body(body: &[u8]) -> ObservedUsage {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return usage_from_value(&value);
+    }
+    let mut usage = ObservedUsage::default();
+    for line in String::from_utf8_lossy(body).lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            usage_from_value(&value).merge_into(&mut usage.input_tokens, &mut usage.output_tokens);
+        }
+    }
+    usage
+}
+
+fn usage_from_value(value: &Value) -> ObservedUsage {
+    let mut usage = ObservedUsage::default();
+    collect_usage_from_value(value, &mut usage);
+    usage
+}
+
+fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
+    match value {
+        Value::Object(map) => {
+            if let Some(input) = total_input_tokens_from_object(map) {
+                usage.input_tokens = Some(input);
+            }
+            if let Some(output) = map
+                .get("output_tokens")
+                .or_else(|| map.get("completion_tokens"))
+                .and_then(Value::as_u64)
+            {
+                usage.output_tokens = Some(output);
+            }
+            for child in map.values() {
+                collect_usage_from_value(child, usage);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_usage_from_value(item, usage);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn total_input_tokens_from_object(map: &serde_json::Map<String, Value>) -> Option<u64> {
+    let anthropic_total = token_field(map, "input_tokens")
+        .saturating_add(token_field(map, "cache_creation_input_tokens"))
+        .saturating_add(token_field(map, "cache_read_input_tokens"));
+    if anthropic_total > 0 {
+        return Some(anthropic_total);
+    }
+    map.get("prompt_tokens").and_then(Value::as_u64)
+}
+
+fn token_field(map: &serde_json::Map<String, Value>, key: &str) -> u64 {
+    map.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn display_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn record_remote_completion(
+    metrics: Option<&SharedMetricsSink>,
+    request_id: &str,
+    status_code: u16,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    selected_model: Option<String>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record(MetricsUpdate::FirstToken {
+        request_id: request_id.to_owned(),
+    });
+    metrics.record(MetricsUpdate::RequestCompleted {
+        request_id: request_id.to_owned(),
+        status_code: Some(status_code),
+        input_tokens,
+        output_tokens,
+        selected_model,
+    });
+}
+
+fn record_request_error(
+    metrics: Option<&SharedMetricsSink>,
+    request_id: &str,
+    status_code: Option<u16>,
+    error: impl std::fmt::Display,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record(MetricsUpdate::RequestErrored {
+        request_id: request_id.to_owned(),
+        status_code,
+        error: error.to_string(),
+    });
+}
+
+fn record_remote_token_usage(
+    metrics: Option<&SharedMetricsSink>,
+    request_id: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    selected_model: Option<String>,
+) {
+    let (Some(metrics), Some(request_id)) = (metrics, request_id) else {
+        return;
+    };
+    metrics.record(MetricsUpdate::TokenUsage {
+        request_id: request_id.to_owned(),
+        input_tokens,
+        output_tokens,
+        selected_model,
+    });
+}
+
+fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
+    let selected = HeaderValue::from_str(&decision.selected_model)
+        .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
+    let virtual_model = HeaderValue::from_str(&decision.requested_model)
+        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_VIRTUAL_MODEL));
+    let policy = HeaderValue::from_str(&decision.policy)
+        .unwrap_or_else(|_| HeaderValue::from_static("local-static"));
+    let task = HeaderValue::from_str(&decision.task_class)
+        .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
+    let route_id = HeaderValue::from_str(&decision.route_id)
+        .unwrap_or_else(|_| HeaderValue::from_static("local"));
+    headers.insert("x-rayline-selected-model", selected);
+    headers.insert("x-rayline-virtual-model", virtual_model);
+    headers.insert("x-rayline-policy", policy);
+    headers.insert("x-rayline-task-class", task);
+    headers.insert("x-rayline-route-id", route_id);
+}
+
+fn build_openai_chat_request(body: &Value, model: &str) -> Value {
+    let mut messages = Vec::new();
+    if let Some(system) = body.get("system") {
+        let content = content_to_text(system);
+        if !content.is_empty() {
+            messages.push(json!({"role": "system", "content": content}));
+        }
+    }
+    if let Some(items) = body.get("messages").and_then(Value::as_array) {
+        for message in items {
+            append_openai_messages(&mut messages, message);
+        }
+    }
+    let mut out = Map::new();
+    out.insert("model".to_owned(), Value::String(model.to_owned()));
+    out.insert("messages".to_owned(), Value::Array(messages));
+    out.insert("stream".to_owned(), Value::Bool(false));
+    for key in ["max_tokens", "temperature", "top_p", "stop"] {
+        if let Some(value) = body.get(key) {
+            out.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted = tools.iter().filter_map(tool_to_openai).collect::<Vec<_>>();
+        if !converted.is_empty() {
+            out.insert("tools".to_owned(), Value::Array(converted));
+        }
+    }
+    Value::Object(out)
+}
+
+fn append_openai_messages(out: &mut Vec<Value>, message: &Value) {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    let Some(content) = message.get("content") else {
+        out.push(json!({"role": role, "content": ""}));
+        return;
+    };
+    if let Some(text) = content.as_str() {
+        out.push(json!({"role": role, "content": text}));
+        return;
+    }
+    let Some(blocks) = content.as_array() else {
+        out.push(json!({"role": role, "content": content_to_text(content)}));
+        return;
+    };
+    if role == "assistant" {
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(value) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(value);
+                    }
+                }
+                Some("tool_use") => {
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_local");
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let arguments = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                        .to_string();
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let mut msg = Map::new();
+        msg.insert("role".to_owned(), Value::String("assistant".to_owned()));
+        msg.insert(
+            "content".to_owned(),
+            if text.is_empty() {
+                Value::Null
+            } else {
+                Value::String(text)
+            },
+        );
+        if !tool_calls.is_empty() {
+            msg.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+        }
+        out.push(Value::Object(msg));
+        return;
+    }
+
+    let mut user_text = String::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(value) = block.get("text").and_then(Value::as_str) {
+                    user_text.push_str(value);
+                }
+            }
+            Some("tool_result") => {
+                if !user_text.is_empty() {
+                    out.push(json!({"role": "user", "content": user_text}));
+                    user_text = String::new();
+                }
+                let tool_call_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_local");
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content_to_text(block.get("content").unwrap_or(&Value::Null)),
+                }));
+            }
+            Some("image") => {
+                user_text.push_str("\n[image omitted by local router MVP]\n");
+            }
+            _ => {}
+        }
+    }
+    out.push(json!({"role": role, "content": user_text}));
+}
+
+fn tool_to_openai(tool: &Value) -> Option<Value> {
+    let name = tool.get("name")?.as_str()?;
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let parameters = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    Some(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    }))
+}
+
+fn openai_chat_response_to_anthropic(value: &Value, model: &str) -> Value {
+    let message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    let mut content = Vec::new();
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in tool_calls {
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("toolu_local");
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let arguments = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let input = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
+    let stop_reason = if content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+    {
+        "tool_use"
+    } else if finish_reason == "length" {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+    json!({
+        "id": value.get("id").and_then(Value::as_str).unwrap_or("msg_rayline_local"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": value.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+            "output_tokens": value.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        }
+    })
+}
+
+fn synthetic_anthropic_sse(decision: &RouteDecision, message: &Value) -> Response<BoxBody> {
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let stop_reason = message
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("end_turn");
+    let mut events = String::new();
+    push_sse(
+        &mut events,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message.get("id").and_then(Value::as_str).unwrap_or("msg_rayline_local"),
+                "type": "message",
+                "role": "assistant",
+                "model": decision.selected_model,
+                "content": [],
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            }
+        }),
+    );
+    for (index, block) in content.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("toolu_local");
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                push_sse(
+                    &mut events,
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+                );
+                push_sse(
+                    &mut events,
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
+                );
+                push_sse(
+                    &mut events,
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                );
+            }
+            _ => {
+                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                push_sse(
+                    &mut events,
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                );
+                if !text.is_empty() {
+                    push_sse(
+                        &mut events,
+                        "content_block_delta",
+                        json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+                    );
+                }
+                push_sse(
+                    &mut events,
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":index}),
+                );
+            }
+        }
+    }
+    push_sse(
+        &mut events,
+        "message_delta",
+        json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":output_tokens}}),
+    );
+    push_sse(&mut events, "message_stop", json!({"type":"message_stop"}));
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(full_body(events))
+        .unwrap();
+    add_decision_headers(response.headers_mut(), decision);
+    response
+}
+
+fn push_sse(out: &mut String, event: &str, data: Value) {
+    out.push_str("event: ");
+    out.push_str(event);
+    out.push('\n');
+    out.push_str("data: ");
+    out.push_str(&data.to_string());
+    out.push_str("\n\n");
+}
+
+fn rewrite_body_model(body: &mut Value, model: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+}
+
+fn approximate_input_tokens(value: &Value) -> u64 {
+    let system = value.get("system").map(content_to_text).unwrap_or_default();
+    let messages = value
+        .get("messages")
+        .map(content_to_text)
+        .unwrap_or_default();
+    ((system.len() + messages.len()) as u64 / 4).max(1)
+}
+
+fn content_to_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .map(content_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(text) = obj.get("text").and_then(Value::as_str) {
+            return text.to_owned();
+        }
+        if let Some(content) = obj.get("content") {
+            return content_to_text(content);
+        }
+    }
+    if value.is_null() {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+fn normalize_model_name(model: &str) -> String {
+    let trimmed = if model.ends_with(']') {
+        model.rfind('[').map_or(model, |idx| &model[..idx])
+    } else {
+        model
+    };
+    match trimmed.strip_prefix("claude-rayline-router-") {
+        Some("balanced") => DEFAULT_VIRTUAL_MODEL.to_owned(),
+        Some(suffix) => format!("rayline-router-{suffix}"),
+        None if trimmed == "rayline-router-balanced" => DEFAULT_VIRTUAL_MODEL.to_owned(),
+        None => trimmed.to_owned(),
+    }
+}
+
+fn route_target_label(target: &RouteSelection) -> String {
+    match target {
+        RouteSelection::Local => "local".to_owned(),
+        RouteSelection::Endpoint(endpoint) => format!("endpoint:{endpoint}"),
+    }
+}
+
+fn is_hop_by_hop_str(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn percent_decode_minimal(value: &str) -> String {
+    value
+        .replace("%2F", "/")
+        .replace("%2f", "/")
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+}
+
+fn chrono_like_now() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("{}", duration.as_secs()),
+        Err(_) => "0".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(config: RouterConfig) -> AppState {
+        AppState {
+            opts: Arc::new(LocalRouterOptions {
+                local_model_id: "local-model".to_owned(),
+                ..LocalRouterOptions::default()
+            }),
+            config: Arc::new(config),
+            http: reqwest::Client::new(),
+            route_counter: Arc::new(AtomicU64::new(1)),
+            started_at: "0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn routes_subagent_header_to_local_by_default() {
+        let state = state(default_config("local-model"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("explore"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(decision.target, RouteSelection::Local);
+        assert_eq!(decision.selected_model, "local-model");
+        assert_eq!(decision.task_class, "subagent");
+    }
+
+    #[test]
+    fn local_redirect_carries_request_id_in_query() {
+        let state = state(default_config("local-model"));
+        let decision = RouteDecision {
+            target: RouteSelection::Local,
+            requested_model: DEFAULT_VIRTUAL_MODEL.to_owned(),
+            selected_model: "local-model".to_owned(),
+            policy: "subagent".to_owned(),
+            task_class: "subagent".to_owned(),
+            route_id: "local-1".to_owned(),
+        };
+
+        let response = local_redirect_response(&state, &decision, "req_abc123");
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .expect("redirect location");
+
+        assert!(location.contains("usage_doc_id=local-1"));
+        assert!(location.contains("rayline_request_id=req_abc123"));
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req_abc123"
+        );
+    }
+
+    #[test]
+    fn sparse_config_layers_over_defaults_and_defaults_local_model() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-local-router-config-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"routes":{"subagents":{"Explore":{"endpoint":"local"}}}}"#,
+        )
+        .unwrap();
+        let opts = LocalRouterOptions {
+            local_model_id: "local-model".to_owned(),
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+
+        let config = load_config(&opts).unwrap();
+
+        assert!(
+            config
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.id == "anthropic")
+        );
+        let main = config.routes.main.as_ref().unwrap();
+        assert_eq!(main.endpoint, "anthropic");
+        assert_eq!(main.model, "claude-sonnet-4-6");
+        let explore = config.routes.subagents.get("Explore").unwrap();
+        assert_eq!(explore.endpoint, "local");
+        assert_eq!(explore.model, "local-model");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn example_configs_parse() {
+        for (name, raw) in [
+            (
+                "local-router",
+                include_str!("../../../examples/local-router.json"),
+            ),
+            (
+                "openai-compatible",
+                include_str!("../../../examples/openai-compatible.json"),
+            ),
+            (
+                "openrouter",
+                include_str!("../../../examples/openrouter.json"),
+            ),
+        ] {
+            serde_json::from_str::<RouterConfig>(raw)
+                .unwrap_or_else(|error| panic!("{name} example did not parse: {error}"));
+        }
+    }
+
+    #[test]
+    fn explicit_missing_config_path_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-missing-router-config-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let opts = LocalRouterOptions {
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+
+        let error = load_config(&opts).expect_err("missing explicit config should fail");
+
+        assert!(error.to_string().contains("--router-config-path"));
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn openai_chat_protocol_spelling_is_accepted() {
+        let config = serde_json::from_str::<RouterConfig>(
+            r#"{"endpoints":[{"id":"local-openai","protocol":"openai_chat","base_url":"http://127.0.0.1:1234/v1"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.endpoints.first().unwrap().protocol,
+            EndpointProtocol::OpenAIChat
+        );
+    }
+
+    #[test]
+    fn local_availability_uses_rayline_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-rayline-local-available",
+            HeaderValue::from_static("false"),
+        );
+        assert!(!local_available(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rayline-local-hint", HeaderValue::from_static("1"));
+        assert!(local_available(&headers));
+    }
+
+    #[test]
+    fn normalizes_rayline_router_aliases() {
+        assert_eq!(
+            normalize_model_name("claude-rayline-router-balanced"),
+            DEFAULT_VIRTUAL_MODEL
+        );
+        assert_eq!(
+            normalize_model_name("claude-rayline-router-fast"),
+            "rayline-router-fast"
+        );
+        assert_eq!(
+            normalize_model_name("rayline-router-balanced"),
+            DEFAULT_VIRTUAL_MODEL
+        );
+    }
+
+    #[test]
+    fn named_subagent_overrides_default_subagent_route() {
+        let mut config = default_config("local-model");
+        config.routes.subagents.insert(
+            "reviewer".to_owned(),
+            RouteTarget {
+                endpoint: "openrouter".to_owned(),
+                model: "openai/gpt-5.2".to_owned(),
+            },
+        );
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("reviewer"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openrouter".to_owned())
+        );
+        assert_eq!(decision.selected_model, "openai/gpt-5.2");
+        assert_eq!(decision.policy, "subagent:reviewer");
+    }
+
+    #[test]
+    fn named_subagent_uses_resolved_agent_type_header() {
+        let mut config = default_config("local-model");
+        config.routes.subagents.insert(
+            "reviewer".to_owned(),
+            RouteTarget {
+                endpoint: "openrouter".to_owned(),
+                model: "openai/gpt-5.2".to_owned(),
+            },
+        );
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("a332089fa2c10afe6"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Reviewer"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openrouter".to_owned())
+        );
+        assert_eq!(decision.selected_model, "openai/gpt-5.2");
+        assert_eq!(decision.policy, "subagent:reviewer");
+    }
+
+    #[test]
+    fn named_subagent_falls_back_to_agent_id_when_type_route_missing() {
+        let agent_id = "a332089fa2c10afe6";
+        let mut config = default_config("local-model");
+        config.routes.subagents.insert(
+            agent_id.to_owned(),
+            RouteTarget {
+                endpoint: "openrouter".to_owned(),
+                model: "openai/gpt-5.2".to_owned(),
+            },
+        );
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static(agent_id),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Reviewer"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openrouter".to_owned())
+        );
+        assert_eq!(decision.selected_model, "openai/gpt-5.2");
+        assert_eq!(decision.policy, format!("subagent:{agent_id}"));
+    }
+
+    #[test]
+    fn direct_model_routes_to_declaring_endpoint() {
+        let state = state(default_config("local-model"));
+        let headers = HeaderMap::new();
+        let body = json!({"model": "gpt-5.2", "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openai".to_owned())
+        );
+        assert_eq!(decision.selected_model, "gpt-5.2");
+    }
+
+    #[test]
+    fn openai_tool_response_maps_to_anthropic_tool_use() {
+        let response = json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{\"file_path\":\"a.rs\"}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        });
+
+        let mapped = openai_chat_response_to_anthropic(&response, "gpt-5.2");
+
+        assert_eq!(mapped["stop_reason"], "tool_use");
+        assert_eq!(mapped["content"][0]["type"], "tool_use");
+        assert_eq!(mapped["content"][0]["name"], "Read");
+        assert_eq!(mapped["content"][0]["input"]["file_path"], "a.rs");
+    }
+
+    #[test]
+    fn observes_anthropic_sse_usage_for_remote_metrics() {
+        let mut buffer = String::new();
+        let mut input_tokens = Some(12);
+        let mut output_tokens = None;
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+        );
+
+        assert_eq!(input_tokens, Some(42));
+        assert_eq!(output_tokens, Some(17));
+    }
+
+    #[test]
+    fn observes_crlf_anthropic_sse_usage_for_remote_metrics() {
+        let mut buffer = String::new();
+        let mut input_tokens = Some(12);
+        let mut output_tokens = None;
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+        );
+
+        assert_eq!(input_tokens, Some(42));
+        assert_eq!(output_tokens, Some(17));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn observes_unterminated_anthropic_sse_usage_on_flush() {
+        let mut buffer = String::new();
+        let mut input_tokens = Some(12);
+        let mut output_tokens = None;
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+        );
+        assert_eq!(output_tokens, None);
+
+        observe_anthropic_sse_chunk(b"\n\n", &mut buffer, &mut input_tokens, &mut output_tokens);
+        assert_eq!(output_tokens, Some(17));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn observes_cached_anthropic_sse_usage_for_remote_metrics() {
+        let mut buffer = String::new();
+        let mut input_tokens = Some(12);
+        let mut output_tokens = None;
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+        );
+
+        assert_eq!(input_tokens, Some(42));
+        assert_eq!(output_tokens, Some(17));
+    }
+
+    #[test]
+    fn extracts_usage_from_completed_sse_body() {
+        let usage = usage_from_anthropic_body(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+        );
+
+        assert_eq!(usage.input_tokens, Some(42));
+        assert_eq!(usage.output_tokens, Some(17));
+    }
+}

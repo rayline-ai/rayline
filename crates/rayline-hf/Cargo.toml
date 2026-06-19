@@ -1,0 +1,16 @@
+[package]
+name = "rayline-hf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Hugging Face cache scan + download"
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+sha2 = "0.10"

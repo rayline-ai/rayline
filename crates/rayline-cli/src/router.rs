@@ -1,0 +1,3317 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+const DEFAULT_INJECTOR_PORT: u16 = 20809;
+const DEFAULT_ADAPTER_PORT: u16 = 20808;
+const DEFAULT_PROXY_PORT: u16 = 20810;
+pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
+const DEFAULT_LOCAL_ROUTER_MODEL_REPO: &str = "unsloth/Qwen3.6-35B-A3B-GGUF";
+const DEFAULT_LOCAL_ROUTER_MODEL_FILE: &str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+pub const DEFAULT_LOCAL_ROUTER_MODEL_ID: &str = "qwen3.6-35b-a3b-q4-k-m";
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
+const HEALTH_TIMEOUT_SECONDS: u64 = 240;
+const HEALTH_TIMEOUT_DOWNLOAD_SECONDS: u64 = 3600;
+const HEALTH_POLL: Duration = Duration::from_secs(1);
+pub const PROXY_ROUTING_MODE_ALL: &str = "all";
+const TOP_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const TOP_TRACE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const TOP_TRACE_LOOKBACK: Duration = Duration::from_secs(12 * 60 * 60);
+const TOP_TRACE_MATCH_WINDOW_MS: u64 = 120_000;
+pub const PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS: &str = "selective-subagents";
+pub const DECISION_PLANE_HOSTED: &str = "hosted";
+pub const DECISION_PLANE_LOCAL: &str = "local";
+
+fn daemon_name() -> &'static str {
+    crate::DAEMON_BIN
+}
+
+fn cli_name() -> &'static str {
+    crate::CLI_BIN
+}
+
+fn daemon_bin_env_var() -> &'static str {
+    "RLD_BIN"
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterStatusRequest {
+    pub root_env_explicit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterStartRequest {
+    pub env_name: Option<String>,
+    pub model_repo: String,
+    pub model_file: String,
+    pub router_url: String,
+    pub router_url_explicit: bool,
+    pub decision_plane: String,
+    pub local_router_port: u16,
+    pub router_config_path: Option<PathBuf>,
+    pub local_model_id: String,
+    /// Custom upstream endpoint root (LM Studio / Ollama / llama.cpp). When set,
+    /// `spawn_router` passes `--upstream-url` and skips `--model-repo`/
+    /// `--model-file` so the daemon never downloads a GGUF (custom mode).
+    pub upstream_url: Option<String>,
+    /// Model name the custom endpoint advertises/serves (`--upstream-model`).
+    pub upstream_model: Option<String>,
+    pub adapter_port: u16,
+    pub injector_port: u16,
+    pub enable_proxy: bool,
+    pub proxy_port: u16,
+    pub proxy_routing_mode: String,
+    pub root_env_explicit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalProxyStartRequest {
+    pub router_url: String,
+    pub proxy_port: u16,
+    pub proxy_routing_mode: String,
+    pub router_config_path: Option<PathBuf>,
+    pub local_model_id: String,
+    pub adapter_port: u16,
+    pub custom_mode: bool,
+    pub force_restart: bool,
+    pub diagnose: bool,
+    pub upstream_ca_path: Option<PathBuf>,
+    pub isolated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProxyLocalConfig {
+    local_model_id: String,
+    adapter_port: u16,
+    custom_mode: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterLogsRequest {
+    pub lines: i64,
+    pub root_env_explicit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterTopRequest {
+    pub json: bool,
+    pub root_env_explicit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterStopRequest {
+    pub root_env_explicit: bool,
+}
+
+impl RouterStatusRequest {
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
+    }
+}
+
+impl RouterStartRequest {
+    /// Base request with no model: there is deliberately no bundled default —
+    /// the model always comes from the `local_model` config, layered on via
+    /// `from_local_model` (a request must never reach `spawn_router` with
+    /// these fields still empty).
+    pub fn defaults(root_env_explicit: bool) -> Self {
+        Self {
+            env_name: None,
+            model_repo: String::new(),
+            model_file: String::new(),
+            router_url: crate::ROUTER_PROD_URL.to_owned(),
+            router_url_explicit: false,
+            decision_plane: DECISION_PLANE_HOSTED.to_owned(),
+            local_router_port: DEFAULT_LOCAL_ROUTER_PORT,
+            router_config_path: None,
+            local_model_id: String::new(),
+            upstream_url: None,
+            upstream_model: None,
+            adapter_port: DEFAULT_ADAPTER_PORT,
+            injector_port: DEFAULT_INJECTOR_PORT,
+            enable_proxy: false,
+            proxy_port: DEFAULT_PROXY_PORT,
+            proxy_routing_mode: PROXY_ROUTING_MODE_ALL.to_owned(),
+            root_env_explicit,
+        }
+    }
+
+    /// Local-router launches need a one-command bundled llama.cpp path, while
+    /// ordinary local router starts remain config-driven through `local_model`.
+    pub fn local_router_defaults(root_env_explicit: bool) -> Self {
+        let mut request = Self::defaults(root_env_explicit);
+        request.model_repo = DEFAULT_LOCAL_ROUTER_MODEL_REPO.to_owned();
+        request.model_file = DEFAULT_LOCAL_ROUTER_MODEL_FILE.to_owned();
+        request.local_model_id = DEFAULT_LOCAL_ROUTER_MODEL_ID.to_owned();
+        request.decision_plane = DECISION_PLANE_LOCAL.to_owned();
+        request.local_router_port = DEFAULT_LOCAL_ROUTER_PORT;
+        request.router_url = format!("http://127.0.0.1:{DEFAULT_LOCAL_ROUTER_PORT}");
+        request.router_url_explicit = true;
+        request
+    }
+
+    /// Layer a local-model config onto a model-less `base` request.
+    ///
+    /// `Recommended` mode fills the GGUF coordinates from the user's curated
+    /// pick (`model_repo`/`model_file`, advertising the catalog `model_id` to
+    /// the classifier). `Custom` mode points the daemon at the user's
+    /// endpoint: it sets `upstream_url`/`upstream_model` (so `spawn_router`
+    /// emits `--upstream-url`/`--upstream-model` and skips the GGUF args) and
+    /// overrides `local_model_id` with the user's model so the injector
+    /// advertises the real model name to the classifier. Incomplete configs
+    /// (no pick, or custom missing URL/model) return `base` unchanged — the
+    /// engagement gates (`resolve_engageable_local_config` in claude,
+    /// `resolve_start_model` in router start) never pass one in, and a
+    /// model-less request fails visibly at the daemon rather than silently
+    /// serving something the user didn't choose.
+    pub fn from_local_model(cfg: &crate::local_model::LocalModelConfig, base: Self) -> Self {
+        match cfg.mode {
+            crate::local_model::LocalModelMode::Recommended => {
+                let (Some(model_repo), Some(model_file)) =
+                    (cfg.model_repo.clone(), cfg.model_file.clone())
+                else {
+                    return base;
+                };
+                Self {
+                    model_repo,
+                    model_file,
+                    local_model_id: cfg.model_id.clone().unwrap_or(base.local_model_id),
+                    ..base
+                }
+            }
+            crate::local_model::LocalModelMode::Custom => {
+                let (Some(upstream_url), Some(model)) = (cfg.base_url.clone(), cfg.model.clone())
+                else {
+                    return base;
+                };
+                Self {
+                    upstream_url: Some(upstream_url),
+                    upstream_model: Some(model.clone()),
+                    local_model_id: model,
+                    ..base
+                }
+            }
+        }
+    }
+
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
+    }
+}
+
+impl RouterLogsRequest {
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
+    }
+}
+
+impl RouterTopRequest {
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        false
+    }
+}
+
+impl RouterStopRequest {
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
+    }
+}
+
+pub async fn render_status(_request: &RouterStatusRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    render_status_from_home(&home).await
+}
+
+pub fn render_logs(request: &RouterLogsRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    Ok(tail_log(&RouterPaths::new(&home).log_file, request.lines))
+}
+
+pub async fn render_top(request: &RouterTopRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    render_top_from_home(&home, request).await
+}
+
+async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Result<String> {
+    let meta = read_meta(&RouterPaths::new(home).meta_file);
+    let metrics_port = parse_optional_port(meta.get("metrics_port"))
+        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT);
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(io::Error::other)?;
+    let url = format!("http://127.0.0.1:{metrics_port}/v1/router/top/snapshot");
+    let mut trace_cache = ClaudeTraceCache::new(home);
+
+    if request.json {
+        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        trace_cache.enrich_snapshot(&mut snapshot);
+        return serde_json::to_string_pretty(&snapshot)
+            .map(|mut json| {
+                json.push('\n');
+                json
+            })
+            .map_err(io::Error::other);
+    }
+
+    if !io::stdout().is_terminal() {
+        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        trace_cache.enrich_snapshot(&mut snapshot);
+        return Ok(format_top_snapshot(&snapshot));
+    }
+
+    run_top_tui(&client, &url, trace_cache).await?;
+    Ok(String::new())
+}
+
+async fn fetch_top_snapshot(client: &reqwest::Client, url: &str) -> io::Result<Value> {
+    client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("router metrics endpoint is not available: {error}"),
+            )
+        })?
+        .error_for_status()
+        .map_err(io::Error::other)?
+        .json::<Value>()
+        .await
+        .map_err(io::Error::other)
+}
+
+struct ClaudeTraceCache {
+    home: PathBuf,
+    cwd: Option<PathBuf>,
+    last_refresh: Option<Instant>,
+    usages: Vec<TraceUsage>,
+}
+
+impl ClaudeTraceCache {
+    fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            cwd: std::env::current_dir().ok(),
+            last_refresh: None,
+            usages: Vec::new(),
+        }
+    }
+
+    fn enrich_snapshot(&mut self, snapshot: &mut Value) {
+        self.refresh_if_stale();
+        enrich_top_snapshot_with_trace_usages(snapshot, &self.usages);
+    }
+
+    fn refresh_if_stale(&mut self) {
+        if self
+            .last_refresh
+            .is_some_and(|last| last.elapsed() < TOP_TRACE_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.usages = load_claude_trace_usages(&self.home, self.cwd.as_deref());
+        self.last_refresh = Some(Instant::now());
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TraceUsage {
+    timestamp_ms: u64,
+    request_id: Option<String>,
+    message_id: Option<String>,
+    agent_type: Option<String>,
+    model: Option<String>,
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl TraceUsage {
+    fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    fn cache_ratio(&self) -> Option<f64> {
+        let total = self.total_input_tokens();
+        (total > 0).then(|| self.cache_read_input_tokens as f64 / total as f64)
+    }
+}
+
+fn enrich_top_snapshot_with_trace_usages(snapshot: &mut Value, usages: &[TraceUsage]) {
+    if usages.is_empty() {
+        return;
+    }
+    let mut total_input_delta = 0i128;
+    let mut total_output_delta = 0i128;
+    let Some(rows) = snapshot.get_mut("recent").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for row in rows {
+        if value_str(row, "state") != "completed" {
+            continue;
+        }
+        let Some((input_delta, output_delta)) = enrich_top_row_with_trace_usage(row, usages) else {
+            continue;
+        };
+        total_input_delta += input_delta;
+        total_output_delta += output_delta;
+    }
+    if let Some(totals) = snapshot.get_mut("totals").and_then(Value::as_object_mut) {
+        adjust_object_u64(totals, "input_tokens", total_input_delta);
+        adjust_object_u64(totals, "output_tokens", total_output_delta);
+    }
+}
+
+fn enrich_top_row_with_trace_usage(row: &mut Value, usages: &[TraceUsage]) -> Option<(i128, i128)> {
+    let usage = find_matching_trace_usage(row, usages)?;
+    let old_input = row_u64(row, "input_tokens").unwrap_or(0);
+    let old_output = row_u64(row, "output_tokens").unwrap_or(0);
+    let total_input = usage.total_input_tokens();
+
+    set_row_u64(row, "input_tokens", total_input);
+    set_row_u64(row, "prompt_tokens", total_input);
+    set_row_u64(row, "prompt_cache_tokens", usage.cache_read_input_tokens);
+    set_row_u64(row, "output_tokens", usage.output_tokens);
+    if let Some(ratio) = usage.cache_ratio() {
+        set_row_f64(row, "cache_hit_ratio", ratio);
+    }
+    if let Some(output_tps) = trace_output_tps(row, usage.output_tokens) {
+        set_row_f64(row, "output_tps", output_tps);
+    }
+    if let Some(request_id) = usage.request_id.as_deref() {
+        set_row_str(row, "provider_request_id", request_id);
+    }
+    set_row_str(row, "metrics_overlay", "claude_trace");
+
+    Some((
+        total_input as i128 - old_input as i128,
+        usage.output_tokens as i128 - old_output as i128,
+    ))
+}
+
+fn find_matching_trace_usage<'a>(row: &Value, usages: &'a [TraceUsage]) -> Option<&'a TraceUsage> {
+    let row_target = value_str(row, "target");
+    let row_model = match value_str(row, "selected_model") {
+        "-" => value_str(row, "requested_model"),
+        model => model,
+    };
+    let row_agent = value_str(row, "agent_type");
+    let row_output = row_u64(row, "output_tokens");
+    let row_completed_at = row_u64(row, "completed_at_unix_ms")?;
+    usages
+        .iter()
+        .filter(|usage| {
+            let remote_row = row_target != "local";
+            if remote_row && usage.request_id.is_none() {
+                return false;
+            }
+            if !remote_row && usage.request_id.is_some() {
+                return false;
+            }
+            if !models_match(row_model, usage.model.as_deref()) {
+                return false;
+            }
+            if row_agent != "-"
+                && usage
+                    .agent_type
+                    .as_deref()
+                    .is_some_and(|agent| !agent.eq_ignore_ascii_case(row_agent))
+            {
+                return false;
+            }
+            if row_target == "local"
+                && row_output.is_some_and(|output| output != usage.output_tokens)
+            {
+                return false;
+            }
+            timestamp_diff_ms(row_completed_at, usage.timestamp_ms) <= TOP_TRACE_MATCH_WINDOW_MS
+        })
+        .min_by_key(|usage| timestamp_diff_ms(row_completed_at, usage.timestamp_ms))
+}
+
+fn trace_output_tps(row: &Value, output_tokens: u64) -> Option<f64> {
+    if output_tokens == 0 {
+        return None;
+    }
+    let completed_or_duration = row_completed_at_ms(row)
+        .zip(row_u64(row, "started_at_unix_ms"))
+        .map(|(completed, started)| completed.saturating_sub(started))
+        .or_else(|| row_u64(row, "duration_ms"))?;
+    let generation_ms = row_u64(row, "first_token_at_unix_ms")
+        .zip(row_completed_at_ms(row))
+        .map(|(first, completed)| completed.saturating_sub(first))
+        .unwrap_or(completed_or_duration);
+    (generation_ms > 0).then(|| output_tokens as f64 / (generation_ms as f64 / 1000.0))
+}
+
+fn row_completed_at_ms(row: &Value) -> Option<u64> {
+    row_u64(row, "completed_at_unix_ms").or_else(|| {
+        row_u64(row, "started_at_unix_ms")
+            .zip(row_u64(row, "duration_ms"))
+            .map(|(started, duration)| started.saturating_add(duration))
+    })
+}
+
+fn timestamp_diff_ms(left: u64, right: u64) -> u64 {
+    left.abs_diff(right)
+}
+
+fn models_match(row_model: &str, trace_model: Option<&str>) -> bool {
+    if row_model == "-" {
+        return true;
+    }
+    let Some(trace_model) = trace_model.filter(|model| !model.is_empty()) else {
+        return false;
+    };
+    row_model == trace_model
+        || row_model.contains(trace_model)
+        || trace_model.contains(row_model)
+        || short_model(row_model) == short_model(trace_model)
+}
+
+fn short_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+fn load_claude_trace_usages(home: &Path, cwd: Option<&Path>) -> Vec<TraceUsage> {
+    let mut trace_files = Vec::new();
+    for project_dir in claude_trace_project_dirs(home, cwd) {
+        collect_recent_trace_files(&project_dir, &mut trace_files);
+    }
+    let mut deduped = BTreeMap::new();
+    for file in trace_files {
+        let Ok(contents) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for (line_idx, line) in contents.lines().enumerate() {
+            let Some(usage) = trace_usage_from_line(line) else {
+                continue;
+            };
+            let key = usage
+                .request_id
+                .clone()
+                .or_else(|| usage.message_id.clone())
+                .unwrap_or_else(|| format!("{}:{line_idx}", file.display()));
+            deduped.insert(key, usage);
+        }
+    }
+    deduped.into_values().collect()
+}
+
+fn claude_trace_project_dirs(home: &Path, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        roots.push(config_dir.join("projects"));
+    }
+    roots.push(home.join(".claude").join("projects"));
+
+    let mut dirs = Vec::new();
+    if let Some(cwd) = cwd {
+        let slug = claude_project_slug(cwd);
+        for root in &roots {
+            let dir = root.join(&slug);
+            if dir.is_dir() {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+fn collect_recent_trace_files(project_dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(project_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            if trace_file_is_recent(&path) {
+                files.push(path);
+            }
+            continue;
+        }
+        if path.is_dir() {
+            collect_recent_subagent_trace_files(&path.join("subagents"), files);
+        }
+    }
+}
+
+fn collect_recent_subagent_trace_files(subagents_dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(subagents_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && trace_file_is_recent(&path)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn trace_file_is_recent(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age <= TOP_TRACE_LOOKBACK)
+}
+
+fn trace_usage_from_line(line: &str) -> Option<TraceUsage> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let usage = value.pointer("/message/usage")?;
+    let timestamp_ms = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_trace_timestamp_ms)?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if input_tokens == 0
+        && cache_creation_input_tokens == 0
+        && cache_read_input_tokens == 0
+        && output_tokens == 0
+    {
+        return None;
+    }
+    Some(TraceUsage {
+        timestamp_ms,
+        request_id: value
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        message_id: value
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        agent_type: value
+            .get("attributionAgent")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model: value
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        input_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        output_tokens,
+    })
+}
+
+fn parse_trace_timestamp_ms(value: &str) -> Option<u64> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second_part = time_parts.next()?;
+    let (second, millis) = match second_part.split_once('.') {
+        Some((second, fraction)) => {
+            let millis = fraction
+                .chars()
+                .take(3)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+                .unwrap_or(0);
+            (second.parse::<u32>().ok()?, millis)
+        }
+        None => (second_part.parse::<u32>().ok()?, 0),
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)?;
+    u64::try_from(seconds)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(millis)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - if month <= 2 { 1 } else { 0 };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month as i32 + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i32 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era as i64 * 146_097 + day_of_era as i64 - 719_468
+}
+
+fn claude_project_slug(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
+fn row_u64(row: &Value, key: &str) -> Option<u64> {
+    row.get(key).and_then(Value::as_u64)
+}
+
+fn set_row_u64(row: &mut Value, key: &str, value: u64) {
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert(key.to_owned(), Value::from(value));
+    }
+}
+
+fn set_row_f64(row: &mut Value, key: &str, value: f64) {
+    if let Some(obj) = row.as_object_mut() {
+        if let Some(number) = serde_json::Number::from_f64(value) {
+            obj.insert(key.to_owned(), Value::Number(number));
+        }
+    }
+}
+
+fn set_row_str(row: &mut Value, key: &str, value: &str) {
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
+}
+
+fn adjust_object_u64(obj: &mut serde_json::Map<String, Value>, key: &str, delta: i128) {
+    if delta == 0 {
+        return;
+    }
+    let current = obj.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let next = if delta > 0 {
+        current.saturating_add(delta.min(u64::MAX as i128) as u64)
+    } else {
+        current.saturating_sub((-delta).min(u64::MAX as i128) as u64)
+    };
+    obj.insert(key.to_owned(), Value::from(next));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopSort {
+    Started,
+    Ttft,
+    Throughput,
+}
+
+impl TopSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Started => Self::Ttft,
+            Self::Ttft => Self::Throughput,
+            Self::Throughput => Self::Started,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Ttft => "ttft",
+            Self::Throughput => "tg",
+        }
+    }
+}
+
+struct TopTerminalGuard;
+
+impl TopTerminalGuard {
+    fn enter(stdout: &mut io::Stdout) -> io::Result<Self> {
+        terminal::enable_raw_mode().map_err(io::Error::other)?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TopTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+async fn run_top_tui(
+    client: &reqwest::Client,
+    url: &str,
+    mut trace_cache: ClaudeTraceCache,
+) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    let _guard = TopTerminalGuard::enter(&mut stdout)?;
+    let mut snapshot = Value::Null;
+    let mut last_error: Option<String> = None;
+    let mut last_fetch: Option<Instant> = None;
+    let mut paused = false;
+    let mut force_refresh = true;
+    let mut needs_draw = true;
+    let mut sort = TopSort::Started;
+
+    loop {
+        let should_refresh = force_refresh
+            || (!paused
+                && last_fetch
+                    .map(|last| last.elapsed() >= TOP_REFRESH_INTERVAL)
+                    .unwrap_or(true));
+        if should_refresh {
+            match fetch_top_snapshot(client, url).await {
+                Ok(mut next_snapshot) => {
+                    trace_cache.enrich_snapshot(&mut next_snapshot);
+                    snapshot = next_snapshot;
+                    last_error = None;
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
+            }
+            last_fetch = Some(Instant::now());
+            force_refresh = false;
+            needs_draw = true;
+        }
+
+        if needs_draw {
+            draw_top(&mut stdout, &snapshot, last_error.as_deref(), paused, sort)?;
+            needs_draw = false;
+        }
+
+        if event::poll(Duration::from_millis(100)).map_err(io::Error::other)? {
+            match event::read().map_err(io::Error::other)? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('p') => {
+                        paused = !paused;
+                        needs_draw = true;
+                    }
+                    KeyCode::Char('r') => force_refresh = true,
+                    KeyCode::Char('s') => {
+                        sort = sort.next();
+                        needs_draw = true;
+                    }
+                    _ => {}
+                },
+                Event::Resize(_, _) => needs_draw = true,
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn draw_top(
+    stdout: &mut io::Stdout,
+    snapshot: &Value,
+    last_error: Option<&str>,
+    paused: bool,
+    sort: TopSort,
+) -> io::Result<()> {
+    let (width, height) = terminal::size().map_err(io::Error::other)?;
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    let mut y = 0;
+    y = draw_title(
+        stdout,
+        y,
+        width,
+        &format!("{} Router Top", crate::DISPLAY_NAME),
+    )?;
+    y = draw_top_summary(stdout, y, width, snapshot, paused, sort)?;
+    if let Some(error) = last_error {
+        y = draw_colored_line(
+            stdout,
+            y,
+            width,
+            Color::Red,
+            &format!("last fetch error: {error}"),
+        )?;
+    }
+    y = draw_line(stdout, y, width, "")?;
+
+    let active = sorted_top_rows(snapshot, "active", sort);
+    let recent = sorted_top_rows(snapshot, "recent", sort);
+    let remaining = height.saturating_sub(y).saturating_sub(1);
+    let active_budget = if remaining > 12 {
+        remaining / 2
+    } else {
+        remaining
+    };
+    y = draw_table_section(
+        stdout,
+        y,
+        width,
+        y.saturating_add(active_budget),
+        "Active",
+        &active,
+    )?;
+    if y < height.saturating_sub(1) {
+        y = draw_line(stdout, y, width, "")?;
+    }
+    let footer_y = height.saturating_sub(1);
+    y = draw_table_section(stdout, y, width, footer_y, "Recent", &recent)?;
+
+    let _ = y;
+    let footer =
+        "q/Esc quit  p pause  r refresh  s sort  | daemon-memory metrics  | --json for scripts";
+    queue!(
+        stdout,
+        MoveTo(0, footer_y),
+        Clear(ClearType::CurrentLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print(fit_width(footer, width as usize)),
+        ResetColor
+    )?;
+    stdout.flush()
+}
+
+fn draw_top_summary(
+    stdout: &mut io::Stdout,
+    mut y: u16,
+    width: u16,
+    snapshot: &Value,
+    paused: bool,
+    sort: TopSort,
+) -> io::Result<u16> {
+    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let active = snapshot
+        .get("active")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let recent = snapshot
+        .get("recent")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    y = draw_line(
+        stdout,
+        y,
+        width,
+        &format!(
+            "current active={active}  recent={recent}  mode={}  sort={}  refresh={}ms",
+            if paused { "paused" } else { "live" },
+            sort.label(),
+            TOP_REFRESH_INTERVAL.as_millis(),
+        ),
+    )?;
+    draw_line(
+        stdout,
+        y,
+        width,
+        &format!(
+            "overall completed={}  errors={}  local={}  remote={}  input={}  output={}  {}",
+            totals_u64(totals, "completed_requests"),
+            totals_u64(totals, "errored_requests"),
+            totals_u64(totals, "local_requests"),
+            totals_u64(totals, "remote_requests"),
+            totals_u64(totals, "input_tokens"),
+            totals_u64(totals, "output_tokens"),
+            llama_perf_summary(snapshot),
+        ),
+    )
+}
+
+fn llama_perf_summary(snapshot: &Value) -> String {
+    let Some(perf) = snapshot.get("llama_perf").filter(|value| !value.is_null()) else {
+        return "llama.cpp pf=- tg=-".to_owned();
+    };
+    format!(
+        "llama.cpp pf={} tg={} updated={}",
+        rate_cell(perf, "prefill_tokens_per_second"),
+        rate_cell(perf, "generation_tokens_per_second"),
+        perf.get("updated_at_unix_ms")
+            .and_then(Value::as_u64)
+            .map(format_unix_ms_age)
+            .unwrap_or_else(|| "-".to_owned()),
+    )
+}
+
+fn draw_table_section(
+    stdout: &mut io::Stdout,
+    mut y: u16,
+    width: u16,
+    bottom_exclusive: u16,
+    title: &str,
+    rows: &[Value],
+) -> io::Result<u16> {
+    if y >= bottom_exclusive {
+        return Ok(y);
+    }
+
+    y = draw_heading(
+        stdout,
+        y,
+        width,
+        &format!("{title} requests ({})", rows.len()),
+    )?;
+    if y >= bottom_exclusive {
+        return Ok(y);
+    }
+
+    y = draw_colored_line(stdout, y, width, Color::DarkGrey, &top_table_header(width))?;
+    if rows.is_empty() {
+        if y < bottom_exclusive {
+            y = draw_line(stdout, y, width, "no requests")?;
+        }
+        return Ok(y);
+    }
+
+    let available = bottom_exclusive.saturating_sub(y) as usize;
+    let rendered_rows = rows.len().min(available);
+    for row in rows.iter().take(rendered_rows) {
+        y = draw_line(stdout, y, width, &top_table_row(row, width))?;
+    }
+    if rows.len() > rendered_rows && y < bottom_exclusive {
+        y = draw_colored_line(
+            stdout,
+            y,
+            width,
+            Color::DarkGrey,
+            &format!("... {} more", rows.len() - rendered_rows),
+        )?;
+    }
+    Ok(y)
+}
+
+fn draw_title(stdout: &mut io::Stdout, y: u16, width: u16, text: &str) -> io::Result<u16> {
+    queue!(
+        stdout,
+        MoveTo(0, y),
+        SetAttribute(Attribute::Bold),
+        SetForegroundColor(Color::Cyan),
+        Print(fit_width(text, width as usize)),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )?;
+    Ok(y.saturating_add(1))
+}
+
+fn draw_heading(stdout: &mut io::Stdout, y: u16, width: u16, text: &str) -> io::Result<u16> {
+    queue!(
+        stdout,
+        MoveTo(0, y),
+        SetAttribute(Attribute::Bold),
+        Print(fit_width(text, width as usize)),
+        SetAttribute(Attribute::Reset)
+    )?;
+    Ok(y.saturating_add(1))
+}
+
+fn draw_colored_line(
+    stdout: &mut io::Stdout,
+    y: u16,
+    width: u16,
+    color: Color,
+    text: &str,
+) -> io::Result<u16> {
+    queue!(
+        stdout,
+        MoveTo(0, y),
+        SetForegroundColor(color),
+        Print(fit_width(text, width as usize)),
+        ResetColor
+    )?;
+    Ok(y.saturating_add(1))
+}
+
+fn draw_line(stdout: &mut io::Stdout, y: u16, width: u16, text: &str) -> io::Result<u16> {
+    queue!(stdout, MoveTo(0, y), Print(fit_width(text, width as usize)))?;
+    Ok(y.saturating_add(1))
+}
+
+fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort) -> Vec<Value> {
+    let mut rows = snapshot
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.sort_by(|left, right| {
+        top_sort_value(right, sort)
+            .partial_cmp(&top_sort_value(left, sort))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows
+}
+
+fn top_sort_value(row: &Value, sort: TopSort) -> f64 {
+    match sort {
+        TopSort::Started => row
+            .get("started_at_unix_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as f64,
+        TopSort::Ttft => row.get("ttft_ms").and_then(Value::as_u64).unwrap_or(0) as f64,
+        TopSort::Throughput => row.get("output_tps").and_then(Value::as_f64).unwrap_or(0.0),
+    }
+}
+
+fn top_table_header(width: u16) -> String {
+    if width < 120 {
+        format!(
+            "{:<14} {:<10} {:<7} {:<10} {:>6} {:>7} {:>6} {:>6} {:>5} MODEL",
+            "REQ", "AGENT", "TARGET", "STATE", "OUT", "TTFT", "PF", "TG", "CACHE"
+        )
+    } else {
+        format!(
+            "{:<18} {:<12} {:<8} {:<10} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} {:>5} MODEL / POLICY",
+            "REQ", "AGENT", "TARGET", "STATE", "IN", "OUT", "AGE", "TTFT", "PF", "TG", "CACHE"
+        )
+    }
+}
+
+fn top_table_row(row: &Value, width: u16) -> String {
+    let request_id = truncate_cell(
+        value_str(row, "request_id"),
+        if width < 120 { 14 } else { 18 },
+    );
+    let agent = truncate_cell(
+        value_str(row, "agent_type"),
+        if width < 120 { 10 } else { 12 },
+    );
+    let target = truncate_cell(value_str(row, "target"), 8);
+    let state = truncate_cell(value_str(row, "state"), 10);
+    let output_tokens = count_cell(row, "output_tokens");
+    let ttft = ms_cell(row, "ttft_ms");
+    let prefill_tps = rate_cell(row, "prefill_tps");
+    let generation_tps = rate_cell(row, "output_tps");
+    let cache_hit = percent_cell(row, "cache_hit_ratio");
+    let model = top_model_cell(row);
+
+    if width < 120 {
+        return format!(
+            "{request_id:<14} {agent:<10} {target:<7} {state:<10} {output_tokens:>6} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {cache_hit:>5} {model}"
+        );
+    }
+
+    let input_tokens = count_cell(row, "input_tokens");
+    let age = ms_cell(row, "duration_ms");
+    format!(
+        "{request_id:<18} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {cache_hit:>5} {model}"
+    )
+}
+
+fn format_top_snapshot(snapshot: &Value) -> String {
+    let active = snapshot
+        .get("active")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let recent = snapshot
+        .get("recent")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let completed = totals
+        .get("completed_requests")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let errored = totals
+        .get("errored_requests")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut output = format!(
+        "Rayline router top snapshot\nactive: {active}  recent: {recent}  completed: {completed}  errors: {errored}\n"
+    );
+    if let Some(rows) = snapshot.get("active").and_then(Value::as_array) {
+        for row in rows {
+            output.push_str(&format_top_row(row));
+        }
+    }
+    if active == 0 {
+        output.push_str("no active requests\n");
+    }
+    output
+}
+
+fn format_top_row(row: &Value) -> String {
+    let request_id = value_str(row, "request_id");
+    let agent = value_str(row, "agent_type");
+    let target = value_str(row, "target");
+    let model = value_str(row, "selected_model");
+    let state = value_str(row, "state");
+    let ttft = row
+        .get("ttft_ms")
+        .and_then(Value::as_u64)
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_owned());
+    let output_tokens = row
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let prefill_tps = rate_cell(row, "prefill_tps");
+    let generation_tps = rate_cell(row, "output_tps");
+    let cache_hit = percent_cell(row, "cache_hit_ratio");
+    format!(
+        "{request_id:<22} {agent:<12} {target:<10} {state:<10} out={output_tokens:<6} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} cache={cache_hit:<5} {model}\n"
+    )
+}
+
+fn value_str<'a>(row: &'a Value, key: &str) -> &'a str {
+    row.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+}
+
+fn totals_u64(totals: &Value, key: &str) -> u64 {
+    totals.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn count_cell(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn ms_cell(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_u64)
+        .map(format_ms)
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_ms(value: u64) -> String {
+    if value < 1000 {
+        format!("{value}ms")
+    } else {
+        format!("{:.1}s", value as f64 / 1000.0)
+    }
+}
+
+fn format_unix_ms_age(value: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(value);
+    format!("{} ago", format_ms(now.saturating_sub(value)))
+}
+
+fn rate_cell(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_f64)
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn percent_cell(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_f64)
+        .map(|value| format!("{:.0}%", value * 100.0))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn top_model_cell(row: &Value) -> String {
+    let model = match value_str(row, "selected_model") {
+        "-" => value_str(row, "requested_model"),
+        selected => selected,
+    };
+    let policy = value_str(row, "policy");
+    if policy == "-" {
+        model.to_owned()
+    } else {
+        format!("{model} / {policy}")
+    }
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        value.to_owned()
+    } else {
+        fit_width(value, width)
+    }
+}
+
+fn fit_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut chars = text.chars();
+    let mut output = String::new();
+    for _ in 0..width {
+        let Some(ch) = chars.next() else {
+            return output;
+        };
+        output.push(ch);
+    }
+    if chars.next().is_none() {
+        return output;
+    }
+    output.pop();
+    output.push('~');
+    output
+}
+
+/// Filesystem path of the on-device router's combined log. Exposed so a
+/// `claude --local-router` launch can point users at live progress during the
+/// otherwise-silent wait while the local model loads.
+pub fn local_router_log_path(home: &Path) -> PathBuf {
+    RouterPaths::new(home).log_file
+}
+
+/// Filesystem path of the proxy log, for `--diagnose`. `isolated` selects the
+/// `--isolated` proxy's state dir (the `cc/` subdir) so diagnostics point users
+/// at the right log for isolated failures.
+pub fn proxy_log_path(home: &Path, isolated: bool) -> PathBuf {
+    RouterPaths::for_isolation(home, isolated).proxy_log_file
+}
+
+pub async fn start(request: &RouterStartRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    // Resolve the daemon binary before the model config so a broken install
+    // surfaces as the first error.
+    let bin_path = resolve_rld_bin(&home)?;
+    let request = resolve_start_model(&home, request.clone()).await?;
+    start_from_home_with_rld_bin(&home, &request, &bin_path).await
+}
+
+/// Fill the start request's model from the stored `local_model` config — the
+/// only model source for `router start`. A Recommended config without a pick
+/// adopts the best already-downloaded curated model and persists it as the pick. Errors (with
+/// remediation) when nothing is configured, the custom endpoint is
+/// incomplete, or the picked model is not downloaded — `router start` never
+/// downloads a model. (`claude` resolves its own config and calls
+/// `start_from_home` directly, bypassing this.)
+async fn resolve_start_model(
+    home: &Path,
+    request: RouterStartRequest,
+) -> io::Result<RouterStartRequest> {
+    let cli = cli_name();
+    let Some(cfg) = crate::local_model::read_from_home(home) else {
+        return Err(io::Error::other(format!(
+            "No local model configured. Pick one with `{cli} local use <model-id>` (see `{cli} local models`)."
+        )));
+    };
+    match cfg.mode {
+        crate::local_model::LocalModelMode::Custom => {
+            if !cfg.is_engageable() {
+                return Err(io::Error::other(format!(
+                    "Custom local endpoint is incomplete. Set it with `{cli} local custom --url <URL> --model <NAME>`."
+                )));
+            }
+            Ok(RouterStartRequest::from_local_model(&cfg, request))
+        }
+        crate::local_model::LocalModelMode::Recommended => {
+            let cfg = if cfg.has_recommended_pick() {
+                cfg
+            } else {
+                let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
+                match crate::catalog::auto_select_downloaded(&env_name).await {
+                    Some(model) => {
+                        eprintln!(
+                            "No local model selected — using downloaded `{id}` (saved as your selection; change with `{cli} local use <model-id>`).",
+                            id = model.id,
+                        );
+                        crate::local_model::set_recommended_in_home(home, &model)?
+                    }
+                    // Nothing downloaded — a sole saved custom endpoint is the
+                    // only added model, so select and serve it (custom mode:
+                    // no GGUF check applies).
+                    None => match cfg.custom_endpoints.as_slice() {
+                        [endpoint] => {
+                            eprintln!(
+                                "No local model selected — using your saved custom endpoint `{model}` ({url}).",
+                                model = endpoint.model,
+                                url = endpoint.base_url,
+                            );
+                            let cfg = crate::local_model::activate_custom_endpoint_in_home(
+                                home, endpoint,
+                            )?;
+                            return Ok(RouterStartRequest::from_local_model(&cfg, request));
+                        }
+                        _ => {
+                            return Err(io::Error::other(format!(
+                                "No local model selected and none downloaded. Pick one with `{cli} local use <model-id>` (see `{cli} local models`)."
+                            )));
+                        }
+                    },
+                }
+            };
+            let repo = cfg.model_repo.as_deref().unwrap_or_default();
+            let file = cfg.model_file.as_deref().unwrap_or_default();
+            if !hf_cache_has_gguf(home, repo, file) {
+                let model_id = cfg.model_id.as_deref().unwrap_or(file);
+                return Err(io::Error::other(format!(
+                    "Local model `{model_id}` is not downloaded. Run `{cli} local download {model_id}`."
+                )));
+            }
+            Ok(RouterStartRequest::from_local_model(&cfg, request))
+        }
+    }
+}
+
+pub async fn start_from_home(home: &Path, request: &RouterStartRequest) -> io::Result<String> {
+    let bin_path = resolve_rld_bin(home)?;
+    start_from_home_with_rld_bin(home, request, &bin_path).await
+}
+
+pub async fn stop(_request: &RouterStopRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    stop_from_home(&home).await
+}
+
+pub async fn render_status_from_home(home: &Path) -> io::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    render_status_from_home_with_client(home, &client).await
+}
+
+pub async fn start_from_home_with_rld_bin(
+    home: &Path,
+    request: &RouterStartRequest,
+    bin_path: &Path,
+) -> io::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    start_from_home_with_client(home, request, bin_path, &client).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_proxy_from_home(
+    home: &Path,
+    router_url: &str,
+    router_api_key: &str,
+    proxy_port: u16,
+    proxy_routing_mode: &str,
+    force_restart: bool,
+    diagnose: bool,
+    upstream_ca_path: Option<&Path>,
+    isolated: bool,
+) -> io::Result<String> {
+    if router_api_key.is_empty() {
+        return Err(io::Error::other(
+            "RAYLINE_ROUTER_API_KEY is required for proxy mode.",
+        ));
+    }
+    let bin_path = resolve_rld_bin(home)?;
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    start_proxy_from_home_with_client(
+        home,
+        router_url,
+        router_api_key,
+        proxy_port,
+        proxy_routing_mode,
+        &bin_path,
+        force_restart,
+        diagnose,
+        upstream_ca_path,
+        isolated,
+        None,
+        None,
+        &client,
+    )
+    .await
+}
+
+pub async fn start_local_proxy_from_home(
+    home: &Path,
+    request: &LocalProxyStartRequest,
+) -> io::Result<String> {
+    let bin_path = resolve_rld_bin(home)?;
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    let local = ProxyLocalConfig {
+        local_model_id: request.local_model_id.clone(),
+        adapter_port: request.adapter_port,
+        custom_mode: request.custom_mode,
+    };
+    start_proxy_from_home_with_client(
+        home,
+        &request.router_url,
+        "",
+        request.proxy_port,
+        &request.proxy_routing_mode,
+        &bin_path,
+        request.force_restart,
+        request.diagnose,
+        request.upstream_ca_path.as_deref(),
+        request.isolated,
+        request.router_config_path.as_deref(),
+        Some(&local),
+        &client,
+    )
+    .await
+}
+
+/// Stop a lingering shared serve daemon (`rld serve` + embedded proxy) ONLY
+/// when this cloud launch is about to bind the same proxy port the daemon's
+/// embedded proxy holds — i.e. when the launch will replace it in place.
+///
+/// Used by `claude` on a non-isolated proxy launch where the account toggle is
+/// confirmed off: such a launch starts a cloud-only proxy on `proxy_port`, but
+/// a serve daemon left over from a prior local session still binds that port,
+/// so `start_proxy_from_home` would fail with a port conflict and the model
+/// would keep occupying RAM/GPU. Stopping the daemon first frees the port for
+/// the replacement.
+///
+/// The stop is gated tightly to avoid taking down a daemon this launch is NOT
+/// replacing: only when the serve meta says it has an embedded proxy on exactly
+/// `proxy_port` (a daemon on a different port, or with no embedded proxy, does
+/// not conflict and may still be serving another session). The caller is
+/// responsible for preflighting the replacement binary before calling this, so
+/// a launch that cannot start its own proxy never performs the destructive
+/// stop.
+///
+/// Returns `true` when a live serve daemon was actually stopped.
+pub async fn stop_serve_daemon_from_home(home: &Path, proxy_port: u16) -> io::Result<bool> {
+    let paths = RouterPaths::new(home);
+    // Nothing recorded → nothing to stop (the common case); avoid building a
+    // client and probing.
+    if read_pid(&paths.pid_file).is_none() {
+        return Ok(false);
+    }
+    // Only stop a daemon whose embedded proxy occupies the exact port this
+    // launch will rebind — anything else, this launch is not the replacement.
+    let meta = read_meta(&paths.meta_file);
+    let owns_proxy_port = meta.get("proxy_enabled").map(String::as_str) == Some("true")
+        && parse_optional_port(meta.get("proxy_port")) == Some(proxy_port);
+    if !owns_proxy_port {
+        return Ok(false);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    let was_running = is_serve_daemon_running(&paths, &client).await;
+    let mut output = String::new();
+    stop_router(&paths, &client, &mut output).await?;
+    Ok(was_running)
+}
+
+/// Whether the serve pidfile points at a live `rld serve` supervisor (vs. a
+/// stale pidfile, which `stop_router` cleans up but isn't a "was running").
+async fn is_serve_daemon_running(paths: &RouterPaths, client: &reqwest::Client) -> bool {
+    let Some(pid) = read_pid(&paths.pid_file) else {
+        return false;
+    };
+    process_exists(pid)
+        && is_rld_process(pid, &read_meta(&paths.meta_file), RldMode::Serve, client).await
+}
+
+pub async fn stop_from_home(home: &Path) -> io::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
+    let paths = RouterPaths::new(home);
+    let mut output = String::new();
+    stop_router(&paths, &client, &mut output).await?;
+    stop_proxy(&paths, &client, &mut output, false).await?;
+    // Also clean up the `--isolated` proxy so it does not orphan on its own port
+    // in the `cc/` state dir. Only act (and print) when one is actually present,
+    // so the common no-isolated case keeps its existing output.
+    let isolated = RouterPaths::new_isolated(home);
+    if read_pid(&isolated.proxy_pid_file).is_some() {
+        output.push_str("--isolated:\n");
+        stop_proxy(&isolated, &client, &mut output, false).await?;
+    }
+    Ok(output)
+}
+
+async fn start_from_home_with_client(
+    home: &Path,
+    request: &RouterStartRequest,
+    bin_path: &Path,
+    client: &reqwest::Client,
+) -> io::Result<String> {
+    let request = effective_start_request(home, request)?;
+    let router_api_key = resolve_router_api_key(home, &request)?;
+    let paths = RouterPaths::new(home);
+    std::fs::create_dir_all(paths.data_dir())?;
+    let mut output = String::new();
+    let requested_meta = router_meta(home, &request, None, router_api_key.as_deref());
+
+    if let Some(existing) = read_pid(&paths.pid_file) {
+        if process_exists(existing) {
+            let meta = read_meta(&paths.meta_file);
+            let health_port =
+                parse_optional_port(meta.get("injector_port")).unwrap_or(request.injector_port);
+            let health = healthz(client, health_port).await;
+            let is_rld = is_rld_process(existing, &meta, RldMode::Serve, client).await;
+            let metadata_matches = metadata_matches_config(&meta, &requested_meta);
+            if health
+                .as_ref()
+                .is_some_and(|health| router_health_matches_meta(health, &requested_meta))
+                && is_rld
+                && metadata_matches
+            {
+                output.push_str(&format!(
+                    "{} already running (pid {existing}, injector :{health_port}).\n",
+                    daemon_name()
+                ));
+                return Ok(output);
+            }
+            if !is_rld {
+                let requested_health = if health_port == request.injector_port {
+                    health
+                } else {
+                    healthz(client, request.injector_port).await
+                };
+                if requested_health.is_some() {
+                    return Err(io::Error::other(format!(
+                        "injector :{} is responding, but pid {} from {} is not this {} supervisor. Run `{} router stop` to clean up before starting.",
+                        request.injector_port,
+                        existing,
+                        paths.pid_file.display(),
+                        daemon_name(),
+                        cli_name()
+                    )));
+                }
+                output.push_str(&format!(
+                    "{} pidfile points at {existing}, but that process is not this {} supervisor. Cleaning up.\n",
+                    daemon_name(),
+                    daemon_name()
+                ));
+                clear_router_state(&paths);
+            } else if !metadata_matches || health.is_some() {
+                output.push_str(&format!(
+                    "{} running with different config (pid {existing}); restarting.\n",
+                    daemon_name()
+                ));
+                stop_router(&paths, client, &mut output).await?;
+            } else {
+                return Err(io::Error::other(format!(
+                    "pid {existing} from {} is alive but injector :{health_port} is not responding. Run `{} router stop` first.",
+                    paths.pid_file.display(),
+                    cli_name()
+                )));
+            }
+        } else {
+            output.push_str(&format!(
+                "{} pidfile points at {existing} but the process is gone. Cleaning up.\n",
+                daemon_name()
+            ));
+            clear_router_state(&paths);
+        }
+    }
+
+    // A combined local-router serve also binds the requested proxy port.
+    // Cloud-only Rayline clients run a standalone proxy there, so take the port
+    // over: stop that proxy first, otherwise the
+    // serve's embedded proxy dies with "Address already in use" and tears down
+    // llama-server. Only do this when the incumbent proxy's meta *explicitly*
+    // records the same port we are about to bind. With a custom `RAYLINE_PROXY_PORT`
+    // there is no conflict, and a missing/unparsable meta port is not proof of a
+    // conflict, so leave an unrelated proxy (e.g. one on another port feeding
+    // other sessions) alone rather than tearing it down on a guess. A genuine
+    // same-port collision we miss this way still surfaces as a clear bind error.
+    if request.enable_proxy && read_pid(&paths.proxy_pid_file).is_some() {
+        let incumbent_port =
+            parse_optional_port(read_meta(&paths.proxy_meta_file).get("proxy_port"));
+        if incumbent_port == Some(request.proxy_port) {
+            stop_proxy(&paths, client, &mut output, false).await?;
+        }
+    }
+
+    let started = spawn_router(home, &request, bin_path, router_api_key.as_deref())?;
+    output.push_str(&started.output);
+
+    wait_for_router_ready(
+        RouterReadyWait {
+            paths: &paths,
+            client,
+            pid: started.pid,
+            injector_port: request.injector_port,
+            requested_meta: &started.meta,
+            proxy_port: if request.enable_proxy {
+                Some(request.proxy_port)
+            } else {
+                None
+            },
+            timeout: if started.cache_hit {
+                Duration::from_secs(HEALTH_TIMEOUT_SECONDS)
+            } else {
+                Duration::from_secs(HEALTH_TIMEOUT_DOWNLOAD_SECONDS)
+            },
+        },
+        &mut output,
+    )
+    .await?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_from_home_with_client(
+    home: &Path,
+    router_url: &str,
+    router_api_key: &str,
+    proxy_port: u16,
+    proxy_routing_mode: &str,
+    bin_path: &Path,
+    force_restart: bool,
+    diagnose: bool,
+    upstream_ca_path: Option<&Path>,
+    isolated: bool,
+    router_config_path: Option<&Path>,
+    local_config: Option<&ProxyLocalConfig>,
+    client: &reqwest::Client,
+) -> io::Result<String> {
+    let paths = RouterPaths::for_isolation(home, isolated);
+    std::fs::create_dir_all(paths.data_dir())?;
+    let mut output = String::new();
+    if force_restart {
+        stop_proxy(&paths, client, &mut output, true).await?;
+    }
+
+    let metrics_url = metrics_url_from_router_meta(home);
+    let requested_meta = proxy_meta(
+        home,
+        router_url,
+        router_api_key,
+        proxy_port,
+        proxy_routing_mode,
+        None,
+        upstream_ca_path,
+        router_config_path,
+        local_config,
+        metrics_url.as_deref(),
+    );
+    if let Some(existing) = read_pid(&paths.proxy_pid_file) {
+        if process_exists(existing) {
+            let meta = read_meta(&paths.proxy_meta_file);
+            let health_port = parse_optional_port(meta.get("proxy_port")).unwrap_or(proxy_port);
+            let health = healthz(client, health_port).await;
+            let is_rld = is_rld_process(existing, &meta, RldMode::Proxy, client).await;
+            let metadata_matches = metadata_matches_config(&meta, &requested_meta);
+            if health
+                .as_ref()
+                .is_some_and(|health| proxy_health_matches_meta(health, &requested_meta))
+                && is_rld
+                && metadata_matches
+            {
+                output.push_str(&format!(
+                    "{} proxy already running (pid {existing}, proxy :{health_port}).\n",
+                    daemon_name()
+                ));
+                return Ok(output);
+            }
+            if !is_rld {
+                let requested_health = if health_port == proxy_port {
+                    health
+                } else {
+                    healthz(client, proxy_port).await
+                };
+                if requested_health.is_some() {
+                    return Err(io::Error::other(format!(
+                        "proxy :{proxy_port} is responding, but pid {existing} from {} is not this {} proxy. Run `{} router stop` to clean up before starting.",
+                        paths.proxy_pid_file.display(),
+                        daemon_name(),
+                        cli_name()
+                    )));
+                }
+                output.push_str(&format!(
+                    "{} proxy pidfile points at {existing}, but that process is not this {} proxy. Cleaning up.\n",
+                    daemon_name(),
+                    daemon_name()
+                ));
+                clear_proxy_state(&paths);
+            } else if !metadata_matches || health.is_some() {
+                output.push_str(&format!(
+                    "{} proxy running with different config (pid {existing}); restarting.\n",
+                    daemon_name()
+                ));
+                stop_proxy(&paths, client, &mut output, true).await?;
+            } else {
+                return Err(io::Error::other(format!(
+                    "pid {existing} from {} is alive but proxy :{health_port} is not responding. Run `{} router stop` first.",
+                    paths.proxy_pid_file.display(),
+                    cli_name()
+                )));
+            }
+        } else {
+            output.push_str(&format!(
+                "{} proxy pidfile points at {existing} but the process is gone. Cleaning up.\n",
+                daemon_name()
+            ));
+            clear_proxy_state(&paths);
+        }
+    }
+
+    if let Some(health) = healthz(client, proxy_port).await {
+        if !proxy_health_matches_meta(&health, &requested_meta) {
+            return Err(io::Error::other(format!(
+                "proxy :{proxy_port} is already responding, but it does not match the requested {} proxy config. Stop the process using that port or set RAYLINE_PROXY_PORT/RAYLINE_ISOLATED_PROXY_PORT to a free port.",
+                daemon_name()
+            )));
+        }
+    }
+
+    let started = spawn_proxy(
+        home,
+        router_url,
+        router_api_key,
+        proxy_port,
+        proxy_routing_mode,
+        bin_path,
+        diagnose,
+        upstream_ca_path,
+        isolated,
+        router_config_path,
+        local_config,
+        metrics_url.as_deref(),
+    )?;
+    output.push_str(&started.output);
+    wait_for_proxy_ready(
+        &paths,
+        client,
+        started.pid,
+        proxy_port,
+        &started.meta,
+        &mut output,
+    )
+    .await?;
+    Ok(output)
+}
+
+struct StartedRouter {
+    pid: i32,
+    cache_hit: bool,
+    meta: BTreeMap<String, String>,
+    output: String,
+}
+
+struct StartedProxy {
+    pid: i32,
+    meta: BTreeMap<String, String>,
+    output: String,
+}
+
+fn spawn_router(
+    home: &Path,
+    request: &RouterStartRequest,
+    bin_path: &Path,
+    router_api_key: Option<&str>,
+) -> io::Result<StartedRouter> {
+    let paths = RouterPaths::new(home);
+    std::fs::create_dir_all(paths.data_dir())?;
+    let requested_meta = router_meta(home, request, Some(bin_path), router_api_key);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.log_file)?;
+    let adapter_port = request.adapter_port.to_string();
+    let injector_port = request.injector_port.to_string();
+    let local_router_port = request.local_router_port.to_string();
+    let metrics_port = rayline_metrics::DEFAULT_METRICS_PORT.to_string();
+    let mut command = Command::new(bin_path);
+    command.args(["serve"]);
+    // Custom mode: forward to the user's endpoint and skip the GGUF args so the
+    // daemon never downloads a bundled model. Auto mode: the bundled GGUF path.
+    if let Some(upstream_url) = request.upstream_url.as_deref() {
+        command.args(["--upstream-url", upstream_url]);
+        if let Some(upstream_model) = request.upstream_model.as_deref() {
+            command.args(["--upstream-model", upstream_model]);
+        }
+    } else {
+        command.args([
+            "--model-repo",
+            &request.model_repo,
+            "--model-file",
+            &request.model_file,
+        ]);
+    }
+    command.args([
+        "--decision-plane",
+        &request.decision_plane,
+        "--local-router-port",
+        &local_router_port,
+        "--router-url",
+        &request.router_url,
+        "--local-model-id",
+        &request.local_model_id,
+        "--adapter-port",
+        &adapter_port,
+        "--injector-port",
+        &injector_port,
+        "--metrics-port",
+        &metrics_port,
+    ]);
+    if let Some(path) = request.router_config_path.as_deref() {
+        command.arg("--router-config-path").arg(path);
+    }
+    let ca_cert_path = proxy_ca_cert_path(home);
+    let ca_key_path = proxy_ca_key_path(home);
+    if request.enable_proxy {
+        let proxy_port = request.proxy_port.to_string();
+        let ca_cert_path = ca_cert_path.display().to_string();
+        let ca_key_path = ca_key_path.display().to_string();
+        command.args([
+            "--proxy-port",
+            &proxy_port,
+            "--ca-cert-path",
+            &ca_cert_path,
+            "--ca-key-path",
+            &ca_key_path,
+            "--proxy-routing-mode",
+            &request.proxy_routing_mode,
+        ]);
+        set_proxy_child_env(
+            &mut command,
+            router_api_key.unwrap_or_default(),
+            request.proxy_port,
+        );
+    }
+    command.env("RUST_LOG", "info");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file));
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn()?;
+    let pid = child.id() as i32;
+    std::fs::write(&paths.pid_file, format!("{pid}\n"))?;
+    std::fs::write(&paths.meta_file, format_meta(&requested_meta))?;
+
+    let mut output = format!(
+        "{} starting (pid {pid}, log {}).",
+        daemon_name(),
+        paths.log_file.display()
+    );
+    // Custom mode downloads no GGUF, so there is never a first-run download wait
+    // to warn about — treat it like a warm cache.
+    let cache_hit = request.upstream_url.is_some()
+        || hf_cache_has_gguf(home, &request.model_repo, &request.model_file);
+    if cache_hit {
+        output.push_str(" Waiting for healthz\u{2026}\n");
+    } else {
+        output.push('\n');
+        output.push_str(&format!(
+            "First-time setup: downloading {} from {}. This can take 10+ minutes on a slow connection \u{2014} progress below. If you Ctrl-C, the download continues in the background; re-run the same command to resume.\n",
+            request.model_file, request.model_repo
+        ));
+    }
+
+    Ok(StartedRouter {
+        pid,
+        cache_hit,
+        meta: requested_meta,
+        output,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_proxy(
+    home: &Path,
+    router_url: &str,
+    router_api_key: &str,
+    proxy_port: u16,
+    proxy_routing_mode: &str,
+    bin_path: &Path,
+    diagnose: bool,
+    upstream_ca_path: Option<&Path>,
+    isolated: bool,
+    router_config_path: Option<&Path>,
+    local_config: Option<&ProxyLocalConfig>,
+    metrics_url: Option<&str>,
+) -> io::Result<StartedProxy> {
+    let paths = RouterPaths::for_isolation(home, isolated);
+    std::fs::create_dir_all(paths.data_dir())?;
+    let requested_meta = proxy_meta(
+        home,
+        router_url,
+        router_api_key,
+        proxy_port,
+        proxy_routing_mode,
+        Some(bin_path),
+        upstream_ca_path,
+        router_config_path,
+        local_config,
+        metrics_url,
+    );
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.proxy_log_file)?;
+    let proxy_port_arg = proxy_port.to_string();
+    let ca_cert_path = proxy_ca_cert_path(home);
+    let ca_key_path = proxy_ca_key_path(home);
+    let ca_cert_arg = ca_cert_path.display().to_string();
+    let ca_key_arg = ca_key_path.display().to_string();
+    let mut command = Command::new(bin_path);
+    command.args([
+        "proxy",
+        "--proxy-port",
+        &proxy_port_arg,
+        "--router-url",
+        router_url,
+        "--ca-cert-path",
+        &ca_cert_arg,
+        "--ca-key-path",
+        &ca_key_arg,
+        "--proxy-routing-mode",
+        proxy_routing_mode,
+    ]);
+    if let Some(upstream_ca_path) = upstream_ca_path {
+        command
+            .arg("--upstream-ca-path")
+            .arg(upstream_ca_path.as_os_str());
+    }
+    if let Some(router_config_path) = router_config_path {
+        command
+            .arg("--router-config-path")
+            .arg(router_config_path.as_os_str());
+    }
+    if let Some(local_config) = local_config {
+        let adapter_port = local_config.adapter_port.to_string();
+        command.args([
+            "--local-available",
+            "--local-model-id",
+            &local_config.local_model_id,
+            "--local-adapter-port",
+            &adapter_port,
+        ]);
+        if local_config.custom_mode {
+            command.arg("--local-custom");
+        }
+        command.arg("--local-router-owns-metrics");
+    }
+    if let Some(metrics_url) = metrics_url {
+        command.args(["--metrics-url", metrics_url]);
+    }
+    set_proxy_child_env(&mut command, router_api_key, proxy_port);
+    command.env("RUST_LOG", if diagnose { "debug" } else { "info" });
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file));
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn()?;
+    let pid = child.id() as i32;
+    std::fs::write(&paths.proxy_pid_file, format!("{pid}\n"))?;
+    std::fs::write(&paths.proxy_meta_file, format_meta(&requested_meta))?;
+    Ok(StartedProxy {
+        pid,
+        meta: requested_meta,
+        output: format!(
+            "{} proxy starting (pid {pid}, log {}). Waiting for healthz\u{2026}\n",
+            daemon_name(),
+            paths.proxy_log_file.display()
+        ),
+    })
+}
+
+struct RouterReadyWait<'a> {
+    paths: &'a RouterPaths,
+    client: &'a reqwest::Client,
+    pid: i32,
+    injector_port: u16,
+    requested_meta: &'a BTreeMap<String, String>,
+    proxy_port: Option<u16>,
+    timeout: Duration,
+}
+
+async fn wait_for_router_ready(state: RouterReadyWait<'_>, output: &mut String) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + state.timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_exists(state.pid) {
+            return Err(io::Error::other(format!(
+                "{} exited early. Last log lines:\n{}",
+                daemon_name(),
+                tail_log(&state.paths.log_file, 40)
+            )));
+        }
+        let injector_ready = healthz(state.client, state.injector_port)
+            .await
+            .as_ref()
+            .is_some_and(|health| router_health_matches_meta(health, state.requested_meta));
+        if injector_ready {
+            if let Some(proxy_port) = state.proxy_port {
+                if !healthz(state.client, proxy_port)
+                    .await
+                    .as_ref()
+                    .is_some_and(|health| proxy_health_matches_meta(health, state.requested_meta))
+                {
+                    tokio::time::sleep(HEALTH_POLL).await;
+                    continue;
+                }
+                output.push_str(&format!(
+                    "{} ready \u{2014} set HTTPS_PROXY=http://127.0.0.1:{proxy_port}\n",
+                    daemon_name()
+                ));
+                return Ok(());
+            }
+            output.push_str(&format!(
+                "{} ready \u{2014} point Claude Code at ANTHROPIC_BASE_URL=http://127.0.0.1:{}\n",
+                daemon_name(),
+                state.injector_port
+            ));
+            return Ok(());
+        }
+        tokio::time::sleep(HEALTH_POLL).await;
+    }
+
+    let _ = terminate_process(state.pid);
+    clear_router_state(state.paths);
+    Err(io::Error::other(format!(
+        "{} did not become healthy in {}s. See {}.",
+        daemon_name(),
+        state.timeout.as_secs(),
+        state.paths.log_file.display()
+    )))
+}
+
+async fn wait_for_proxy_ready(
+    paths: &RouterPaths,
+    client: &reqwest::Client,
+    pid: i32,
+    proxy_port: u16,
+    requested_meta: &BTreeMap<String, String>,
+    output: &mut String,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(HEALTH_TIMEOUT_SECONDS);
+    while std::time::Instant::now() < deadline {
+        if !process_exists(pid) {
+            return Err(io::Error::other(format!(
+                "{} proxy exited early. Last log lines:\n{}",
+                daemon_name(),
+                tail_log(&paths.proxy_log_file, 40)
+            )));
+        }
+        if healthz(client, proxy_port)
+            .await
+            .as_ref()
+            .is_some_and(|health| proxy_health_matches_meta(health, requested_meta))
+        {
+            output.push_str(&format!(
+                "{} proxy ready \u{2014} set HTTPS_PROXY=http://127.0.0.1:{proxy_port}\n",
+                daemon_name()
+            ));
+            return Ok(());
+        }
+        tokio::time::sleep(HEALTH_POLL).await;
+    }
+
+    let _ = terminate_process(pid);
+    clear_proxy_state(paths);
+    Err(io::Error::other(format!(
+        "{} proxy did not become healthy in {}s. See {}.",
+        daemon_name(),
+        HEALTH_TIMEOUT_SECONDS,
+        paths.proxy_log_file.display()
+    )))
+}
+
+fn router_meta(
+    home: &Path,
+    request: &RouterStartRequest,
+    bin_path: Option<&Path>,
+    router_api_key: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::new();
+    meta.insert("model_repo".to_owned(), request.model_repo.clone());
+    meta.insert("model_file".to_owned(), request.model_file.clone());
+    // Record the custom upstream so switching endpoints (or auto↔custom) is seen
+    // as a config change and restarts the daemon. Empty in auto mode.
+    meta.insert(
+        "upstream_url".to_owned(),
+        request.upstream_url.clone().unwrap_or_default(),
+    );
+    // Also record the upstream model so changing only `--upstream-model` (same
+    // url + local-model-id) is seen as a config change and restarts the daemon —
+    // otherwise the adapter keeps rewriting requests to the previous model.
+    meta.insert(
+        "upstream_model".to_owned(),
+        request.upstream_model.clone().unwrap_or_default(),
+    );
+    meta.insert("router_url".to_owned(), request.router_url.clone());
+    meta.insert("decision_plane".to_owned(), request.decision_plane.clone());
+    meta.insert(
+        "local_router_port".to_owned(),
+        request.local_router_port.to_string(),
+    );
+    meta.insert(
+        "router_config_path".to_owned(),
+        request
+            .router_config_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
+    meta.insert("local_model_id".to_owned(), request.local_model_id.clone());
+    meta.insert("adapter_port".to_owned(), request.adapter_port.to_string());
+    meta.insert(
+        "injector_port".to_owned(),
+        request.injector_port.to_string(),
+    );
+    meta.insert(
+        "metrics_port".to_owned(),
+        rayline_metrics::DEFAULT_METRICS_PORT.to_string(),
+    );
+    if let Some(bin_path) = bin_path {
+        meta.insert("bin_path".to_owned(), bin_path.display().to_string());
+    }
+    if request.enable_proxy {
+        meta.insert("proxy_enabled".to_owned(), "true".to_owned());
+        meta.insert("proxy_port".to_owned(), request.proxy_port.to_string());
+        meta.insert(
+            "proxy_routing_mode".to_owned(),
+            request.proxy_routing_mode.clone(),
+        );
+        if let Some(fingerprint) = router_key_fingerprint(router_api_key) {
+            meta.insert("router_key_sha256".to_owned(), fingerprint);
+        }
+        meta.insert(
+            "ca_cert_path".to_owned(),
+            proxy_ca_cert_path(home).display().to_string(),
+        );
+        meta.insert(
+            "ca_key_path".to_owned(),
+            proxy_ca_key_path(home).display().to_string(),
+        );
+        meta.insert("upstream_ca_path".to_owned(), String::new());
+    }
+    meta
+}
+
+fn metrics_url_from_router_meta(home: &Path) -> Option<String> {
+    let meta = read_meta(&RouterPaths::new(home).meta_file);
+    if meta.is_empty() {
+        return None;
+    }
+    let port = parse_optional_port(meta.get("metrics_port"))
+        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT);
+    Some(format!("http://127.0.0.1:{port}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proxy_meta(
+    home: &Path,
+    router_url: &str,
+    router_api_key: &str,
+    proxy_port: u16,
+    proxy_routing_mode: &str,
+    bin_path: Option<&Path>,
+    upstream_ca_path: Option<&Path>,
+    router_config_path: Option<&Path>,
+    local_config: Option<&ProxyLocalConfig>,
+    metrics_url: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::new();
+    meta.insert("router_url".to_owned(), router_url.to_owned());
+    meta.insert("proxy_port".to_owned(), proxy_port.to_string());
+    meta.insert(
+        "proxy_routing_mode".to_owned(),
+        proxy_routing_mode.to_owned(),
+    );
+    if let Some(fingerprint) = router_key_fingerprint(Some(router_api_key)) {
+        meta.insert("router_key_sha256".to_owned(), fingerprint);
+    }
+    if let Some(local_config) = local_config {
+        meta.insert("decision_plane".to_owned(), DECISION_PLANE_LOCAL.to_owned());
+        meta.insert("local_available".to_owned(), "true".to_owned());
+        meta.insert(
+            "local_model_id".to_owned(),
+            local_config.local_model_id.clone(),
+        );
+        meta.insert(
+            "local_adapter_port".to_owned(),
+            local_config.adapter_port.to_string(),
+        );
+        meta.insert(
+            "local_custom".to_owned(),
+            local_config.custom_mode.to_string(),
+        );
+    }
+    if let Some(metrics_url) = metrics_url {
+        meta.insert("metrics_url".to_owned(), metrics_url.to_owned());
+    }
+    meta.insert(
+        "ca_cert_path".to_owned(),
+        proxy_ca_cert_path(home).display().to_string(),
+    );
+    meta.insert(
+        "ca_key_path".to_owned(),
+        proxy_ca_key_path(home).display().to_string(),
+    );
+    meta.insert(
+        "upstream_ca_path".to_owned(),
+        upstream_ca_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
+    meta.insert(
+        "router_config_path".to_owned(),
+        router_config_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
+    if let Some(bin_path) = bin_path {
+        meta.insert("bin_path".to_owned(), bin_path.display().to_string());
+    }
+    meta
+}
+
+fn metadata_matches_config(
+    meta: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+) -> bool {
+    expected.iter().all(|(key, expected_value)| {
+        if key == "bin_path" {
+            return true;
+        }
+        let Some(actual) = meta.get(key) else {
+            return false;
+        };
+        if key == "router_url" {
+            actual.trim_end_matches('/') == expected_value.trim_end_matches('/')
+        } else {
+            actual == expected_value
+        }
+    })
+}
+
+fn format_meta(meta: &BTreeMap<String, String>) -> String {
+    let mut output = String::new();
+    for key in [
+        "model_repo",
+        "model_file",
+        "upstream_url",
+        "upstream_model",
+        "router_url",
+        "decision_plane",
+        "local_available",
+        "local_router_port",
+        "router_config_path",
+        "local_model_id",
+        "local_adapter_port",
+        "local_custom",
+        "adapter_port",
+        "injector_port",
+        "metrics_port",
+        "metrics_url",
+        "bin_path",
+        "proxy_enabled",
+        "proxy_port",
+        "proxy_routing_mode",
+        "router_key_sha256",
+        "ca_cert_path",
+        "ca_key_path",
+        "upstream_ca_path",
+    ] {
+        if let Some(value) = meta.get(key) {
+            output.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    output
+}
+
+fn effective_start_request(
+    home: &Path,
+    request: &RouterStartRequest,
+) -> io::Result<RouterStartRequest> {
+    let mut effective = request.clone();
+    if effective.decision_plane == DECISION_PLANE_LOCAL {
+        effective.router_url = format!("http://127.0.0.1:{}", effective.local_router_port);
+        effective.router_url_explicit = true;
+        return Ok(effective);
+    }
+    if effective.enable_proxy && !effective.router_url_explicit {
+        let env_name = crate::status::resolve_env(effective.env_name.as_deref(), Some(home));
+        let hosted = crate::status::resolve_hosted_environment(&env_name, Some(home))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        effective.router_url = hosted.router_url;
+    }
+    Ok(effective)
+}
+
+fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Result<Option<String>> {
+    if !request.enable_proxy {
+        return Ok(None);
+    }
+    if request.decision_plane == DECISION_PLANE_LOCAL {
+        return Ok(Some(String::new()));
+    }
+    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
+    crate::status::resolve_hosted_environment(&env_name, Some(home))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    crate::status::load_claude_key_from_home(&env_name, home)
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "No {} router key stored for {env_name}. Run: {} auth login",
+                crate::DISPLAY_NAME,
+                cli_name()
+            ))
+        })
+}
+
+fn router_key_fingerprint(router_api_key: Option<&str>) -> Option<String> {
+    let router_api_key = router_api_key.filter(|key| !key.is_empty())?;
+    Some(format!(
+        "sha256:{:x}",
+        Sha256::digest(router_api_key.as_bytes())
+    ))
+}
+
+fn proxy_ca_cert_path(home: &Path) -> PathBuf {
+    proxy_ca_dir(home).join("proxy-ca.pem")
+}
+
+pub fn default_proxy_ca_cert_path(home: &Path) -> PathBuf {
+    proxy_ca_cert_path(home)
+}
+
+fn proxy_ca_key_path(home: &Path) -> PathBuf {
+    proxy_ca_dir(home).join("proxy-ca-key.pem")
+}
+
+fn proxy_ca_dir(home: &Path) -> PathBuf {
+    platform_config_dir(home).join(crate::CONFIG_DIR)
+}
+
+fn platform_config_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library").join("Application Support")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+    }
+}
+
+fn set_proxy_child_env(command: &mut Command, router_api_key: &str, proxy_port: u16) {
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if std::env::var(name).is_ok_and(|value| is_self_proxy_url(&value, proxy_port)) {
+            command.env_remove(name);
+        }
+    }
+    command.env("RAYLINE_ROUTER_API_KEY", router_api_key);
+}
+
+fn is_self_proxy_url(value: &str, proxy_port: u16) -> bool {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("http://{raw}")
+    };
+    let Ok(parsed) = reqwest::Url::parse(&candidate) else {
+        return false;
+    };
+    matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+        && parsed.port() == Some(proxy_port)
+}
+
+pub(crate) fn resolve_rld_bin(home: &Path) -> io::Result<PathBuf> {
+    let env_var = daemon_bin_env_var();
+    if let Some(explicit) = std::env::var_os(env_var) {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("${env_var} points to a missing file: {}", path.display()),
+        ));
+    }
+    let bundled = home
+        .join(crate::DOT_CONFIG_DIR)
+        .join("bin")
+        .join(daemon_name());
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+    if let Some(found) = find_on_path(daemon_name()) {
+        return Ok(found);
+    }
+    let dev_hint = format!(
+        "`cargo build --release -p rayline-daemon` and place target/release/{} on PATH or set ${env_var}",
+        daemon_name()
+    );
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} binary not found. Reinstall with `curl -fsSL {} | bash` (drops it at {}), or for dev: {dev_hint}.",
+            daemon_name(),
+            crate::INSTALLER_URL,
+            bundled.display(),
+        ),
+    ))
+}
+
+fn find_on_path(binary_name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe_candidate = dir.join(format!("{binary_name}.exe"));
+            if exe_candidate.is_file() {
+                return Some(exe_candidate);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn hf_cache_has_gguf(home: &Path, model_repo: &str, model_file: &str) -> bool {
+    let repo_dir = hf_hub_dir(home).join(format!("models--{}", model_repo.replace('/', "--")));
+    let snapshots = repo_dir.join("snapshots");
+    let Ok(entries) = std::fs::read_dir(snapshots) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join(model_file).is_file())
+}
+
+fn hf_hub_dir(home: &Path) -> PathBuf {
+    if let Some(hub_cache) = std::env::var_os("HF_HUB_CACHE") {
+        return PathBuf::from(hub_cache);
+    }
+    if let Some(hf_home) = std::env::var_os("HF_HOME") {
+        return PathBuf::from(hf_home).join("hub");
+    }
+    platform_cache_dir(home).join("huggingface/hub")
+}
+
+fn platform_cache_dir(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return home.join("Library/Caches");
+    }
+    if cfg!(windows) {
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_appdata);
+        }
+        return home.join("AppData/Local");
+    }
+    if let Some(xdg_cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg_cache_home);
+    }
+    home.join(".cache")
+}
+
+async fn render_status_from_home_with_client(
+    home: &Path,
+    client: &reqwest::Client,
+) -> io::Result<String> {
+    let paths = RouterPaths::new(home);
+    let pid = read_pid(&paths.pid_file);
+    let meta = read_meta(&paths.meta_file);
+    let injector_port = parse_port(meta.get("injector_port"), DEFAULT_INJECTOR_PORT);
+    let adapter_port = parse_port(meta.get("adapter_port"), DEFAULT_ADAPTER_PORT);
+    let mut output = String::new();
+
+    match pid {
+        None => {
+            output.push_str(&format!("{}: not running (no pidfile).\n", daemon_name()));
+            append_proxy_sidecar_status(&mut output, &paths, client).await;
+            append_isolated_proxy_status(&mut output, home, client).await;
+            return Ok(output);
+        }
+        Some(pid) if !process_exists(pid) => {
+            output.push_str(&format!(
+                "{}: stale pidfile (pid {pid} gone). Run `{} router stop` to clean up.\n",
+                daemon_name(),
+                cli_name()
+            ));
+            append_proxy_sidecar_status(&mut output, &paths, client).await;
+            append_isolated_proxy_status(&mut output, home, client).await;
+            return Ok(output);
+        }
+        Some(pid) => {
+            output.push_str(&format!("{}: pid {pid}\n", daemon_name()));
+        }
+    }
+
+    for key in ["model_repo", "model_file", "local_model_id", "router_url"] {
+        if let Some(value) = meta.get(key) {
+            output.push_str(&format!("  {key}: {value}\n"));
+        }
+    }
+
+    let injector_health = healthz(client, injector_port).await;
+    if let Some(health) = injector_health.as_ref() {
+        output.push_str(&format!(
+            "  injector :{injector_port} \u{2713} ({})\n",
+            value_display_or_empty(health.get("router_url")),
+        ));
+    } else {
+        output.push_str(&format!(
+            "  injector :{injector_port} \u{2717} (no healthz)\n"
+        ));
+    }
+
+    let adapter_health = healthz(client, adapter_port).await;
+    if let Some(health) = adapter_health.as_ref() {
+        output.push_str(&format!(
+            "  adapter  :{adapter_port} \u{2713} (\u{2192} {})\n",
+            value_display_or_empty(health.get("target")),
+        ));
+    } else {
+        output.push_str(&format!(
+            "  adapter  :{adapter_port} \u{2717} (no healthz)\n"
+        ));
+    }
+
+    if let Some(proxy_port) = parse_optional_port(meta.get("proxy_port")) {
+        append_proxy_health(&mut output, client, proxy_port).await;
+    } else {
+        append_proxy_sidecar_status(&mut output, &paths, client).await;
+    }
+    output.push_str(&format!("  log: {}\n", paths.log_file.display()));
+    append_isolated_proxy_status(&mut output, home, client).await;
+
+    Ok(output)
+}
+
+pub fn tail_log(path: &Path, lines: i64) -> String {
+    if !path.is_file() {
+        return "(no log)".to_owned();
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => return format!("(could not read log: {error})"),
+    };
+
+    let entries = text.lines().collect::<Vec<_>>();
+    let start = tail_start(entries.len(), lines);
+    entries[start..].join("\n")
+}
+
+fn tail_start(len: usize, lines: i64) -> usize {
+    if lines == 0 {
+        return 0;
+    }
+    if lines > 0 {
+        return len.saturating_sub(lines as usize);
+    }
+    len.min(lines.unsigned_abs() as usize)
+}
+
+async fn stop_router(
+    paths: &RouterPaths,
+    client: &reqwest::Client,
+    output: &mut String,
+) -> io::Result<()> {
+    let Some(pid) = read_pid(&paths.pid_file) else {
+        output.push_str(&format!("{} is not running (no pidfile).\n", daemon_name()));
+        return Ok(());
+    };
+    if !process_exists(pid) {
+        output.push_str(&format!(
+            "{} pidfile points at {pid} but the process is gone. Cleaning up.\n",
+            daemon_name()
+        ));
+        clear_router_state(paths);
+        return Ok(());
+    }
+
+    let meta = read_meta(&paths.meta_file);
+    if !is_rld_process(pid, &meta, RldMode::Serve, client).await {
+        output.push_str(&format!(
+            "{} pidfile points at {pid}, but that process is not this {} supervisor. Cleaning up.\n",
+            daemon_name(),
+            daemon_name()
+        ));
+        clear_router_state(paths);
+        return Ok(());
+    }
+
+    output.push_str(&format!("Stopping {} (pid {pid})\u{2026}\n", daemon_name()));
+    match terminate_process(pid) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            clear_router_state(paths);
+            output.push_str("already gone.\n");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+
+    for _ in 0..50 {
+        if !process_exists(pid) {
+            clear_router_state(paths);
+            output.push_str(&format!("{} stopped.\n", daemon_name()));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    output.push_str("SIGTERM timeout \u{2014} forcing router process tree to stop.\n");
+    force_stop_process_group(pid)?;
+    clear_router_state(paths);
+    output.push_str(&format!("{} killed.\n", daemon_name()));
+    Ok(())
+}
+
+async fn stop_proxy(
+    paths: &RouterPaths,
+    client: &reqwest::Client,
+    output: &mut String,
+    quiet: bool,
+) -> io::Result<()> {
+    let Some(pid) = read_pid(&paths.proxy_pid_file) else {
+        if !quiet {
+            output.push_str(&format!(
+                "{} proxy is not running (no pidfile).\n",
+                daemon_name()
+            ));
+        }
+        clear_proxy_state(paths);
+        return Ok(());
+    };
+    if !process_exists(pid) {
+        if !quiet {
+            output.push_str(&format!(
+                "{} proxy pidfile points at {pid} but the process is gone. Cleaning up.\n",
+                daemon_name()
+            ));
+        }
+        clear_proxy_state(paths);
+        return Ok(());
+    }
+
+    let meta = read_meta(&paths.proxy_meta_file);
+    if !is_rld_process(pid, &meta, RldMode::Proxy, client).await {
+        if !quiet {
+            output.push_str(&format!(
+                "{} proxy pidfile points at {pid}, but that process is not this {} proxy. Cleaning up.\n",
+                daemon_name(),
+                daemon_name()
+            ));
+        }
+        clear_proxy_state(paths);
+        return Ok(());
+    }
+
+    if !quiet {
+        output.push_str(&format!(
+            "Stopping {} proxy (pid {pid})\u{2026}\n",
+            daemon_name()
+        ));
+    }
+    if let Err(error) = terminate_process(pid) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    for _ in 0..50 {
+        if !process_exists(pid) {
+            clear_proxy_state(paths);
+            if !quiet {
+                output.push_str(&format!("{} proxy stopped.\n", daemon_name()));
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    if !quiet {
+        output.push_str("SIGTERM timeout \u{2014} forcing proxy process tree to stop.\n");
+    }
+    force_stop_process_group(pid)?;
+    clear_proxy_state(paths);
+    if !quiet {
+        output.push_str(&format!("{} proxy killed.\n", daemon_name()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RldMode {
+    Serve,
+    Proxy,
+}
+
+impl RldMode {
+    fn arg(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+async fn is_rld_process(
+    pid: i32,
+    meta: &BTreeMap<String, String>,
+    mode: RldMode,
+    client: &reqwest::Client,
+) -> bool {
+    let Some(argv) = process_argv(pid) else {
+        return running_matches_meta(meta, mode, client).await;
+    };
+    let Some(program) = argv.first() else {
+        return running_matches_meta(meta, mode, client).await;
+    };
+
+    let mut expected_names = vec![daemon_name().to_owned(), format!("{}.exe", daemon_name())];
+    if let Some(bin_path) = meta.get("bin_path") {
+        expected_names.push(process_name(bin_path));
+    }
+    if !expected_names
+        .iter()
+        .any(|expected| process_name(program) == *expected)
+    {
+        return false;
+    }
+    if argv.get(1).is_none_or(|arg| arg != mode.arg()) {
+        return false;
+    }
+
+    match mode {
+        RldMode::Serve => match parse_optional_port(meta.get("injector_port")) {
+            Some(port) => healthz(client, port)
+                .await
+                .is_none_or(|health| router_health_matches_meta(&health, meta)),
+            None => true,
+        },
+        RldMode::Proxy => match parse_optional_port(meta.get("proxy_port")) {
+            Some(port) => healthz(client, port)
+                .await
+                .is_none_or(|health| proxy_health_matches_meta(&health, meta)),
+            None => true,
+        },
+    }
+}
+
+async fn running_matches_meta(
+    meta: &BTreeMap<String, String>,
+    mode: RldMode,
+    client: &reqwest::Client,
+) -> bool {
+    match mode {
+        RldMode::Serve => {
+            let Some(port) = parse_optional_port(meta.get("injector_port")) else {
+                return false;
+            };
+            healthz(client, port)
+                .await
+                .is_some_and(|health| router_health_matches_meta(&health, meta))
+        }
+        RldMode::Proxy => {
+            let Some(port) = parse_optional_port(meta.get("proxy_port")) else {
+                return false;
+            };
+            healthz(client, port)
+                .await
+                .is_some_and(|health| proxy_health_matches_meta(&health, meta))
+        }
+    }
+}
+
+fn router_health_matches_meta(health: &Value, meta: &BTreeMap<String, String>) -> bool {
+    if let Some(expected_router_url) = meta.get("router_url") {
+        let Some(actual_router_url) = health.get("router_url").and_then(Value::as_str) else {
+            return false;
+        };
+        if actual_router_url.trim_end_matches('/') != expected_router_url.trim_end_matches('/') {
+            return false;
+        }
+    }
+    meta.get("local_model_id").is_none_or(|expected_model_id| {
+        health.get("local_model_id").and_then(Value::as_str) == Some(expected_model_id.as_str())
+    })
+}
+
+fn proxy_health_matches_meta(health: &Value, meta: &BTreeMap<String, String>) -> bool {
+    if let Some(expected_router_url) = meta.get("router_url") {
+        let Some(actual_router_url) = health.get("router_url").and_then(Value::as_str) else {
+            return false;
+        };
+        if actual_router_url.trim_end_matches('/') != expected_router_url.trim_end_matches('/') {
+            return false;
+        }
+    }
+    if let Some(expected_port) = parse_optional_port(meta.get("proxy_port")) {
+        if health.get("proxy_port").and_then(Value::as_u64) != Some(u64::from(expected_port)) {
+            return false;
+        }
+    }
+    if let Some(expected_mode) = meta.get("proxy_routing_mode") {
+        if health.get("routing_mode").and_then(Value::as_str) != Some(expected_mode.as_str()) {
+            return false;
+        }
+    }
+    if let Some(expected_available) = meta.get("local_available") {
+        let expected_available = expected_available == "true";
+        if health.get("local_available").and_then(Value::as_bool) != Some(expected_available) {
+            return false;
+        }
+    }
+    if let Some(expected_model_id) = meta.get("local_model_id") {
+        if health.get("local_model_id").and_then(Value::as_str) != Some(expected_model_id.as_str())
+        {
+            return false;
+        }
+    }
+    if let Some(expected_adapter_port) = parse_optional_port(meta.get("local_adapter_port")) {
+        if health.get("local_adapter_port").and_then(Value::as_u64)
+            != Some(u64::from(expected_adapter_port))
+        {
+            return false;
+        }
+    }
+    if meta.get("decision_plane").map(String::as_str) == Some(DECISION_PLANE_LOCAL) {
+        return true;
+    }
+    health.get("has_router_key").and_then(Value::as_bool) == Some(true)
+}
+
+fn process_name(argv0: &str) -> String {
+    let stripped = argv0.trim_matches(|ch| ch == '"' || ch == '\'');
+    stripped
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(stripped)
+        .to_ascii_lowercase()
+}
+
+#[cfg(unix)]
+fn process_argv(pid: i32) -> Option<Vec<String>> {
+    let proc_cmdline = Path::new("/proc").join(pid.to_string()).join("cmdline");
+    if let Ok(raw) = std::fs::read(&proc_cmdline) {
+        let argv = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        if !argv.is_empty() {
+            return Some(argv);
+        }
+    }
+
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if command.is_empty() {
+        None
+    } else {
+        Some(split_command_line_best_effort(&command))
+    }
+}
+
+#[cfg(windows)]
+fn process_argv(pid: i32) -> Option<Vec<String>> {
+    let query = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if command.is_empty() {
+        None
+    } else {
+        Some(split_command_line_best_effort(&command))
+    }
+}
+
+fn split_command_line_best_effort(command: &str) -> Vec<String> {
+    command.split_whitespace().map(str::to_owned).collect()
+}
+
+fn clear_router_state(paths: &RouterPaths) {
+    let _ = std::fs::remove_file(&paths.pid_file);
+    let _ = std::fs::remove_file(&paths.meta_file);
+}
+
+fn clear_proxy_state(paths: &RouterPaths) {
+    let _ = std::fs::remove_file(&paths.proxy_pid_file);
+    let _ = std::fs::remove_file(&paths.proxy_meta_file);
+}
+
+/// Report the `--isolated` proxy in `router status` so users can see (and clean
+/// up with `router stop`) a proxy left running in the isolated `cc/` state dir
+/// on its own port. No-op when no isolated proxy is running.
+async fn append_isolated_proxy_status(output: &mut String, home: &Path, client: &reqwest::Client) {
+    let isolated = RouterPaths::new_isolated(home);
+    if read_pid(&isolated.proxy_pid_file).is_none() {
+        return;
+    }
+    output.push_str("--isolated:\n");
+    append_proxy_sidecar_status(output, &isolated, client).await;
+}
+
+async fn append_proxy_sidecar_status(
+    output: &mut String,
+    paths: &RouterPaths,
+    client: &reqwest::Client,
+) -> bool {
+    let Some(proxy_pid) = read_pid(&paths.proxy_pid_file) else {
+        return false;
+    };
+
+    let meta = read_meta(&paths.proxy_meta_file);
+    let proxy_port = parse_port(meta.get("proxy_port"), DEFAULT_PROXY_PORT);
+    if !process_exists(proxy_pid) {
+        output.push_str(&format!(
+            "{} proxy: stale pidfile (pid {proxy_pid} gone). Run `{} router stop` to clean up.\n",
+            daemon_name(),
+            cli_name()
+        ));
+        return true;
+    }
+
+    output.push_str(&format!("{} proxy: pid {proxy_pid}\n", daemon_name()));
+    for key in ["router_url", "proxy_port", "ca_cert_path"] {
+        if let Some(value) = meta.get(key) {
+            output.push_str(&format!("  {key}: {value}\n"));
+        }
+    }
+    append_proxy_health(output, client, proxy_port).await;
+    output.push_str(&format!("  log: {}\n", paths.proxy_log_file.display()));
+    true
+}
+
+async fn append_proxy_health(output: &mut String, client: &reqwest::Client, proxy_port: u16) {
+    if let Some(health) = healthz(client, proxy_port).await {
+        output.push_str(&format!(
+            "  proxy    :{proxy_port} \u{2713} ({}, local={})\n",
+            value_display_or_empty(health.get("router_url")),
+            value_display_title_case(health.get("local_available")),
+        ));
+    } else {
+        output.push_str(&format!("  proxy    :{proxy_port} \u{2717} (no healthz)\n"));
+    }
+}
+
+async fn healthz(client: &reqwest::Client, port: u16) -> Option<Value> {
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    response.json::<Value>().await.ok()
+}
+
+fn read_pid(path: &Path) -> Option<i32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse::<i32>().ok()
+}
+
+fn read_meta(path: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+fn parse_port(value: Option<&String>, default: u16) -> u16 {
+    parse_optional_port(value).unwrap_or(default)
+}
+
+fn parse_optional_port(value: Option<&String>) -> Option<u16> {
+    value?.parse::<u16>().ok()
+}
+
+fn value_display_or_empty(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.to_owned(),
+        Some(Value::Bool(value)) => title_case_bool(*value).to_owned(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn value_display_title_case(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Bool(value)) => title_case_bool(*value).to_owned(),
+        Some(Value::String(value)) => value.to_owned(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Null) | None => "None".to_owned(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn title_case_bool(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Mirrors POSIX kill(pid, 0): no signal is delivered; errno tells
+    // us whether the process is absent or merely owned by another user.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return !process_is_zombie(pid);
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn process_is_zombie(pid: i32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| output.status.success().then_some(output.stdout))
+        .map(|stdout| String::from_utf8_lossy(&stdout).contains('Z'))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: i32) -> io::Result<()> {
+    signal_process(pid, libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn force_stop_process_group(pid: i32) -> io::Result<()> {
+    let result = unsafe { libc::killpg(pid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
+fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, error));
+    }
+    Err(error)
+}
+
+#[cfg(windows)]
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let query = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').ProcessId");
+    Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == pid.to_string()
+        })
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: i32) -> io::Result<()> {
+    // Windows has no graceful equivalent of SIGTERM for our daemon: `taskkill`
+    // without `/F` only posts WM_CLOSE, which a windowless console process never
+    // receives, so the command fails ("can only be terminated forcefully") and
+    // the daemon survives. The daemon's only shutdown handler is for ctrl-c,
+    // which taskkill does not deliver either. So terminate by force-killing the
+    // process tree (`/T /F`) — the same call `force_stop_process_group` makes —
+    // which also reaps child processes (e.g. llama-server). Returning an Err here
+    // (as the old graceful attempt did) made the callers' escalation unreachable,
+    // breaking `rayline router stop` and the daemon-restart in `rayline claude`.
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    // taskkill exits 128 when the PID no longer exists; surface that as NotFound
+    // so callers can report "already gone" instead of a hard error.
+    if status.code() == Some(128) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("process {pid} not found"),
+        ));
+    }
+    Err(io::Error::other(format!(
+        "taskkill failed with status {status}"
+    )))
+}
+
+#[cfg(windows)]
+fn force_stop_process_group(pid: i32) -> io::Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill /T /F failed with status {status}"
+        )))
+    }
+}
+
+struct RouterPaths {
+    pid_file: PathBuf,
+    log_file: PathBuf,
+    meta_file: PathBuf,
+    proxy_pid_file: PathBuf,
+    proxy_log_file: PathBuf,
+    proxy_meta_file: PathBuf,
+}
+
+impl RouterPaths {
+    fn new(home: &Path) -> Self {
+        Self::in_dir(home.join(crate::ROUTER_STATE_DIR))
+    }
+
+    /// State for the `--isolated` proxy/router, kept in a separate `cc/` subdir
+    /// so an isolated session never stops or reconfigures the shared proxy a
+    /// normal session is using.
+    fn new_isolated(home: &Path) -> Self {
+        Self::in_dir(home.join(crate::ROUTER_STATE_DIR).join("cc"))
+    }
+
+    fn for_isolation(home: &Path, isolated: bool) -> Self {
+        if isolated {
+            Self::new_isolated(home)
+        } else {
+            Self::new(home)
+        }
+    }
+
+    fn in_dir(data_dir: PathBuf) -> Self {
+        let prefix = crate::ROUTER_FILE_PREFIX;
+        Self {
+            pid_file: data_dir.join(format!("{prefix}.pid")),
+            log_file: data_dir.join(format!("{prefix}.log")),
+            meta_file: data_dir.join(format!("{prefix}.meta")),
+            proxy_pid_file: data_dir.join(format!("{prefix}-proxy.pid")),
+            proxy_log_file: data_dir.join(format!("{prefix}-proxy.log")),
+            proxy_meta_file: data_dir.join(format!("{prefix}-proxy.meta")),
+        }
+    }
+
+    fn data_dir(&self) -> &Path {
+        self.pid_file
+            .parent()
+            .expect("router pid path should always have a parent")
+    }
+}
