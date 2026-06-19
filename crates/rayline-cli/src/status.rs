@@ -886,8 +886,7 @@ fn parse_device_token_response(
             crate::CLI_BIN
         ))),
         _ => Err(AuthLoginError::LoginFailed(format!(
-            "Device-flow polling failed: HTTP {}",
-            status_code
+            "Device-flow polling failed: HTTP {status_code}"
         ))),
     }
 }
