@@ -2,8 +2,9 @@
 
 ## Supported Versions
 
-Rayline is under active pre-release development. Only the latest release and
-`main` are supported; security fixes are applied there.
+Rayline Local, the local-router project in the broader Rayline ecosystem, is
+under active pre-release development. Only the latest release and `main` are
+supported; security fixes are applied there.
 
 ## Reporting a Vulnerability
 
@@ -33,9 +34,9 @@ you informed as we work on a fix and coordinate disclosure.
 
 ## Local TLS Interception
 
-Rayline can install a local certificate authority and intercept TLS traffic on
-your own machine to route requests. This is core to how proxy-mode routing
-works and is documented in the [README](README.md#disclaimers).
+Rayline Local can install a local certificate authority and intercept TLS
+traffic on your own machine to route requests. This is core to how proxy-mode
+routing works and is documented in the [README](README.md#disclaimers).
 
 Reports about this intended behavior are not security vulnerabilities. Reports
 about flaws in this mechanism, such as certificate handling, key storage, or

@@ -1,6 +1,6 @@
-# Rayline Claude Routing
+# Rayline Local Claude Routing
 
-Rayline can run Claude Code through an explicit local static router.
+Rayline Local can run Claude Code through an explicit local static router.
 
 - `rayline claude --local-router` starts the local static router path. It does
   not require hosted Rayline auth for routing decisions.
@@ -28,7 +28,7 @@ Check for CLI updates:
 rayline update --check
 ```
 
-Inspect or stop local Rayline router and proxy processes:
+Inspect or stop Rayline Local router and proxy processes:
 
 ```bash
 rayline router status
@@ -50,8 +50,8 @@ local-router path does not require this.
 
 ## Override-only Config
 
-The router config is JSON layered over Rayline defaults. Save it wherever you
-prefer. The examples below use `~/.config/rayline/local-router.json`.
+The router config is JSON layered over Rayline Local defaults. Save it wherever
+you prefer. The examples below use `~/.config/rayline/local-router.json`.
 
 Pass the file with `--router-config-path` when `routes.subagents` is meant to
 limit which Claude Code subagents reach the local router. The local router can
@@ -85,7 +85,7 @@ rayline claude \
 Notes:
 
 - `endpoint: "local"` means the managed local adapter. If `model` is omitted,
-  Rayline fills in the active local model.
+  Rayline Local fills in the active local model.
 - In `proxy-subagents` mode, `routes.subagents` also becomes the proxy allowlist.
   The proxy matches the resolved Claude Code agent type case-insensitively, so
   `Explore` is enough when Claude Code has written subagent metadata. This
@@ -186,9 +186,9 @@ explicit `rayline claude --local-router` launch still starts the managed local
 adapter with the active local-model config; without a custom local-model config,
 that is the bundled llama.cpp path.
 
-To use Rayline's managed local adapter, route to `endpoint: "local"` as shown
-in the override-only example. If you want the managed adapter to use your own
-server and skip the bundled GGUF model, configure a custom local model:
+To use Rayline Local's managed local adapter, route to `endpoint: "local"` as
+shown in the override-only example. If you want the managed adapter to use your
+own server and skip the bundled GGUF model, configure a custom local model:
 
 ```bash
 rayline local custom \
@@ -252,7 +252,7 @@ from starting. Configure `rayline local custom` to make the daemon use
    rayline update --help
    ```
 
-   Confirm the native Rayline CLI exposes `claude`, `router`, `local`, and
+   Confirm the native Rayline Local CLI exposes `claude`, `router`, `local`, and
    `update`. Confirm `rayline claude --help` describes local routing and includes
    `--local-router`, `--isolated`,
    `--routing-mode`, and `--router-config-path`.

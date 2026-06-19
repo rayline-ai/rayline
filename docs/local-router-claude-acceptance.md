@@ -1,7 +1,7 @@
 # Local Router Claude Acceptance
 
-This guide validates the real Claude Code path through Rayline's local router
-and managed llama.cpp runtime.
+This guide validates the real Claude Code path through Rayline Local's local
+router and managed llama.cpp runtime.
 
 Prerequisites:
 
@@ -11,7 +11,7 @@ Prerequisites:
 
 ## Install Matching Binaries
 
-From a Rayline source checkout:
+From a Rayline Local source checkout:
 
 ```bash
 cargo install --path crates/rayline-daemon --locked --root ~/.rayline --force
@@ -59,14 +59,14 @@ JSON
 
 ## Clear Stale Test State
 
-Stop any previous isolated Claude Code daemon and Rayline router:
+Stop any previous isolated Claude Code daemon and Rayline Local router:
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.rayline/cc" claude daemon stop --any || true
 rayline router stop || true
 ```
 
-## Run Claude Through Rayline
+## Run Claude Through Rayline Local
 
 ```bash
 rayline claude \
@@ -115,8 +115,8 @@ target=Router reason=selective_subagent_header
 
 ## Troubleshooting
 
-If Claude reports a non-Rayline daemon conflict, stop only the isolated daemon
-and retry:
+If Claude reports a non-Rayline Local daemon conflict, stop only the isolated
+daemon and retry:
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.rayline/cc" claude daemon stop --any || true

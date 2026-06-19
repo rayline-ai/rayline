@@ -1,30 +1,29 @@
 # Rayline Local
 
-Rayline Local is the open-source local router in the broader Rayline stack. It
-runs on your machine and sits between your coding agent and the AI models it
-talks to, deciding where each request should go. It provides the `rayline` CLI
-and `rld` daemon for local passthrough, selective subagent routing, local model
+Rayline Local is the open-source local router from Atlas Futures, Inc. It runs
+on your machine and sits between your coding agent and the AI models it talks
+to, deciding where each request should go. It provides the `rayline` CLI and
+`rld` daemon for local passthrough, selective subagent routing, local model
 support, and update checks.
 
 This repository contains the Rayline Local router. Local-router-only use does
-not require a hosted Rayline account and does not connect to any remote Rayline
-service.
+not require a hosted account and does not connect to any remote hosted service.
 
 ## How It Works
 
 Run `rayline claude` to start a Claude Code session with smart routing layered
-on top. Your conversation works as it normally would, but Rayline can route
+on top. Your conversation works as it normally would, but Rayline Local can route
 cheaper, high-volume work such as background subagent tasks to a fast model
 running locally on your machine.
 
 By default, your main conversation still goes straight to Claude on your own
 account, and only configured local-router traffic is routed to local or
-alternative endpoints. Hosted Rayline client features are separate, opt-in, and
+alternative endpoints. Hosted client features are separate, opt-in, and
 not required for local-router workflows. Run `rayline --help` to see the
 available commands and configuration options.
 
-Rayline operates on your machine and with your provider credentials. It is not
-affiliated with any model provider.
+Rayline Local operates on your machine and with your provider credentials. It is
+not affiliated with any model provider.
 
 ## Supported Clients
 
@@ -55,23 +54,24 @@ See [docs/rayline-local-router.md](docs/rayline-local-router.md).
 
 ### Non-Affiliation
 
-Rayline is an independent, open-source project from Atlas Futures, Inc. It is
-not affiliated with, endorsed by, or sponsored by Anthropic PBC. "Claude",
+Rayline Local is an independent, open-source project from Atlas Futures, Inc. It
+is not affiliated with, endorsed by, or sponsored by Anthropic PBC. "Claude",
 "Claude Code", and "Anthropic" are trademarks of Anthropic PBC, used here
 nominatively to describe interoperability.
 
 ### User Responsibility and Local TLS Interception
 
-To route traffic in proxy modes, Rayline can install a local certificate
+To route traffic in proxy modes, Rayline Local can install a local certificate
 authority on your machine and intercept TLS traffic to provider APIs locally,
-using your own credentials. You are responsible for ensuring your use of Rayline
-complies with the terms of service of any provider whose API you route to.
-Install and use Rayline only on machines and accounts you control.
+using your own credentials. You are responsible for ensuring your use of
+Rayline Local complies with the terms of service of any provider whose API you
+route to. Install and use Rayline Local only on machines and accounts you
+control.
 
 ## License and Trademarks
 
-Rayline is licensed under the [Apache License 2.0](LICENSE). The Apache license
-does not grant rights to the Rayline name or logos. See
+Rayline Local is licensed under the [Apache License 2.0](LICENSE). The Apache
+license does not grant rights to the Rayline Local name or logos. See
 [TRADEMARK.md](TRADEMARK.md).
 
 Copyright 2026 Atlas Futures, Inc.
