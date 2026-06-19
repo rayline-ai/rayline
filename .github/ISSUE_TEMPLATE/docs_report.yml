@@ -1,0 +1,43 @@
+name: Documentation issue
+description: Report missing, stale, or confusing Rayline Local documentation.
+title: "[docs]: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for README, docs, examples, and contribution-policy issues. If the docs mismatch a real runtime failure, file a bug report instead and include the command output there.
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: Link or name the affected README section, docs page, or example file.
+      placeholder: README.md#local-router, docs/rayline-local-router.md, examples/local-router.json
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is missing, stale, misleading, or hard to follow?
+    validations:
+      required: true
+  - type: textarea
+    id: suggested_change
+    attributes:
+      label: Suggested change
+      description: If you know the correction, describe it or paste a proposed replacement.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Include the command, version, OS, or workflow that made the documentation issue visible.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing.
+          required: true
+        - label: I removed API keys, tokens, private prompts, customer data, and unsanitized logs.
+          required: true

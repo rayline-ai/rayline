@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/rayline-ai/rayline/security/advisories/new
+    about: Report vulnerabilities privately through GitHub Private Vulnerability Reporting.
+  - name: Contribution policy
+    url: https://github.com/rayline-ai/rayline/blob/main/CONTRIBUTING.md
+    about: Rayline Local is not accepting external pull requests yet; read the current contribution policy before starting implementation work.
+  - name: Local router documentation
+    url: https://github.com/rayline-ai/rayline/blob/main/docs/rayline-local-router.md
+    about: Start here for local-router setup and configuration before filing a bug.
