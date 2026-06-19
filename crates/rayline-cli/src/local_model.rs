@@ -298,11 +298,9 @@ fn set_custom_in_home(
         Some(_) => None, // explicit empty --model clears the stored model
         None => existing.as_ref().and_then(|config| config.model.clone()),
     };
-    // No family allowlist here: custom endpoints use the legacy custom-route
-    // signal, and the router deliberately bypasses isEligibleLocalModel() for
-    // that path (the user has opted into an arbitrary model, for example
-    // Ollama `llama3:70b`).
-    // The allowlist only governs the recommended/bundled catalog path.
+    // No client-side family allowlist here: custom endpoints use the legacy
+    // custom-route signal, and curated registry entries are validated before
+    // publication.
 
     let config = LocalModelConfig {
         mode: LocalModelMode::Custom,

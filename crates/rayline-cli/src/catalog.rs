@@ -21,25 +21,6 @@ use serde_json::{Value, json};
 const REGISTRY_PROD_URL: &str = "https://registry.rayline.ai/models.json";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Local-model families the cloud router actually delegates to. A model outside
-/// these families runs locally but never receives a routed request, so the CLI
-/// refuses to configure one.
-pub const ELIGIBLE_LOCAL_MODEL_PREFIXES: &[&str] = &[
-    "qwen3.6-35b-a3b-",
-    "qwen3.6-27b-",
-    "qwen3.5-35b-a3b-",
-    "gemma4-31b-",
-];
-
-/// Whether the router would delegate to a local model advertised as
-/// `model_id` (matches the router's lowercase prefix check).
-pub fn is_eligible_local_model(model_id: &str) -> bool {
-    let lower = model_id.to_lowercase();
-    ELIGIBLE_LOCAL_MODEL_PREFIXES
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-}
-
 /// Context budgets mirroring the desktop's `recommendedContextLength`:
 /// 64K tokens on <=16 GB machines, 128K above.
 const SMALL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -163,7 +144,6 @@ fn parse_curated(body: &Value) -> Vec<CatalogModel> {
                 && entry.get("shardedFilenames").is_none()
         })
         .filter_map(parse_model)
-        .filter(|model| is_eligible_local_model(&model.id))
         .collect::<Vec<_>>();
     models.sort_by_key(|model| model.base_ram_bytes);
     models
@@ -815,10 +795,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_curated_filters_router_ineligible_models() {
+    fn parse_curated_trusts_pinned_registry_curated_entries() {
         let body = json!({
             "models": [
-                registry_model("not-router-eligible", 1),
+                registry_model("qwen2.5-coder-7b-q5km", 1),
                 registry_model("qwen3.6-27b-q4km", 2),
             ],
         });
@@ -830,7 +810,7 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["qwen3.6-27b-q4km"]
+            vec!["qwen2.5-coder-7b-q5km", "qwen3.6-27b-q4km"]
         );
     }
 
@@ -919,7 +899,7 @@ mod tests {
 
     #[test]
     fn parse_curated_accepts_new_curated_model_when_registry_supplies_pins() {
-        let mut model = registry_model("qwen3.6-27b-iq2m", 2);
+        let mut model = registry_model("qwen3.5-9b-q4km", 2);
         model
             .as_object_mut()
             .unwrap()
@@ -929,7 +909,7 @@ mod tests {
         let models = parse_curated(&body);
 
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "qwen3.6-27b-iq2m");
+        assert_eq!(models[0].id, "qwen3.5-9b-q4km");
         assert_eq!(models[0].filename, "new.gguf");
     }
 }
