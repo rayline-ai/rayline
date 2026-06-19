@@ -1,42 +1,127 @@
 name: Bug report
-description: Report a reproducible Rayline bug.
+description: Report a reproducible Rayline Local bug.
 title: "[bug]: "
 labels: ["bug"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, search existing issues and make sure this is not a security vulnerability. Security reports must use GitHub Private Vulnerability Reporting from the Security tab.
+
+        Include only sanitized config and logs. Do not paste API keys, tokens, private prompts, customer data, or unsanitized proxy logs.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues before filing.
+          required: true
+        - label: I reproduced this on the latest Rayline release or current main.
+          required: true
+        - label: I removed API keys, tokens, local CA keys, private prompts, customer data, and unsanitized logs.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
   - type: textarea
     id: summary
     attributes:
       label: Summary
+      description: What is broken? Keep this short and concrete.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Pick every affected area you can narrow this to.
+      multiple: true
+      options:
+        - CLI (rayline)
+        - Daemon (rld)
+        - Claude Code routing
+        - Local router
+        - Transparent proxy or TLS interception
+        - Header injector
+        - Adapter or local model
+        - Model download or cache
+        - Installer or updater
+        - Build from source
+        - Documentation or examples
+        - Other
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: Rayline version
+      description: Paste `rayline --version`, or the commit SHA if building from source.
+      placeholder: rayline 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: install_method
+    attributes:
+      label: Install method
+      description: How did you install or run Rayline?
+      placeholder: release binary, cargo build --release, source checkout, other
     validations:
       required: true
   - type: input
     id: os
     attributes:
       label: OS and architecture
+      placeholder: macOS 15 arm64, Ubuntu 24.04 x86_64, Windows 11 x86_64
     validations:
       required: true
+  - type: input
+    id: rust_version
+    attributes:
+      label: Rust version
+      description: Required only if building from source. Paste `rustc --version --verbose` or `cargo --version`.
   - type: textarea
     id: repro
     attributes:
       label: Reproduction
-      description: Include commands, sanitized config, and sanitized logs.
+      description: Include the exact commands and a minimal sanitized config or scenario that reproduces the bug.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
       label: Expected behavior
+      description: What should have happened?
     validations:
       required: true
   - type: textarea
     id: actual
     attributes:
       label: Actual behavior
+      description: What happened instead? Include error output when useful.
     validations:
       required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or diagnostics
+      description: Paste sanitized output from `rayline router status`, `rayline router logs --lines 120`, the failing command, or relevant `~/.rayline/rld/*.log` snippets.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Sanitized config
+      description: Paste relevant `~/.config/rayline/settings.json`, router config JSON, and env var names with secret values, tokens, private URLs, and prompts removed.
+      render: json
+  - type: input
+    id: regression
+    attributes:
+      label: Last known working version
+      description: If this is a regression, provide the last version or commit that worked.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Include workarounds, related issues, screenshots, or anything else that helps narrow the problem.
