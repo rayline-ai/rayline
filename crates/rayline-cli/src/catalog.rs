@@ -306,7 +306,7 @@ fn detect_total_ram_uncached() -> Option<u64> {
             avail_extended_virtual: u64,
         }
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
         }
         let mut status = MemoryStatusEx {
