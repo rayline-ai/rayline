@@ -2,9 +2,13 @@
 name = "rayline-daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Rayline local-router runtime: llama-server + adapter + header-injector"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "rld"

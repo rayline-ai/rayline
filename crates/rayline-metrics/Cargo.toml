@@ -2,9 +2,13 @@
 name = "rayline-metrics"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "In-memory Rayline router metrics model"
+
+[lints]
+workspace = true
 
 [dependencies]
 serde.workspace = true
