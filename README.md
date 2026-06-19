@@ -17,7 +17,7 @@ a model running fully on your machine (Qwen3.6-35B-A3B, Q4) — seamlessly, in a
 single session.
 
 <a href="https://get.rayline.ai/media/rayline-local-routing-demo.mp4">
-  <img src="https://get.rayline.ai/media/rayline-local-routing-demo.gif"
+  <img src="https://get.rayline.ai/media/rayline-local-routing-demo-4x.gif"
        alt="Rayline Local routing a Claude Code Explore subagent to an on-device model"
        width="100%">
 </a>
