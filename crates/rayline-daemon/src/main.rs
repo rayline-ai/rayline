@@ -50,6 +50,7 @@ const RAYLINE_ROUTER_DEFAULT_URL: &str = "https://api.rayline.ai";
 const MODEL_REPO_ENV: &str = "RAYLINE_MODEL_REPO";
 const MODEL_FILE_ENV: &str = "RAYLINE_MODEL_FILE";
 const MODEL_REVISION_ENV: &str = "RAYLINE_MODEL_REVISION";
+const MODEL_SHA256_ENV: &str = "RAYLINE_MODEL_SHA256";
 const LLAMA_TAG_ENV: &str = "RAYLINE_LLAMA_TAG";
 const CTX_SIZE_ENV: &str = "RAYLINE_CTX_SIZE";
 const ADAPTER_PORT_ENV: &str = "RAYLINE_ADAPTER_PORT";
@@ -144,6 +145,10 @@ struct ServeArgs {
     /// HuggingFace revision/commit. Resolved from `main` if unset.
     #[arg(long, env = MODEL_REVISION_ENV)]
     model_revision: Option<String>,
+
+    /// Expected SHA256 for the GGUF. Requires `--model-revision` when set.
+    #[arg(long, env = MODEL_SHA256_ENV)]
+    model_sha256: Option<String>,
 
     /// llama.cpp release tag (download source).
     #[arg(long, env = LLAMA_TAG_ENV, default_value = DEFAULT_LLAMA_TAG)]
@@ -467,9 +472,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             .model_file
             .as_deref()
             .ok_or_else(|| anyhow!("--model-file is required without --upstream-url"))?;
-        let gguf_path =
-            resolve_or_download_gguf(model_repo, model_file, args.model_revision.as_deref())
-                .await?;
+        let gguf_path = resolve_or_download_gguf(
+            model_repo,
+            model_file,
+            args.model_revision.as_deref(),
+            args.model_sha256.as_deref(),
+        )
+        .await?;
         info!("model GGUF ready at {}", gguf_path.display());
 
         // 2. Ensure llama-server binary is present.
@@ -1011,16 +1020,25 @@ async fn resolve_or_download_gguf(
     repo: &str,
     filename: &str,
     revision: Option<&str>,
+    expected_sha256: Option<&str>,
 ) -> Result<PathBuf> {
+    if expected_sha256.is_some() && revision.is_none() {
+        return Err(anyhow!(
+            "--model-sha256 requires --model-revision so the verified download is pinned"
+        ));
+    }
+
     // With a pinned revision, only treat the exact snapshot dir as a hit.
-    // Without one, any cached copy of repo+filename is acceptable.
+    // Without one, this is an explicit unverified/user-supplied path, so any
+    // cached copy of repo+filename is acceptable.
     if let Some(rev) = revision {
-        let snapshot = rayline_hf::hf_cache_dir()
-            .join(rayline_hf::repo_to_folder_name(repo))
-            .join("snapshots")
-            .join(rev)
-            .join(filename);
-        if snapshot.is_file() {
+        if let Some(snapshot) =
+            rayline_hf::verified_hf_cache_file(repo, filename, rev, expected_sha256)
+                .map_err(|e| anyhow!(e))
+                .with_context(|| {
+                    format!("cache verification failed for {repo}/{filename} @ {rev}")
+                })?
+        {
             info!("cache hit: {} / {} @ {}", repo, filename, rev);
             return Ok(snapshot);
         }
@@ -1033,6 +1051,19 @@ async fn resolve_or_download_gguf(
         }
     }
     info!("cache miss: downloading {} / {}", repo, filename);
+    if expected_sha256.is_none() {
+        if revision.is_some() {
+            warn!(
+                "downloading {} / {} without SHA256 verification; this should only be used for explicitly supplied models",
+                repo, filename
+            );
+        } else {
+            warn!(
+                "resolving current Hugging Face commit and downloading {} / {} without SHA256 verification; this should only be used for explicitly supplied models",
+                repo, filename
+            );
+        }
+    }
 
     let commit = if let Some(r) = revision {
         r.to_string()
@@ -1044,12 +1075,14 @@ async fn resolve_or_download_gguf(
     };
     let repo = repo.to_string();
     let filename = filename.to_string();
+    let expected_sha256 = expected_sha256.map(ToOwned::to_owned);
     let path = tokio::task::spawn_blocking(move || {
         let cb = |p: DownloadProgress| emit_progress_event(&p);
         rayline_hf::download_to_hf_cache(
             &repo,
             &filename,
             &commit,
+            expected_sha256.as_deref(),
             Some(&cb),
             "model",
             None,
@@ -1306,6 +1339,29 @@ mod tests {
 
         let without = parse_serve(&[bin, "serve", "--model-repo", "r", "--model-file", "f.gguf"]);
         assert_eq!(without.upstream_url, None);
+    }
+
+    #[test]
+    fn serve_parses_model_revision_and_sha256_flags() {
+        let bin = RAYLINE_DAEMON_BIN_NAME;
+        let args = parse_serve(&[
+            bin,
+            "serve",
+            "--model-repo",
+            "r",
+            "--model-file",
+            "f.gguf",
+            "--model-revision",
+            "abc123",
+            "--model-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]);
+
+        assert_eq!(args.model_revision.as_deref(), Some("abc123"));
+        assert_eq!(
+            args.model_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     /// Custom upstream mode needs no GGUF coordinates: `serve` parses with only

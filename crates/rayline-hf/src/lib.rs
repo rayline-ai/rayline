@@ -355,6 +355,88 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Normalize a SHA256 digest accepted at the Rayline trust boundary.
+/// Accepts bare hex, `sha256:<hex>`, or our cache blob name `sha256-<hex>`.
+pub fn normalize_sha256(digest: &str) -> Result<String, String> {
+    let trimmed = digest.trim();
+    let without_prefix = trimmed
+        .strip_prefix("sha256:")
+        .or_else(|| trimmed.strip_prefix("sha256-"))
+        .unwrap_or(trimmed);
+    if without_prefix.len() != 64 || !without_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("expected SHA256 digest as 64 hex characters".to_string());
+    }
+    Ok(without_prefix.to_ascii_lowercase())
+}
+
+fn sha256_blob_name(digest: &str) -> String {
+    format!("sha256-{digest}")
+}
+
+fn path_points_to_sha256_blob(path: &Path, expected_sha256: &str) -> bool {
+    let expected_blob = sha256_blob_name(expected_sha256);
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == expected_blob)
+    {
+        return true;
+    }
+    let Ok(target) = fs::read_link(path) else {
+        return false;
+    };
+    target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == expected_blob)
+}
+
+/// Verify a file against an expected SHA256. HF cache symlinks created by this
+/// crate point at `blobs/sha256-<digest>`, so cache hits usually take the cheap
+/// symlink-target path; otherwise the file is hashed.
+pub fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
+    let expected = normalize_sha256(expected_sha256)?;
+    if path_points_to_sha256_blob(path, &expected) {
+        return Ok(());
+    }
+    let actual = compute_sha256(path)?;
+    if actual != expected {
+        return Err(format!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+pub fn hf_cache_snapshot_path(repo: &str, filename: &str, commit: &str) -> PathBuf {
+    hf_cache_dir()
+        .join(repo_to_folder_name(repo))
+        .join("snapshots")
+        .join(commit)
+        .join(filename)
+}
+
+/// Return the exact pinned snapshot file when present and, when provided,
+/// verified against the expected SHA256.
+pub fn verified_hf_cache_file(
+    repo: &str,
+    filename: &str,
+    commit: &str,
+    expected_sha256: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let snapshot = hf_cache_snapshot_path(repo, filename, commit);
+    if !snapshot.is_file() {
+        return Ok(None);
+    }
+    if let Some(expected) = expected_sha256 {
+        verify_file_sha256(&snapshot, expected)?;
+    }
+    Ok(Some(snapshot))
+}
+
 // ---------------------------------------------------------------------------
 // Download to HF cache
 // ---------------------------------------------------------------------------
@@ -368,6 +450,7 @@ pub fn download_to_hf_cache(
     repo: &str,
     filename: &str,
     commit: &str,
+    expected_sha256: Option<&str>,
     on_progress: ProgressCallback<'_>,
     stage: &str,
     cancel: Option<&AtomicBool>,
@@ -375,7 +458,38 @@ pub fn download_to_hf_cache(
     total_override: u64,
     progress_filename: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let cache = hf_cache_dir();
+    download_to_hf_cache_at(
+        &hf_cache_dir(),
+        "https://huggingface.co",
+        repo,
+        filename,
+        commit,
+        expected_sha256,
+        on_progress,
+        stage,
+        cancel,
+        bytes_offset,
+        total_override,
+        progress_filename,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_to_hf_cache_at(
+    cache: &Path,
+    hf_base_url: &str,
+    repo: &str,
+    filename: &str,
+    commit: &str,
+    expected_sha256: Option<&str>,
+    on_progress: ProgressCallback<'_>,
+    stage: &str,
+    cancel: Option<&AtomicBool>,
+    bytes_offset: u64,
+    total_override: u64,
+    progress_filename: Option<&str>,
+) -> Result<PathBuf, String> {
+    let expected_sha256 = expected_sha256.map(normalize_sha256).transpose()?;
     let repo_dir = cache.join(repo_to_folder_name(repo));
     let refs_dir = repo_dir.join("refs");
     let blobs_dir = repo_dir.join("blobs");
@@ -400,7 +514,10 @@ pub fn download_to_hf_cache(
     // partial file and ask the server for a Range; if it differs (or is
     // missing) we wipe the stale bytes before re-downloading.
     let tmp_url_path = blobs_dir.join(format!(".download-{safe_name}.tmp.url"));
-    let download_url = format!("https://huggingface.co/{repo}/resolve/{commit}/{filename}");
+    let download_url = format!(
+        "{}/{repo}/resolve/{commit}/{filename}",
+        hf_base_url.trim_end_matches('/')
+    );
 
     let prior_url = fs::read_to_string(&tmp_url_path).ok();
     let resumable = prior_url.as_deref().map(str::trim) == Some(download_url.as_str());
@@ -444,7 +561,16 @@ pub fn download_to_hf_cache(
 
     info!("[HfCache] Computing SHA256 for {:?}", tmp_path);
     let sha256 = compute_sha256(&tmp_path)?;
-    let blob_name = format!("sha256-{sha256}");
+    if let Some(expected) = expected_sha256.as_deref() {
+        if sha256 != expected {
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&tmp_url_path);
+            return Err(format!(
+                "SHA256 mismatch for {repo}/{filename} @ {commit}: expected {expected}, got {sha256}"
+            ));
+        }
+    }
+    let blob_name = sha256_blob_name(&sha256);
     let blob_path = blobs_dir.join(&blob_name);
 
     if blob_path.exists() {
@@ -1100,6 +1226,127 @@ mod tests {
         let _ = fs::remove_dir_all(test_dir);
     }
 
+    #[test]
+    fn test_verified_hf_cache_download_promotes_matching_sha256() {
+        let test_dir = unique_test_dir("verified-download");
+        let cache_dir = test_dir.join("hub");
+        let body = b"verified gguf bytes";
+        let expected = sha256_hex(body);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(&mut stream, body);
+        });
+
+        let path = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            "org/repo",
+            "model.gguf",
+            "abc123",
+            Some(&expected),
+            None,
+            "model",
+            None,
+            0,
+            0,
+            Some("model.gguf"),
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert_eq!(
+            fs::read_to_string(
+                cache_dir
+                    .join(repo_to_folder_name("org/repo"))
+                    .join("refs")
+                    .join("main")
+            )
+            .unwrap(),
+            "abc123"
+        );
+        assert!(
+            cache_dir
+                .join(repo_to_folder_name("org/repo"))
+                .join("blobs")
+                .join(format!("sha256-{expected}"))
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_verified_hf_cache_download_rejects_sha256_mismatch() {
+        let test_dir = unique_test_dir("verified-download-mismatch");
+        let cache_dir = test_dir.join("hub");
+        let body = b"tampered bytes";
+        let wrong_expected = sha256_hex(b"expected bytes");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_http_response(&mut stream, body);
+        });
+
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            "org/repo",
+            "model.gguf",
+            "abc123",
+            Some(&wrong_expected),
+            None,
+            "model",
+            None,
+            0,
+            0,
+            Some("model.gguf"),
+        )
+        .unwrap_err();
+
+        server.join().unwrap();
+        assert!(error.contains("SHA256 mismatch"));
+        assert!(
+            !cache_dir
+                .join(repo_to_folder_name("org/repo"))
+                .join("snapshots")
+                .join("abc123")
+                .join("model.gguf")
+                .exists()
+        );
+        assert!(
+            !cache_dir
+                .join(repo_to_folder_name("org/repo"))
+                .join("blobs")
+                .join(format!("sha256-{wrong_expected}"))
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_verify_file_sha256_accepts_prefixed_hex_and_rejects_mismatch() {
+        let test_dir = unique_test_dir("verify-sha");
+        fs::create_dir_all(&test_dir).unwrap();
+        let path = test_dir.join("model.gguf");
+        fs::write(&path, b"model bytes").unwrap();
+        let expected = sha256_hex(b"model bytes");
+
+        verify_file_sha256(&path, &format!("sha256:{expected}")).unwrap();
+        let error = verify_file_sha256(&path, &sha256_hex(b"different")).unwrap_err();
+        assert!(error.contains("SHA256 mismatch"));
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1111,6 +1358,10 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
