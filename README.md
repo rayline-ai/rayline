@@ -1,20 +1,34 @@
 # Rayline
 
-Rayline is an open-source local-router runtime for Claude Code workflows. It
-provides the `rayline` CLI and `rld` daemon for local passthrough, selective
-subagent routing, local model support, and update checks.
+Rayline is a command-line tool that runs on your machine and sits between your
+coding agent and the AI models it talks to, deciding where each request should
+go. It provides the `rayline` CLI and `rld` daemon for local passthrough,
+selective subagent routing, local model support, and update checks.
 
 Rayline defaults to local operation. Local-router-only use does not require a
-hosted Rayline account.
+hosted Rayline account and does not connect to any remote Rayline service.
 
-Built-in hosted Rayline auth and hosted cloud-router launch are intentionally
-deferred in this release. They will be added after the public-client auth
-boundary is redesigned and reviewed.
+## How It Works
 
-Rayline is an independent project from Atlas Futures, Inc. It is not affiliated
-with, endorsed by, or sponsored by Anthropic PBC. "Claude", "Claude Code", and
-"Anthropic" are trademarks of Anthropic PBC, used here nominatively to describe
-interoperability.
+Run `rayline claude` to start a Claude Code session with smart routing layered
+on top. Your conversation works as it normally would, but Rayline can route
+cheaper, high-volume work such as background subagent tasks to a fast model
+running locally on your machine.
+
+By default, your main conversation still goes straight to Claude on your own
+account, and only configured local-router traffic is routed to local or
+alternative endpoints. Hosted Rayline client features are separate, opt-in, and
+not required for local-router workflows. Run `rayline --help` to see the
+available commands and configuration options.
+
+Rayline operates on your machine and with your provider credentials. It is not
+affiliated with any model provider.
+
+## Supported Clients
+
+- Claude Code, Anthropic's CLI coding agent.
+
+More clients may be supported over time.
 
 ## Build
 
@@ -35,8 +49,27 @@ cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
 
 See [docs/rayline-local-router.md](docs/rayline-local-router.md).
 
-Rayline can install a local certificate authority and proxy Claude Code traffic
-through a local process when using proxy modes. Only enable TLS interception on
-machines you control and only after reviewing the generated config and logs.
-You are responsible for complying with the terms of the services and tools you
-use with Rayline.
+## Disclaimers
+
+### Non-Affiliation
+
+Rayline is an independent, open-source project from Atlas Futures, Inc. It is
+not affiliated with, endorsed by, or sponsored by Anthropic PBC. "Claude",
+"Claude Code", and "Anthropic" are trademarks of Anthropic PBC, used here
+nominatively to describe interoperability.
+
+### User Responsibility and Local TLS Interception
+
+To route traffic in proxy modes, Rayline can install a local certificate
+authority on your machine and intercept TLS traffic to provider APIs locally,
+using your own credentials. You are responsible for ensuring your use of Rayline
+complies with the terms of service of any provider whose API you route to.
+Install and use Rayline only on machines and accounts you control.
+
+## License and Trademarks
+
+Rayline is licensed under the [Apache License 2.0](LICENSE). The Apache license
+does not grant rights to the Rayline name or logos. See
+[TRADEMARK.md](TRADEMARK.md).
+
+Copyright 2026 Atlas Futures, Inc.
