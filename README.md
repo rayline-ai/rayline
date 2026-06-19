@@ -54,9 +54,9 @@ cargo build --release -p rayline-cli -p rayline-daemon --locked
 ## Validate
 
 ```bash
-cargo +1.85.0 fmt --all -- --check
-cargo +1.85.0 test --workspace --locked -- --test-threads=1
-cargo +1.85.0 clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.88.0 fmt --all -- --check
+cargo +1.88.0 test --workspace --locked -- --test-threads=1
+cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 ## Local Router
