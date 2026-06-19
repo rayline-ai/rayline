@@ -1,13 +1,21 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+#[cfg(target_os = "macos")]
+use std::io::Read;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+#[cfg(target_os = "macos")]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 
 const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
@@ -1294,6 +1302,7 @@ fn mirror_claude_code_keychain_credentials(
 ) {
 }
 
+#[cfg(target_os = "macos")]
 fn claude_code_keychain_service(config_dir: &Path) -> String {
     let normalized = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
     let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
@@ -1315,6 +1324,7 @@ fn find_keychain_account(service: &str) -> Option<String> {
     parse_keychain_account(std::str::from_utf8(&output.stdout).ok()?)
 }
 
+#[cfg(target_os = "macos")]
 fn parse_keychain_account(output: &str) -> Option<String> {
     const PREFIX: &str = "\"acct\"<blob>=\"";
     for line in output.lines() {

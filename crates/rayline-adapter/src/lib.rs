@@ -381,7 +381,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             metrics.record(MetricsUpdate::RequestErrored {
                 request_id: request_id.clone(),
                 status_code: Some(status.as_u16()),
-                error: format!("upstream {}: {}", status, snippet),
+                error: format!("upstream {status}: {snippet}"),
             });
         }
         // Close the placeholder as an error so a failed local turn (the common
@@ -869,7 +869,7 @@ fn spawn_usage_callback(state: &AppState, cb: UsageCallback) {
     let http = state.http.clone();
     let router_url = state.opts.router_url.clone();
     tokio::spawn(async move {
-        let url = format!("{}/v1/usage/update", router_url);
+        let url = format!("{router_url}/v1/usage/update");
         let mut req = http
             .post(&url)
             .header("content-type", "application/json")
@@ -1163,7 +1163,7 @@ fn chrono_like_now() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("epoch:{}", secs)
+    format!("epoch:{secs}")
 }
 
 #[cfg(test)]

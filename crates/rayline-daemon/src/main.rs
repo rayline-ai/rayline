@@ -547,7 +547,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         }
 
         (
-            format!("http://127.0.0.1:{}", llama_port),
+            format!("http://127.0.0.1:{llama_port}"),
             Some(local_healthy),
             false,
             Some(manager),
@@ -1090,7 +1090,7 @@ fn emit_progress_event(progress: &DownloadProgress) {
     // the file and parses these lines. Use the marker prefix so the wrapper can
     // distinguish structured events from free-form tracing output.
     if let Ok(json) = serde_json::to_string(&payload) {
-        eprintln!("{} {}", PROGRESS_MARKER, json);
+        eprintln!("{PROGRESS_MARKER} {json}");
     }
 }
 

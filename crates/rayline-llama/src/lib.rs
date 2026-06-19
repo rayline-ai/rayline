@@ -178,12 +178,9 @@ pub fn resolve_download_url(
     arch: &str,
     gpu_type: &str,
 ) -> Result<String, String> {
-    let base = format!(
-        "https://github.com/ggml-org/llama.cpp/releases/download/{}",
-        tag
-    );
+    let base = format!("https://github.com/ggml-org/llama.cpp/releases/download/{tag}");
     let filename = resolve_archive_filename(tag, os, arch, gpu_type)?;
-    Ok(format!("{}/{}", base, filename))
+    Ok(format!("{base}/{filename}"))
 }
 
 pub fn resolve_archive_filename(
@@ -193,19 +190,19 @@ pub fn resolve_archive_filename(
     gpu_type: &str,
 ) -> Result<String, String> {
     match (os, arch) {
-        ("macos", "aarch64") => Ok(format!("llama-{}-bin-macos-arm64.tar.gz", tag)),
-        ("macos", "x86_64") => Ok(format!("llama-{}-bin-macos-x64.tar.gz", tag)),
-        ("linux", "x86_64") => Ok(format!("llama-{}-bin-ubuntu-x64.tar.gz", tag)),
+        ("macos", "aarch64") => Ok(format!("llama-{tag}-bin-macos-arm64.tar.gz")),
+        ("macos", "x86_64") => Ok(format!("llama-{tag}-bin-macos-x64.tar.gz")),
+        ("linux", "x86_64") => Ok(format!("llama-{tag}-bin-ubuntu-x64.tar.gz")),
         ("windows", "x86_64") => {
             let variant = match gpu_type {
                 "nvidia" => "win-cuda-12.4-x64",
                 "amd" | "amd-apu" => "win-vulkan-x64",
                 _ => "win-cpu-x64",
             };
-            Ok(format!("llama-{}-bin-{}.zip", tag, variant))
+            Ok(format!("llama-{tag}-bin-{variant}.zip"))
         }
-        ("windows", "aarch64") => Ok(format!("llama-{}-bin-win-cpu-arm64.zip", tag)),
-        _ => Err(format!("Unsupported platform: os={}, arch={}", os, arch)),
+        ("windows", "aarch64") => Ok(format!("llama-{tag}-bin-win-cpu-arm64.zip")),
+        _ => Err(format!("Unsupported platform: os={os}, arch={arch}")),
     }
 }
 
@@ -220,7 +217,7 @@ pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
     info!("[rayline-llama] Downloading {} -> {:?}", url, dest_path);
 
     if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -228,7 +225,7 @@ pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
         .connect_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
     const MAX_ATTEMPTS: u32 = 4;
     let mut attempt: u32 = 0;
@@ -239,7 +236,7 @@ pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
             Err(msg) => {
                 if attempt >= MAX_ATTEMPTS {
                     let _ = fs::remove_file(dest_path);
-                    return Err(format!("{} (failed after {} attempts)", msg, attempt));
+                    return Err(format!("{msg} (failed after {attempt} attempts)"));
                 }
                 let backoff = Duration::from_secs(1u64 << (attempt - 1).min(4));
                 warn!(
@@ -261,24 +258,24 @@ fn attempt_download(
         .get(url)
         .header("User-Agent", "rayline")
         .send()
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("Download failed with status {}", response.status()));
     }
 
     let mut file =
-        fs::File::create(dest_path).map_err(|e| format!("Failed to create dest file: {}", e))?;
+        fs::File::create(dest_path).map_err(|e| format!("Failed to create dest file: {e}"))?;
     let mut buf = [0u8; 65536];
     loop {
         let n = response
             .read(&mut buf)
-            .map_err(|e| format!("Read error: {}", e))?;
+            .map_err(|e| format!("Read error: {e}"))?;
         if n == 0 {
             break;
         }
         file.write_all(&buf[..n])
-            .map_err(|e| format!("Write error: {}", e))?;
+            .map_err(|e| format!("Write error: {e}"))?;
     }
     Ok(())
 }
@@ -286,7 +283,7 @@ fn attempt_download(
 /// Extract the `llama-server` binary and adjacent shared libraries from an
 /// archive into `dest_dir`. Returns the path to the extracted binary.
 pub fn extract_runtime_binary(archive_path: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
-    fs::create_dir_all(dest_dir).map_err(|e| format!("Failed to create dest dir: {}", e))?;
+    fs::create_dir_all(dest_dir).map_err(|e| format!("Failed to create dest dir: {e}"))?;
 
     let binary_name = if cfg!(windows) {
         "llama-server.exe"
@@ -302,22 +299,22 @@ pub fn extract_runtime_binary(archive_path: &Path, dest_dir: &Path) -> Result<Pa
     let temp_dir = dest_dir.join("_extract_tmp");
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("Failed to create temp extraction dir: {}", e))?;
+        .map_err(|e| format!("Failed to create temp extraction dir: {e}"))?;
 
     if archive_name.ends_with(".tar.gz") {
         extract_tar_gz(archive_path, &temp_dir)?;
     } else if archive_name.ends_with(".zip") {
         extract_zip(archive_path, &temp_dir)?;
     } else {
-        return Err(format!("Unknown archive format: {}", archive_name));
+        return Err(format!("Unknown archive format: {archive_name}"));
     }
 
     let binary_src = find_file_recursive(&temp_dir, binary_name)
-        .ok_or_else(|| format!("Could not find {} in extracted archive", binary_name))?;
+        .ok_or_else(|| format!("Could not find {binary_name} in extracted archive"))?;
     let src_parent = binary_src.parent().unwrap_or(&temp_dir);
 
     let binary_dest = dest_dir.join(binary_name);
-    fs::copy(&binary_src, &binary_dest).map_err(|e| format!("Failed to copy binary: {}", e))?;
+    fs::copy(&binary_src, &binary_dest).map_err(|e| format!("Failed to copy binary: {e}"))?;
 
     if let Ok(entries) = fs::read_dir(src_parent) {
         for entry in entries.flatten() {
@@ -348,11 +345,11 @@ pub fn extract_runtime_binary(archive_path: &Path, dest_dir: &Path) -> Result<Pa
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(&binary_dest)
-            .map_err(|e| format!("Failed to read metadata: {}", e))?
+            .map_err(|e| format!("Failed to read metadata: {e}"))?
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&binary_dest, perms)
-            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+            .map_err(|e| format!("Failed to set permissions: {e}"))?;
     }
 
     // On macOS, re-sign ad-hoc so a notarized parent application
@@ -383,7 +380,7 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
             &dest_dir.to_string_lossy(),
         ])
         .output()
-        .map_err(|e| format!("Failed to run tar: {}", e))?;
+        .map_err(|e| format!("Failed to run tar: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "tar extraction failed: {}",
@@ -404,7 +401,7 @@ fn extract_zip(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
                 &dest_dir.to_string_lossy(),
             ])
             .output()
-            .map_err(|e| format!("Failed to run unzip: {}", e))?;
+            .map_err(|e| format!("Failed to run unzip: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "unzip failed: {}",
@@ -678,7 +675,7 @@ pub fn start_server_with_log_observer(
         let _ = fs::create_dir_all(parent);
     }
     let log_file = fs::File::create(&log_path)
-        .map_err(|e| format!("Failed to create llama-server log file: {}", e))?;
+        .map_err(|e| format!("Failed to create llama-server log file: {e}"))?;
     let log_file = Arc::new(Mutex::new(log_file));
 
     let mut cmd = Command::new(&binary);
@@ -688,7 +685,7 @@ pub fn start_server_with_log_observer(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn llama-server: {}", e))?;
+        .map_err(|e| format!("Failed to spawn llama-server: {e}"))?;
     if let Some(stdout) = child.stdout.take() {
         spawn_log_pump(stdout, log_file.clone(), log_observer.clone());
     }
@@ -743,7 +740,7 @@ where
 /// does not contain "loading model" or "error" (llama-server sometimes
 /// returns 200 mid-load).
 pub fn check_health(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", port);
+    let url = format!("http://127.0.0.1:{port}/health");
     let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()

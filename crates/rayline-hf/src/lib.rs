@@ -141,7 +141,7 @@ pub fn folder_name_to_repo(folder: &str) -> Option<String> {
             && !org.ends_with('-')
             && !name.starts_with('-')
         {
-            return Some(format!("{}/{}", org, name));
+            return Some(format!("{org}/{name}"));
         }
     }
 
@@ -149,7 +149,7 @@ pub fn folder_name_to_repo(folder: &str) -> Option<String> {
         let org = &stripped[..pos];
         let name = &stripped[(pos + 2)..];
         if !org.ends_with('-') && !name.starts_with('-') {
-            return Some(format!("{}/{}", org, name));
+            return Some(format!("{org}/{name}"));
         }
     }
 
@@ -309,17 +309,17 @@ fn is_non_first_shard(filename: &str) -> bool {
 
 /// Latest commit hash for a repo via the HF API.
 pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
-    let url = format!("https://huggingface.co/api/models/{}", repo);
+    let url = format!("https://huggingface.co/api/models/{repo}");
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
     let response = client
         .get(&url)
         .header("User-Agent", "rayline")
         .send()
-        .map_err(|e| format!("HF API request failed: {}", e))?;
+        .map_err(|e| format!("HF API request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("HF API returned status {}", response.status()));
@@ -327,9 +327,9 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
 
     let body = response
         .text()
-        .map_err(|e| format!("Failed to read HF API response: {}", e))?;
-    let info: HfModelInfo = serde_json::from_str(&body)
-        .map_err(|e| format!("Failed to parse HF API response: {}", e))?;
+        .map_err(|e| format!("Failed to read HF API response: {e}"))?;
+    let info: HfModelInfo =
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse HF API response: {e}"))?;
 
     Ok(info.sha)
 }
@@ -340,13 +340,13 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
 
 fn compute_sha256(path: &Path) -> Result<String, String> {
     let mut file =
-        fs::File::open(path).map_err(|e| format!("Failed to open file for hashing: {}", e))?;
+        fs::File::open(path).map_err(|e| format!("Failed to open file for hashing: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
         let n = file
             .read(&mut buf)
-            .map_err(|e| format!("Read error during hashing: {}", e))?;
+            .map_err(|e| format!("Read error during hashing: {e}"))?;
         if n == 0 {
             break;
         }
@@ -381,30 +381,26 @@ pub fn download_to_hf_cache(
     let blobs_dir = repo_dir.join("blobs");
     let snapshot_dir = repo_dir.join("snapshots").join(commit);
 
-    fs::create_dir_all(&refs_dir).map_err(|e| format!("Failed to create refs dir: {}", e))?;
-    fs::create_dir_all(&blobs_dir).map_err(|e| format!("Failed to create blobs dir: {}", e))?;
-    fs::create_dir_all(&snapshot_dir)
-        .map_err(|e| format!("Failed to create snapshot dir: {}", e))?;
+    fs::create_dir_all(&refs_dir).map_err(|e| format!("Failed to create refs dir: {e}"))?;
+    fs::create_dir_all(&blobs_dir).map_err(|e| format!("Failed to create blobs dir: {e}"))?;
+    fs::create_dir_all(&snapshot_dir).map_err(|e| format!("Failed to create snapshot dir: {e}"))?;
 
     let snapshot_file = snapshot_dir.join(filename);
     if let Some(parent) = snapshot_file.parent() {
         if parent != snapshot_dir {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create snapshot subdir: {}", e))?;
+                .map_err(|e| format!("Failed to create snapshot subdir: {e}"))?;
         }
     }
 
     let safe_name = filename.replace('/', "_");
-    let tmp_path = blobs_dir.join(format!(".download-{}.tmp", safe_name));
+    let tmp_path = blobs_dir.join(format!(".download-{safe_name}.tmp"));
     // Sidecar that records which URL produced the current `.tmp`. Lets us
     // resume across process restarts: if the URL matches we keep the
     // partial file and ask the server for a Range; if it differs (or is
     // missing) we wipe the stale bytes before re-downloading.
-    let tmp_url_path = blobs_dir.join(format!(".download-{}.tmp.url", safe_name));
-    let download_url = format!(
-        "https://huggingface.co/{}/resolve/{}/{}",
-        repo, commit, filename
-    );
+    let tmp_url_path = blobs_dir.join(format!(".download-{safe_name}.tmp.url"));
+    let download_url = format!("https://huggingface.co/{repo}/resolve/{commit}/{filename}");
 
     let prior_url = fs::read_to_string(&tmp_url_path).ok();
     let resumable = prior_url.as_deref().map(str::trim) == Some(download_url.as_str());
@@ -448,14 +444,14 @@ pub fn download_to_hf_cache(
 
     info!("[HfCache] Computing SHA256 for {:?}", tmp_path);
     let sha256 = compute_sha256(&tmp_path)?;
-    let blob_name = format!("sha256-{}", sha256);
+    let blob_name = format!("sha256-{sha256}");
     let blob_path = blobs_dir.join(&blob_name);
 
     if blob_path.exists() {
         let _ = fs::remove_file(&tmp_path);
         info!("[HfCache] Blob already exists: {:?}", blob_path);
     } else {
-        fs::rename(&tmp_path, &blob_path).map_err(|e| format!("Failed to rename blob: {}", e))?;
+        fs::rename(&tmp_path, &blob_path).map_err(|e| format!("Failed to rename blob: {e}"))?;
         info!("[HfCache] Blob created: {:?}", blob_path);
     }
 
@@ -463,16 +459,16 @@ pub fn download_to_hf_cache(
 
     let refs_main = refs_dir.join("main");
     let mut f =
-        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {}", e))?;
+        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {e}"))?;
     f.write_all(commit.as_bytes())
-        .map_err(|e| format!("Failed to write refs/main: {}", e))?;
+        .map_err(|e| format!("Failed to write refs/main: {e}"))?;
 
     let depth = filename.matches('/').count();
     let mut rel_prefix = String::from("../../");
     for _ in 0..depth {
         rel_prefix.push_str("../");
     }
-    let symlink_target = format!("{}blobs/{}", rel_prefix, blob_name);
+    let symlink_target = format!("{rel_prefix}blobs/{blob_name}");
 
     let _ = fs::remove_file(&snapshot_file);
     create_symlink_or_copy(&symlink_target, &snapshot_file, &blob_path)?;
@@ -499,21 +495,20 @@ pub fn import_to_hf_cache(
     let blobs_dir = repo_dir.join("blobs");
     let snapshot_dir = repo_dir.join("snapshots").join(commit);
 
-    fs::create_dir_all(&refs_dir).map_err(|e| format!("Failed to create refs dir: {}", e))?;
-    fs::create_dir_all(&blobs_dir).map_err(|e| format!("Failed to create blobs dir: {}", e))?;
-    fs::create_dir_all(&snapshot_dir)
-        .map_err(|e| format!("Failed to create snapshot dir: {}", e))?;
+    fs::create_dir_all(&refs_dir).map_err(|e| format!("Failed to create refs dir: {e}"))?;
+    fs::create_dir_all(&blobs_dir).map_err(|e| format!("Failed to create blobs dir: {e}"))?;
+    fs::create_dir_all(&snapshot_dir).map_err(|e| format!("Failed to create snapshot dir: {e}"))?;
 
     let snapshot_file = snapshot_dir.join(filename);
     if let Some(parent) = snapshot_file.parent() {
         if parent != snapshot_dir {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create snapshot subdir: {}", e))?;
+                .map_err(|e| format!("Failed to create snapshot subdir: {e}"))?;
         }
     }
 
     let sha256 = compute_sha256(existing_path)?;
-    let blob_name = format!("sha256-{}", sha256);
+    let blob_name = format!("sha256-{sha256}");
     let blob_path = blobs_dir.join(&blob_name);
 
     if blob_path.exists() {
@@ -521,7 +516,7 @@ pub fn import_to_hf_cache(
     } else {
         fs::rename(existing_path, &blob_path).or_else(|_| {
             fs::copy(existing_path, &blob_path)
-                .map_err(|e| format!("Failed to copy file to blob: {}", e))?;
+                .map_err(|e| format!("Failed to copy file to blob: {e}"))?;
             let _ = fs::remove_file(existing_path);
             Ok::<(), String>(())
         })?;
@@ -529,16 +524,16 @@ pub fn import_to_hf_cache(
 
     let refs_main = refs_dir.join("main");
     let mut f =
-        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {}", e))?;
+        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {e}"))?;
     f.write_all(commit.as_bytes())
-        .map_err(|e| format!("Failed to write refs/main: {}", e))?;
+        .map_err(|e| format!("Failed to write refs/main: {e}"))?;
 
     let depth = filename.matches('/').count();
     let mut rel_prefix = String::from("../../");
     for _ in 0..depth {
         rel_prefix.push_str("../");
     }
-    let symlink_target = format!("{}blobs/{}", rel_prefix, blob_name);
+    let symlink_target = format!("{rel_prefix}blobs/{blob_name}");
     let _ = fs::remove_file(&snapshot_file);
     create_symlink_or_copy(&symlink_target, &snapshot_file, &blob_path)?;
 
@@ -567,8 +562,7 @@ pub fn delete_from_hf_cache(model_path: &Path) -> Result<(), String> {
     };
 
     if model_path.exists() || model_path.is_symlink() {
-        fs::remove_file(model_path)
-            .map_err(|e| format!("Failed to remove snapshot entry: {}", e))?;
+        fs::remove_file(model_path).map_err(|e| format!("Failed to remove snapshot entry: {e}"))?;
         info!("[HfCache] Removed snapshot entry: {:?}", model_path);
     }
 
@@ -581,7 +575,7 @@ pub fn delete_from_hf_cache(model_path: &Path) -> Result<(), String> {
 
     if let Some(ref bp) = blob_path {
         if bp.exists() && !is_blob_referenced_elsewhere(bp)? {
-            fs::remove_file(bp).map_err(|e| format!("Failed to remove blob: {}", e))?;
+            fs::remove_file(bp).map_err(|e| format!("Failed to remove blob: {e}"))?;
             info!("[HfCache] Removed unreferenced blob: {:?}", bp);
         }
     }
@@ -685,7 +679,7 @@ fn find_matching_blob(snapshot_path: &Path) -> Option<PathBuf> {
         return None;
     }
     let hash = compute_sha256(snapshot_path).ok()?;
-    let expected_blob = blobs_dir.join(format!("sha256-{}", hash));
+    let expected_blob = blobs_dir.join(format!("sha256-{hash}"));
     expected_blob.exists().then_some(expected_blob)
 }
 
@@ -701,7 +695,7 @@ fn create_symlink_or_copy(
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(symlink_target, symlink_path)
-            .map_err(|e| format!("Failed to create symlink: {}", e))?;
+            .map_err(|e| format!("Failed to create symlink: {e}"))?;
     }
 
     #[cfg(windows)]
@@ -742,7 +736,7 @@ fn download_file_to_path(
     info!("[HfCache] Downloading {} -> {:?}", url, dest_path);
 
     if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -750,7 +744,7 @@ fn download_file_to_path(
         .connect_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
     // No unconditional pre-delete here: the caller (download_to_hf_cache)
     // already validates that any pre-existing tmp file belongs to this same
@@ -783,7 +777,7 @@ fn download_file_to_path(
             Err(DownloadAttemptError::Retryable(msg)) => {
                 if attempt >= MAX_DOWNLOAD_ATTEMPTS {
                     let _ = fs::remove_file(dest_path);
-                    return Err(format!("{} (failed after {} attempts)", msg, attempt));
+                    return Err(format!("{msg} (failed after {attempt} attempts)"));
                 }
                 let backoff = Duration::from_secs(1u64 << (attempt - 1).min(4));
                 warn!(
@@ -824,13 +818,13 @@ fn attempt_download(
 
     let mut request = client.get(url).header("User-Agent", "rayline");
     if existing_bytes > 0 {
-        request = request.header("Range", format!("bytes={}-", existing_bytes));
+        request = request.header("Range", format!("bytes={existing_bytes}-"));
     }
 
     let response = match request.send() {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("Download request failed: {}", e);
+            let msg = format!("Download request failed: {e}");
             return if is_retryable_reqwest_error(&e) {
                 Err(DownloadAttemptError::Retryable(msg))
             } else {
@@ -848,11 +842,10 @@ fn attempt_download(
         if status.as_u16() == 416 && existing_bytes > 0 {
             let _ = fs::remove_file(dest_path);
             return Err(DownloadAttemptError::Retryable(format!(
-                "Server reported partial file out of range ({} bytes); restarting from zero",
-                existing_bytes
+                "Server reported partial file out of range ({existing_bytes} bytes); restarting from zero"
             )));
         }
-        let msg = format!("Download failed with status {}", status);
+        let msg = format!("Download failed with status {status}");
         return if status.is_server_error() {
             Err(DownloadAttemptError::Retryable(msg))
         } else {
@@ -863,8 +856,7 @@ fn attempt_download(
     if existing_bytes > 0 && status.as_u16() != 206 {
         let _ = fs::remove_file(dest_path);
         return Err(DownloadAttemptError::Retryable(format!(
-            "Server ignored resume request for partial file ({} bytes, status {}); restarting from zero",
-            existing_bytes, status
+            "Server ignored resume request for partial file ({existing_bytes} bytes, status {status}); restarting from zero"
         )));
     }
 
@@ -873,7 +865,7 @@ fn attempt_download(
         let file = fs::OpenOptions::new()
             .append(true)
             .open(dest_path)
-            .map_err(|e| DownloadAttemptError::Fatal(format!("Failed to open tmp file: {}", e)))?;
+            .map_err(|e| DownloadAttemptError::Fatal(format!("Failed to open tmp file: {e}")))?;
         let content_len = response.content_length().unwrap_or(0);
         let total = if content_len > 0 {
             existing_bytes + content_len
@@ -887,7 +879,7 @@ fn attempt_download(
         (file, existing_bytes, total)
     } else {
         let file = fs::File::create(dest_path)
-            .map_err(|e| DownloadAttemptError::Fatal(format!("Failed to create file: {}", e)))?;
+            .map_err(|e| DownloadAttemptError::Fatal(format!("Failed to create file: {e}")))?;
         (file, 0u64, response.content_length().unwrap_or(0))
     };
 
@@ -906,7 +898,7 @@ fn attempt_download(
             Ok(n) => n,
             Err(e) => {
                 drop(file);
-                let msg = format!("Read error during download: {}", e);
+                let msg = format!("Read error during download: {e}");
                 return if is_retryable_io_error(&e) {
                     Err(DownloadAttemptError::Retryable(msg))
                 } else {
@@ -920,8 +912,7 @@ fn attempt_download(
         if let Err(e) = file.write_all(&buf[..n]) {
             drop(file);
             return Err(DownloadAttemptError::Fatal(format!(
-                "Write error during download: {}",
-                e
+                "Write error during download: {e}"
             )));
         }
         bytes_downloaded += n as u64;
@@ -1067,6 +1058,7 @@ mod tests {
             while handled < 2 && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let request = read_http_request(&mut stream);
                         server_requests.lock().unwrap().push(request);
                         let body: &[u8] = if handled == 0 {
@@ -1080,7 +1072,7 @@ mod tests {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(e) => panic!("test server accept failed: {}", e),
+                    Err(e) => panic!("test server accept failed: {e}"),
                 }
             }
         });
