@@ -1,21 +1,72 @@
 name: Feature request
-description: Suggest a Rayline improvement.
+description: Suggest a Rayline Local improvement.
 title: "[feature]: "
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Rayline Local is not accepting external pull requests yet. Use this form to describe the problem and shape the proposal before implementation work starts.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Pick every affected product or code area.
+      multiple: true
+      options:
+        - CLI UX
+        - Claude Code integration
+        - Routing behavior
+        - Local model support
+        - Proxy or TLS behavior
+        - Configuration
+        - Install or update
+        - Documentation or examples
+        - Governance or contribution process
+        - Other
+    validations:
+      required: true
   - type: textarea
     id: problem
     attributes:
       label: Problem
+      description: What user need, limitation, or workflow gap does this solve?
+      placeholder: I am trying to..., but today...
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
-      label: Proposal
+      label: Proposed solution
+      description: What change would you like Rayline Local to make?
     validations:
       required: true
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
+      description: What workarounds or different designs did you consider?
+  - type: textarea
+    id: prior_art
+    attributes:
+      label: Related tools, issues, or prior art
+      description: Link related issues, similar behavior in other tools, docs, or prototypes.
+  - type: textarea
+    id: example
+    attributes:
+      label: Example usage
+      description: Show the command, config, API shape, or workflow you would expect to use.
+  - type: textarea
+    id: compatibility_security
+    attributes:
+      label: Compatibility and security impact
+      description: Note any impact on proxying, local certificates, credentials, routing defaults, existing configs, or platform support.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues before filing.
+          required: true
+        - label: I understand Rayline Local is not accepting external pull requests yet.
+          required: true
