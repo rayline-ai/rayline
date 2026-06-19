@@ -9,6 +9,19 @@ support, and update checks.
 This repository contains the Rayline Local router. Local-router-only use does
 not require a hosted account and does not connect to any remote hosted service.
 
+## Demo
+
+Claude Code running with hybrid cloud + on-device AI. The main agent runs Opus
+in the cloud and orchestrates an `Explore` subagent that Rayline Local routes to
+a model running fully on your machine (Qwen3.6-35B-A3B, Q4) — seamlessly, in a
+single session.
+
+<a href="https://get.rayline.ai/media/rayline-local-routing-demo.mp4">
+  <img src="https://get.rayline.ai/media/rayline-local-routing-demo.gif"
+       alt="Rayline Local routing a Claude Code Explore subagent to an on-device model"
+       width="100%">
+</a>
+
 ## How It Works
 
 Run `rayline claude` to start a Claude Code session with smart routing layered
