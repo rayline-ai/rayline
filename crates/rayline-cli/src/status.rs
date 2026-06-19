@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use rand::Rng;
 use serde_json::{Map, Value};
-use url::Url;
+use url::{Host, Url};
 
 const AUTH_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const TOKEN_REFRESH_MARGIN_SECONDS: f64 = 300.0;
@@ -1244,8 +1244,11 @@ fn validate_env_url(
     value: String,
 ) -> Result<String, HostedEnvironmentError> {
     let value = value.trim_end_matches('/').to_owned();
-    let valid = Url::parse(&value)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    let valid = Url::parse(&value).is_ok_and(|url| match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(host)) => is_local_http_env_host(host),
+        _ => false,
+    });
     if valid {
         Ok(value)
     } else {
@@ -1256,6 +1259,21 @@ fn validate_env_url(
             value,
         })
     }
+}
+
+fn is_local_http_env_host(host: Host<&str>) -> bool {
+    match host {
+        Host::Domain(host) => is_local_http_env_domain(host),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+    }
+}
+
+fn is_local_http_env_domain(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.len() > ".localhost".len() && host.to_ascii_lowercase().ends_with(".localhost")
 }
 
 fn cli_auth_url(hosted: &HostedEnvironment, state: &str) -> Result<String, AuthLoginError> {
@@ -2386,6 +2404,60 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn validate_env_url_accepts_https_hosts() {
+        let settings_path = Path::new("/tmp/rayline-settings.json");
+
+        let url = validate_env_url(
+            "foo",
+            settings_path,
+            "router_url",
+            "https://router.example.test/".to_owned(),
+        )
+        .expect("https URL");
+
+        assert_eq!(url, "https://router.example.test");
+    }
+
+    #[test]
+    fn validate_env_url_accepts_http_loopback_hosts() {
+        let settings_path = Path::new("/tmp/rayline-settings.json");
+        let cases = [
+            ("http://localhost:8787/", "http://localhost:8787"),
+            ("http://api.localhost:8787/", "http://api.localhost:8787"),
+            ("http://127.0.0.1:8787/", "http://127.0.0.1:8787"),
+            ("http://[::1]:8787/", "http://[::1]:8787"),
+        ];
+
+        for (input, expected) in cases {
+            let url = validate_env_url("foo", settings_path, "router_url", input.to_owned())
+                .expect("loopback HTTP URL");
+
+            assert_eq!(url, expected);
+        }
+    }
+
+    #[test]
+    fn validate_env_url_rejects_http_non_loopback_hosts() {
+        let settings_path = Path::new("/tmp/rayline-settings.json");
+
+        let error = validate_env_url(
+            "foo",
+            settings_path,
+            "router_url",
+            "http://router.example.test/".to_owned(),
+        )
+        .expect_err("non-loopback HTTP URL");
+
+        assert!(matches!(
+            &error,
+            HostedEnvironmentError::InvalidUrl { field, value, .. }
+                if *field == "router_url" && value == "http://router.example.test"
+        ));
+        assert!(error.to_string().contains("invalid URL field 'router_url'"));
+        assert!(error.to_string().contains("http://router.example.test"));
     }
 
     #[test]

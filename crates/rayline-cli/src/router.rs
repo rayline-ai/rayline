@@ -17,9 +17,7 @@ const DEFAULT_INJECTOR_PORT: u16 = 20809;
 const DEFAULT_ADAPTER_PORT: u16 = 20808;
 const DEFAULT_PROXY_PORT: u16 = 20810;
 pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
-const DEFAULT_LOCAL_ROUTER_MODEL_REPO: &str = "unsloth/Qwen3.6-35B-A3B-GGUF";
-const DEFAULT_LOCAL_ROUTER_MODEL_FILE: &str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
-pub const DEFAULT_LOCAL_ROUTER_MODEL_ID: &str = "qwen3.6-35b-a3b-q4-k-m";
+pub const DEFAULT_LOCAL_ROUTER_MODEL_ID: &str = "qwen3.6-35b-a3b-q4km";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_TIMEOUT_SECONDS: u64 = 240;
 const HEALTH_TIMEOUT_DOWNLOAD_SECONDS: u64 = 3600;
@@ -55,6 +53,8 @@ pub struct RouterStartRequest {
     pub env_name: Option<String>,
     pub model_repo: String,
     pub model_file: String,
+    pub model_revision: Option<String>,
+    pub model_sha256: Option<String>,
     pub router_url: String,
     pub router_url_explicit: bool,
     pub decision_plane: String,
@@ -130,6 +130,8 @@ impl RouterStartRequest {
             env_name: None,
             model_repo: String::new(),
             model_file: String::new(),
+            model_revision: None,
+            model_sha256: None,
             router_url: crate::ROUTER_PROD_URL.to_owned(),
             router_url_explicit: false,
             decision_plane: DECISION_PLANE_HOSTED.to_owned(),
@@ -151,9 +153,6 @@ impl RouterStartRequest {
     /// ordinary local router starts remain config-driven through `local_model`.
     pub fn local_router_defaults(root_env_explicit: bool) -> Self {
         let mut request = Self::defaults(root_env_explicit);
-        request.model_repo = DEFAULT_LOCAL_ROUTER_MODEL_REPO.to_owned();
-        request.model_file = DEFAULT_LOCAL_ROUTER_MODEL_FILE.to_owned();
-        request.local_model_id = DEFAULT_LOCAL_ROUTER_MODEL_ID.to_owned();
         request.decision_plane = DECISION_PLANE_LOCAL.to_owned();
         request.local_router_port = DEFAULT_LOCAL_ROUTER_PORT;
         request.router_url = format!("http://127.0.0.1:{DEFAULT_LOCAL_ROUTER_PORT}");
@@ -164,8 +163,8 @@ impl RouterStartRequest {
     /// Layer a local-model config onto a model-less `base` request.
     ///
     /// `Recommended` mode fills the GGUF coordinates from the user's curated
-    /// pick (`model_repo`/`model_file`, advertising the catalog `model_id` to
-    /// the classifier). `Custom` mode points the daemon at the user's
+    /// pick (repo/file plus revision/SHA, advertising the catalog `model_id`
+    /// to the classifier). `Custom` mode points the daemon at the user's
     /// endpoint: it sets `upstream_url`/`upstream_model` (so `spawn_router`
     /// emits `--upstream-url`/`--upstream-model` and skips the GGUF args) and
     /// overrides `local_model_id` with the user's model so the injector
@@ -178,14 +177,19 @@ impl RouterStartRequest {
     pub fn from_local_model(cfg: &crate::local_model::LocalModelConfig, base: Self) -> Self {
         match cfg.mode {
             crate::local_model::LocalModelMode::Recommended => {
-                let (Some(model_repo), Some(model_file)) =
-                    (cfg.model_repo.clone(), cfg.model_file.clone())
-                else {
+                let (Some(model_repo), Some(model_file), Some(model_revision), Some(model_sha256)) = (
+                    cfg.model_repo.clone(),
+                    cfg.model_file.clone(),
+                    cfg.model_revision.clone(),
+                    cfg.model_sha256.clone(),
+                ) else {
                     return base;
                 };
                 Self {
                     model_repo,
                     model_file,
+                    model_revision: Some(model_revision),
+                    model_sha256: Some(model_sha256),
                     local_model_id: cfg.model_id.clone().unwrap_or(base.local_model_id),
                     ..base
                 }
@@ -198,6 +202,8 @@ impl RouterStartRequest {
                 Self {
                     upstream_url: Some(upstream_url),
                     upstream_model: Some(model.clone()),
+                    model_revision: None,
+                    model_sha256: None,
                     local_model_id: model,
                     ..base
                 }
@@ -1375,10 +1381,12 @@ async fn resolve_start_model(
                     },
                 }
             };
-            let repo = cfg.model_repo.as_deref().unwrap_or_default();
-            let file = cfg.model_file.as_deref().unwrap_or_default();
-            if !hf_cache_has_gguf(home, repo, file) {
-                let model_id = cfg.model_id.as_deref().unwrap_or(file);
+            if !hf_cache_has_verified_config_gguf(home, &cfg) {
+                let model_id = cfg
+                    .model_id
+                    .as_deref()
+                    .or(cfg.model_file.as_deref())
+                    .unwrap_or("selected model");
                 return Err(io::Error::other(format!(
                     "Local model `{model_id}` is not downloaded. Run `{cli} local download {model_id}`."
                 )));
@@ -1867,6 +1875,12 @@ fn spawn_router(
             "--model-file",
             &request.model_file,
         ]);
+        if let Some(revision) = request.model_revision.as_deref() {
+            command.args(["--model-revision", revision]);
+        }
+        if let Some(sha256) = request.model_sha256.as_deref() {
+            command.args(["--model-sha256", sha256]);
+        }
     }
     command.args([
         "--decision-plane",
@@ -1939,7 +1953,13 @@ fn spawn_router(
     // Custom mode downloads no GGUF, so there is never a first-run download wait
     // to warn about — treat it like a warm cache.
     let cache_hit = request.upstream_url.is_some()
-        || hf_cache_has_gguf(home, &request.model_repo, &request.model_file);
+        || hf_cache_has_verified_gguf(
+            home,
+            &request.model_repo,
+            &request.model_file,
+            request.model_revision.as_deref(),
+            request.model_sha256.as_deref(),
+        );
     if cache_hit {
         output.push_str(" Waiting for healthz\u{2026}\n");
     } else {
@@ -2180,6 +2200,14 @@ fn router_meta(
     let mut meta = BTreeMap::new();
     meta.insert("model_repo".to_owned(), request.model_repo.clone());
     meta.insert("model_file".to_owned(), request.model_file.clone());
+    meta.insert(
+        "model_revision".to_owned(),
+        request.model_revision.clone().unwrap_or_default(),
+    );
+    meta.insert(
+        "model_sha256".to_owned(),
+        request.model_sha256.clone().unwrap_or_default(),
+    );
     // Record the custom upstream so switching endpoints (or auto↔custom) is seen
     // as a config change and restarts the daemon. Empty in auto mode.
     meta.insert(
@@ -2345,6 +2373,8 @@ fn format_meta(meta: &BTreeMap<String, String>) -> String {
     for key in [
         "model_repo",
         "model_file",
+        "model_revision",
+        "model_sha256",
         "upstream_url",
         "upstream_model",
         "router_url",
@@ -2548,15 +2578,132 @@ fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn hf_cache_has_gguf(home: &Path, model_repo: &str, model_file: &str) -> bool {
-    let repo_dir = hf_hub_dir(home).join(format!("models--{}", model_repo.replace('/', "--")));
-    let snapshots = repo_dir.join("snapshots");
-    let Ok(entries) = std::fs::read_dir(snapshots) else {
+pub(crate) fn hf_cache_has_verified_config_gguf(
+    home: &Path,
+    cfg: &crate::local_model::LocalModelConfig,
+) -> bool {
+    hf_cache_has_verified_gguf(
+        home,
+        cfg.model_repo.as_deref().unwrap_or_default(),
+        cfg.model_file.as_deref().unwrap_or_default(),
+        cfg.model_revision.as_deref(),
+        cfg.model_sha256.as_deref(),
+    )
+}
+
+fn hf_cache_has_verified_gguf(
+    home: &Path,
+    model_repo: &str,
+    model_file: &str,
+    model_revision: Option<&str>,
+    model_sha256: Option<&str>,
+) -> bool {
+    hf_cache_has_verified_gguf_at(
+        &hf_hub_dir(home),
+        model_repo,
+        model_file,
+        model_revision,
+        model_sha256,
+    )
+}
+
+fn hf_cache_has_verified_gguf_at(
+    hub_dir: &Path,
+    model_repo: &str,
+    model_file: &str,
+    model_revision: Option<&str>,
+    model_sha256: Option<&str>,
+) -> bool {
+    let (Some(revision), Some(sha256)) = (model_revision, model_sha256) else {
         return false;
     };
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().join(model_file).is_file())
+    let snapshot = hf_cache_verified_snapshot_path(hub_dir, model_repo, model_file, revision);
+    hf_cache_snapshot_is_verified(&snapshot, sha256)
+}
+
+fn hf_cache_snapshot_is_verified(snapshot: &Path, sha256: &str) -> bool {
+    snapshot.is_file() && rayline_hf::verify_file_sha256(snapshot, sha256).is_ok()
+}
+
+fn hf_cache_verified_snapshot_path(
+    hub_dir: &Path,
+    model_repo: &str,
+    model_file: &str,
+    revision: &str,
+) -> PathBuf {
+    hub_dir
+        .join(rayline_hf::repo_to_folder_name(model_repo))
+        .join("snapshots")
+        .join(revision)
+        .join(model_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn verified_cache_requires_exact_revision_and_sha256() {
+        let test_dir = unique_test_dir("verified-router-cache");
+        let hub = test_dir.join("hub");
+        let repo = "org/repo";
+        let filename = "model.gguf";
+        let revision = "ffffffffffffffffffffffffffffffffffffffff";
+        let old_revision = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let body = b"verified model bytes";
+        let sha256 = format!("{:x}", Sha256::digest(body));
+        let wrong_sha = format!("{:x}", Sha256::digest(b"wrong bytes"));
+
+        let old_snapshot = hf_cache_verified_snapshot_path(&hub, repo, filename, old_revision);
+        fs::create_dir_all(old_snapshot.parent().unwrap()).unwrap();
+        fs::write(&old_snapshot, body).unwrap();
+
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&sha256),
+        ));
+
+        let snapshot = hf_cache_verified_snapshot_path(&hub, repo, filename, revision);
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        fs::write(&snapshot, body).unwrap();
+
+        assert!(hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&sha256),
+        ));
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&wrong_sha),
+        ));
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            None,
+        ));
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
 }
 
 fn hf_hub_dir(home: &Path) -> PathBuf {

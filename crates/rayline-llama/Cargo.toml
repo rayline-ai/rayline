@@ -15,6 +15,7 @@ anyhow.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tracing.workspace = true
 dirs.workspace = true
 rayline-hf = { path = "../rayline-hf" }

@@ -177,6 +177,56 @@ impl From<crate::status::AuthTokenError> for RunError {
     }
 }
 
+async fn explicit_local_router_start_request(
+    env_name: &str,
+    request: &RunRequest,
+    local_cfg: Option<&crate::local_model::LocalModelConfig>,
+) -> Result<crate::router::RouterStartRequest, RunError> {
+    let injector_port = resolve_injector_port(request.local_injector_port)?;
+    let mut start_request =
+        crate::router::RouterStartRequest::local_router_defaults(request.root_env_explicit);
+    start_request.env_name = Some(env_name.to_owned());
+    start_request.injector_port = injector_port;
+    start_request.router_config_path = request.router_config_path.clone();
+
+    if let Some(cfg) = local_cfg.filter(|cfg| cfg.is_engageable()) {
+        return Ok(crate::router::RouterStartRequest::from_local_model(
+            cfg,
+            start_request,
+        ));
+    }
+
+    let Some(model) = crate::catalog::fetch_curated(env_name)
+        .await
+        .into_iter()
+        .find(|model| model.id == crate::router::DEFAULT_LOCAL_ROUTER_MODEL_ID)
+    else {
+        return Err(RunError::Router(format!(
+            "No registry-pinned default local model found for `{}`. Publish it with `revision` and `sha256` in the model registry, or configure a custom endpoint with `{} local custom --url <URL> --model <NAME>`.",
+            crate::router::DEFAULT_LOCAL_ROUTER_MODEL_ID,
+            crate::CLI_BIN
+        )));
+    };
+
+    let cfg = crate::local_model::LocalModelConfig {
+        mode: crate::local_model::LocalModelMode::Recommended,
+        base_url: local_cfg.and_then(|cfg| cfg.base_url.clone()),
+        model: local_cfg.and_then(|cfg| cfg.model.clone()),
+        model_id: Some(model.id),
+        model_repo: Some(model.repo),
+        model_file: Some(model.filename),
+        model_revision: Some(model.revision),
+        model_sha256: Some(model.sha256),
+        custom_endpoints: local_cfg
+            .map(|cfg| cfg.custom_endpoints.clone())
+            .unwrap_or_default(),
+    };
+    Ok(crate::router::RouterStartRequest::from_local_model(
+        &cfg,
+        start_request,
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DaemonState {
     pid: u32,
@@ -266,20 +316,7 @@ async fn run_command_from_home(
         .map(enable_local_router_from_router_settings)
         .unwrap_or(false);
     let local_start_request = if request.local_router {
-        let injector_port = resolve_injector_port(request.local_injector_port)?;
-        let mut start_request =
-            crate::router::RouterStartRequest::local_router_defaults(request.root_env_explicit);
-        start_request.env_name = Some(env_name.clone());
-        start_request.injector_port = injector_port;
-        start_request.router_config_path = request.router_config_path.clone();
-        let start_request = match local_cfg.as_ref() {
-            Some(cfg) if cfg.is_engageable() => {
-                crate::router::RouterStartRequest::from_local_model(cfg, start_request)
-            }
-            None => start_request,
-            _ => start_request,
-        };
-        Some(start_request)
+        Some(explicit_local_router_start_request(&env_name, request, local_cfg.as_ref()).await?)
     } else {
         match local_cfg {
             Some(cfg) if !request.isolated && enable_local_router => {
@@ -931,12 +968,14 @@ async fn resolve_engageable_local_config(
         }
         crate::local_model::LocalModelMode::Recommended => {
             if cfg.has_recommended_pick() {
-                let repo = cfg.model_repo.as_deref().unwrap_or_default();
-                let file = cfg.model_file.as_deref().unwrap_or_default();
-                if crate::router::hf_cache_has_gguf(home, repo, file) {
+                if crate::router::hf_cache_has_verified_config_gguf(home, &cfg) {
                     return Some(cfg);
                 }
-                let model_id = cfg.model_id.as_deref().unwrap_or(file);
+                let model_id = cfg
+                    .model_id
+                    .as_deref()
+                    .or(cfg.model_file.as_deref())
+                    .unwrap_or("selected model");
                 eprintln!(
                     "Warning: local routing is enabled, but the local model `{model_id}` is not downloaded. Continuing with cloud routing. Download it with `{cli} local download {model_id}`."
                 );
@@ -963,6 +1002,8 @@ async fn resolve_engageable_local_config(
                                 model_id: Some(model.id),
                                 model_repo: Some(model.repo),
                                 model_file: Some(model.filename),
+                                model_revision: Some(model.revision),
+                                model_sha256: Some(model.sha256),
                                 custom_endpoints: cfg.custom_endpoints,
                             })
                         }

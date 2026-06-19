@@ -5,6 +5,7 @@
 //! binary extraction, process management, and health checks.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -171,6 +172,62 @@ fn detect_gpu() -> (String, String, u64) {
 // Release URL resolution
 // ---------------------------------------------------------------------------
 
+const LLAMA_RELEASE_BASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download";
+const UNVERIFIED_RUNTIME_DOWNLOAD_ENV: &str = "RAYLINE_LLAMA_ALLOW_UNVERIFIED_RUNTIME_DOWNLOAD";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimeArchive {
+    pub url: String,
+    pub filename: String,
+    pub expected_sha256: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeArchiveManifestEntry {
+    tag: &'static str,
+    filename: &'static str,
+    sha256: &'static str,
+}
+
+// Digests are copied from the GitHub release asset `digest` metadata.
+const RUNTIME_ARCHIVE_MANIFEST: &[RuntimeArchiveManifestEntry] = &[
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-macos-arm64.tar.gz",
+        sha256: "e88f05f82c8c0c0f5a861ff7822f096ad6641128e6f64c666eee743f46730db6",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-macos-x64.tar.gz",
+        sha256: "31151226ac563764df3456b615c261d10a92f09e99be48a64d39985f15e7a15b",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-ubuntu-x64.tar.gz",
+        sha256: "be111dd28e6228fc4cb6a6ec41f03a67947ab61f315a3d22d0e68ac7372a58ab",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-win-cuda-12.4-x64.zip",
+        sha256: "d48de89c397ceb7e8325786808a2edff443e29780ce93a8404066286cdac6b63",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-win-vulkan-x64.zip",
+        sha256: "af6b1b94377b9f78dbb2285b878fb696d36766391499d65e055ecd622b69018a",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-win-cpu-x64.zip",
+        sha256: "23c0e329e2228f7cbcc83884f42c7787f1a3133e5548ea99e89d60202e1fd89c",
+    },
+    RuntimeArchiveManifestEntry {
+        tag: "b9585",
+        filename: "llama-b9585-bin-win-cpu-arm64.zip",
+        sha256: "9dd7cde8fdc2a5c932f63e4392c1c10ce6f65d39a70a781d9a3978e68ca9c215",
+    },
+];
+
 /// Resolve the llama-server release archive URL for the given tag and platform.
 pub fn resolve_download_url(
     tag: &str,
@@ -178,12 +235,50 @@ pub fn resolve_download_url(
     arch: &str,
     gpu_type: &str,
 ) -> Result<String, String> {
-    let base = format!("https://github.com/ggml-org/llama.cpp/releases/download/{tag}");
-    let filename = resolve_archive_filename(tag, os, arch, gpu_type)?;
-    Ok(format!("{base}/{filename}"))
+    Ok(resolve_runtime_archive(tag, os, arch, gpu_type)?.url)
 }
 
 pub fn resolve_archive_filename(
+    tag: &str,
+    os: &str,
+    arch: &str,
+    gpu_type: &str,
+) -> Result<String, String> {
+    Ok(resolve_runtime_archive(tag, os, arch, gpu_type)?.filename)
+}
+
+pub fn resolve_runtime_archive(
+    tag: &str,
+    os: &str,
+    arch: &str,
+    gpu_type: &str,
+) -> Result<ResolvedRuntimeArchive, String> {
+    resolve_runtime_archive_checked(tag, os, arch, gpu_type, allow_unverified_runtime_download())
+}
+
+fn resolve_runtime_archive_checked(
+    tag: &str,
+    os: &str,
+    arch: &str,
+    gpu_type: &str,
+    allow_unverified: bool,
+) -> Result<ResolvedRuntimeArchive, String> {
+    let filename = archive_filename_for_platform(tag, os, arch, gpu_type)?;
+    let expected_sha256 = expected_archive_sha256(tag, &filename);
+    if expected_sha256.is_none() && !allow_unverified {
+        return Err(format!(
+            "No committed SHA256 for llama.cpp runtime archive {filename} (tag {tag}); refusing to download. Add it to the runtime archive manifest or set {UNVERIFIED_RUNTIME_DOWNLOAD_ENV}=1 for local development only."
+        ));
+    }
+
+    Ok(ResolvedRuntimeArchive {
+        url: format!("{LLAMA_RELEASE_BASE}/{tag}/{filename}"),
+        filename,
+        expected_sha256,
+    })
+}
+
+fn archive_filename_for_platform(
     tag: &str,
     os: &str,
     arch: &str,
@@ -206,6 +301,25 @@ pub fn resolve_archive_filename(
     }
 }
 
+fn expected_archive_sha256(tag: &str, filename: &str) -> Option<&'static str> {
+    RUNTIME_ARCHIVE_MANIFEST
+        .iter()
+        .find(|entry| entry.tag == tag && entry.filename == filename)
+        .map(|entry| entry.sha256)
+}
+
+fn allow_unverified_runtime_download() -> bool {
+    env::var(UNVERIFIED_RUNTIME_DOWNLOAD_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Download + extract
 // ---------------------------------------------------------------------------
@@ -214,6 +328,7 @@ pub fn resolve_archive_filename(
 /// No resume — the release tarball is small enough (~100MB) that a fresh
 /// re-download on retry is cheaper than the resume bookkeeping.
 pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
+    let expected_sha256 = expected_archive_sha256_for_url(url)?;
     info!("[rayline-llama] Downloading {} -> {:?}", url, dest_path);
 
     if let Some(parent) = dest_path.parent() {
@@ -232,7 +347,12 @@ pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
     loop {
         attempt += 1;
         match attempt_download(&client, url, dest_path) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if let Some(expected) = expected_sha256 {
+                    verify_archive_sha256(dest_path, expected)?;
+                }
+                return Ok(());
+            }
             Err(msg) => {
                 if attempt >= MAX_ATTEMPTS {
                     let _ = fs::remove_file(dest_path);
@@ -247,6 +367,59 @@ pub fn download_file(url: &str, dest_path: &Path) -> Result<(), String> {
             }
         }
     }
+}
+
+fn expected_archive_sha256_for_url(url: &str) -> Result<Option<&'static str>, String> {
+    let Some(rest) = url.strip_prefix(&format!("{LLAMA_RELEASE_BASE}/")) else {
+        if allow_unverified_runtime_download() {
+            warn!(
+                "[rayline-llama] {}=1: downloading runtime from unrecognized URL without SHA256 verification: {}",
+                UNVERIFIED_RUNTIME_DOWNLOAD_ENV, url
+            );
+            return Ok(None);
+        }
+        return Err(format!(
+            "No committed SHA256 for llama.cpp runtime URL {url}; refusing to download. Set {UNVERIFIED_RUNTIME_DOWNLOAD_ENV}=1 for local development only."
+        ));
+    };
+    let Some((tag, filename)) = rest.split_once('/') else {
+        return Err(format!("Malformed llama.cpp runtime download URL: {url}"));
+    };
+    if tag.is_empty() || filename.is_empty() || filename.contains('/') {
+        return Err(format!("Malformed llama.cpp runtime download URL: {url}"));
+    }
+    match expected_archive_sha256(tag, filename) {
+        Some(expected) => Ok(Some(expected)),
+        None if allow_unverified_runtime_download() => {
+            warn!(
+                "[rayline-llama] {}=1: downloading {} without committed SHA256 verification",
+                UNVERIFIED_RUNTIME_DOWNLOAD_ENV, filename
+            );
+            Ok(None)
+        }
+        None => Err(format!(
+            "No committed SHA256 for llama.cpp runtime archive {filename} (tag {tag}); refusing to download. Add it to the runtime archive manifest or set {UNVERIFIED_RUNTIME_DOWNLOAD_ENV}=1 for local development only."
+        )),
+    }
+}
+
+pub fn verify_archive_sha256(archive_path: &Path, expected_sha256: &str) -> Result<(), String> {
+    let actual = sha256_file(archive_path)?;
+    if actual != expected_sha256 {
+        let _ = fs::remove_file(archive_path);
+        return Err(format!(
+            "sha256 mismatch for {}: expected {}, got {}",
+            archive_path.display(),
+            expected_sha256,
+            actual
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read archive for SHA256: {e}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn attempt_download(
@@ -823,47 +996,85 @@ mod tests {
     #[test]
     fn test_resolve_archive_filename_macos_arm() {
         assert_eq!(
-            resolve_archive_filename("b6000", "macos", "aarch64", "apple-silicon").unwrap(),
-            "llama-b6000-bin-macos-arm64.tar.gz"
+            resolve_archive_filename("b9585", "macos", "aarch64", "apple-silicon").unwrap(),
+            "llama-b9585-bin-macos-arm64.tar.gz"
         );
     }
 
     #[test]
     fn test_resolve_archive_filename_linux_x64() {
         assert_eq!(
-            resolve_archive_filename("b6000", "linux", "x86_64", "nvidia").unwrap(),
-            "llama-b6000-bin-ubuntu-x64.tar.gz"
+            resolve_archive_filename("b9585", "linux", "x86_64", "nvidia").unwrap(),
+            "llama-b9585-bin-ubuntu-x64.tar.gz"
         );
     }
 
     #[test]
     fn test_resolve_archive_filename_windows_variants() {
         assert!(
-            resolve_archive_filename("b6000", "windows", "x86_64", "nvidia")
+            resolve_archive_filename("b9585", "windows", "x86_64", "nvidia")
                 .unwrap()
                 .contains("win-cuda")
         );
         assert!(
-            resolve_archive_filename("b6000", "windows", "x86_64", "amd")
+            resolve_archive_filename("b9585", "windows", "x86_64", "amd")
                 .unwrap()
                 .contains("win-vulkan")
         );
         assert!(
-            resolve_archive_filename("b6000", "windows", "x86_64", "none")
+            resolve_archive_filename("b9585", "windows", "x86_64", "none")
                 .unwrap()
                 .contains("win-cpu")
         );
     }
 
     #[test]
-    fn test_resolve_download_url_includes_tag_and_base() {
-        let url = resolve_download_url("b6000", "macos", "aarch64", "apple-silicon").unwrap();
-        assert!(url.starts_with("https://github.com/ggml-org/llama.cpp/releases/download/b6000/"));
-        assert!(url.ends_with(".tar.gz"));
+    fn test_resolve_runtime_archive_selects_url_filename_and_checksum() {
+        let archive =
+            resolve_runtime_archive("b9585", "macos", "aarch64", "apple-silicon").unwrap();
+        assert_eq!(archive.filename, "llama-b9585-bin-macos-arm64.tar.gz");
+        assert_eq!(
+            archive.url,
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9585/llama-b9585-bin-macos-arm64.tar.gz"
+        );
+        assert_eq!(
+            archive.expected_sha256,
+            Some("e88f05f82c8c0c0f5a861ff7822f096ad6641128e6f64c666eee743f46730db6")
+        );
+    }
+
+    #[test]
+    fn test_resolve_download_url_requires_committed_checksum() {
+        let err =
+            resolve_runtime_archive_checked("b6000", "macos", "aarch64", "apple-silicon", false)
+                .unwrap_err();
+        assert!(err.contains("No committed SHA256"));
     }
 
     #[test]
     fn test_resolve_archive_filename_unsupported() {
-        assert!(resolve_archive_filename("b6000", "freebsd", "x86_64", "none").is_err());
+        assert!(resolve_archive_filename("b9585", "freebsd", "x86_64", "none").is_err());
+    }
+
+    #[test]
+    fn test_verify_archive_sha256_removes_mismatched_archive() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-llama-sha256-mismatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"not the expected archive").unwrap();
+
+        let err = verify_archive_sha256(
+            &path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("sha256 mismatch"));
+        assert!(!path.exists());
     }
 }
