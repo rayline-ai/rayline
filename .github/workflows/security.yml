@@ -1,5 +1,7 @@
 name: Rust Supply Chain Security
 
+# These jobs are required by the main branch ruleset. Keep them unfiltered so
+# docs-only and config-only PRs still publish the required check contexts.
 on:
   push:
   pull_request:
