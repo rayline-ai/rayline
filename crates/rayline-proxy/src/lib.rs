@@ -55,6 +55,14 @@ pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
 const MAX_AUTH_CACHE_ENTRIES: usize = 512;
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
+/// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
+/// concurrently with — sometimes a few ms after — it fires the subagent's
+/// first request. Resolving the type just once races that write and can fall
+/// back to passthrough, sending a routable subagent to the cloud. Poll briefly
+/// so the meta file has time to land. Only paid when an `agent_id` is present
+/// and unresolved, so main-thread traffic is never delayed.
+const AGENT_TYPE_RESOLVE_MAX_ATTEMPTS: usize = 6;
+const AGENT_TYPE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(40);
 
 /// Shared map `usage_doc_id -> auth headers`.
 ///
@@ -545,6 +553,14 @@ async fn forward_anthropic_request(
         .map(|p| p.as_str())
         .unwrap_or("/");
     let bytes = body.collect().await?.to_bytes();
+    let agent_id = claude_code_agent_id(&parts.headers)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "<none>".to_owned());
+    let agent_type = if agent_id != "<none>" {
+        resolve_claude_code_agent_type_with_retry(&agent_id).await
+    } else {
+        None
+    };
     let routed = prepare_anthropic_route_with_subagent_filter(
         &parts.method,
         parts.uri.path(),
@@ -552,18 +568,13 @@ async fn forward_anthropic_request(
         bytes,
         state.opts.routing_mode,
         &state.opts.selective_subagent_ids,
+        agent_type.as_deref(),
     );
     let decision = routed.decision;
     let body_model = request_body_model(&routed.body);
     let request_id = rayline_request_id(&parts.headers)
         .map(ToOwned::to_owned)
         .unwrap_or_else(new_request_id);
-    let agent_id = claude_code_agent_id(&parts.headers)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "<none>".to_owned());
-    let agent_type = (agent_id != "<none>")
-        .then(|| resolve_claude_code_agent_type(&agent_id))
-        .flatten();
     let proxy_owns_metrics = proxy_owns_metrics_for_route(&state.opts, decision.target);
     info!(
         "proxy route decision method={} path={} model={} agent_id={} agent_type={} target={:?} reason={} selective_subagents=[{}] local_available={} local_custom={}",
@@ -1847,7 +1858,15 @@ fn prepare_anthropic_route(
     body: Bytes,
     routing_mode: ProxyRoutingMode,
 ) -> PreparedAnthropicRoute {
-    prepare_anthropic_route_with_subagent_filter(method, path, headers, body, routing_mode, &[])
+    prepare_anthropic_route_with_subagent_filter(
+        method,
+        path,
+        headers,
+        body,
+        routing_mode,
+        &[],
+        None,
+    )
 }
 
 fn prepare_anthropic_route_with_subagent_filter(
@@ -1857,6 +1876,7 @@ fn prepare_anthropic_route_with_subagent_filter(
     body: Bytes,
     routing_mode: ProxyRoutingMode,
     selective_subagent_ids: &[String],
+    resolved_agent_type: Option<&str>,
 ) -> PreparedAnthropicRoute {
     if routing_mode == ProxyRoutingMode::All {
         return PreparedAnthropicRoute {
@@ -1919,8 +1939,7 @@ fn prepare_anthropic_route_with_subagent_filter(
         let Some(agent_id) = claude_code_agent_id(headers) else {
             return anthropic_passthrough(body, "selective_main_passthrough");
         };
-        let agent_type = resolve_claude_code_agent_type(agent_id);
-        if !subagent_filter_allows(agent_id, agent_type.as_deref(), selective_subagent_ids) {
+        if !subagent_filter_allows(agent_id, resolved_agent_type, selective_subagent_ids) {
             return anthropic_passthrough(body, "selective_subagent_passthrough");
         }
         return PreparedAnthropicRoute {
@@ -2087,11 +2106,48 @@ fn resolve_claude_code_agent_type(agent_id: &str) -> Option<String> {
     )
 }
 
+/// Resolve the subagent type, briefly retrying to absorb the race between
+/// Claude Code writing `agent-<id>.meta.json` and the subagent's first request
+/// reaching the proxy. Returns as soon as the type resolves; only loops while
+/// it is still unresolved, up to a bounded total wait.
+async fn resolve_claude_code_agent_type_with_retry(agent_id: &str) -> Option<String> {
+    retry_until_some(|| resolve_claude_code_agent_type(agent_id)).await
+}
+
+/// Call `resolve` up to `AGENT_TYPE_RESOLVE_MAX_ATTEMPTS` times, returning the
+/// first `Some` and sleeping `AGENT_TYPE_RESOLVE_RETRY_DELAY` between misses.
+async fn retry_until_some<F>(mut resolve: F) -> Option<String>
+where
+    F: FnMut() -> Option<String>,
+{
+    for attempt in 0..AGENT_TYPE_RESOLVE_MAX_ATTEMPTS {
+        if let Some(value) = resolve() {
+            return Some(value);
+        }
+        if attempt + 1 < AGENT_TYPE_RESOLVE_MAX_ATTEMPTS {
+            tokio::time::sleep(AGENT_TYPE_RESOLVE_RETRY_DELAY).await;
+        }
+    }
+    None
+}
+
 fn claude_projects_roots() -> Vec<PathBuf> {
     claude_projects_roots_from(
         env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
+        claude_home_dir(),
     )
+}
+
+/// Resolve the user's home directory cross-platform. `HOME` alone is wrong on
+/// Windows: native PowerShell / cmd do not set it (they use `USERPROFILE`), so
+/// relying on `HOME` left the Claude projects root empty and every subagent
+/// resolved to `<none>` and passed through to the cloud. `dirs::home_dir`
+/// resolves the Windows profile dir; the env fallbacks cover unusual setups.
+fn claude_home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn claude_projects_roots_from(config_dir: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -2747,6 +2803,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#),
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
+            None,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Router);
         assert_eq!(prepared.decision.reason, "selective_subagent_header");
@@ -2763,9 +2820,76 @@ mod tests {
             Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#),
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
+            None,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
         assert_eq!(prepared.decision.reason, "selective_subagent_passthrough");
+    }
+
+    #[test]
+    fn selective_mode_keys_route_on_resolved_agent_type_for_opaque_id() {
+        let allowlist = vec!["Explore".to_owned()];
+        let mut headers = HeaderMap::new();
+        // A real Claude Code subagent id is an opaque hash, not the agent name,
+        // so it only matches the allowlist once the type is resolved.
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("a4a4dba6877819a3a"),
+        );
+        let body = || Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#);
+
+        // Unresolved (meta file not written yet) -> passthrough to the cloud.
+        let prepared = prepare_anthropic_route_with_subagent_filter(
+            &Method::POST,
+            "/v1/messages",
+            &headers,
+            body(),
+            ProxyRoutingMode::SelectiveSubagents,
+            &allowlist,
+            None,
+        );
+        assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
+        assert_eq!(prepared.decision.reason, "selective_subagent_passthrough");
+
+        // Resolved to an allowlisted type -> route locally through the router.
+        let prepared = prepare_anthropic_route_with_subagent_filter(
+            &Method::POST,
+            "/v1/messages",
+            &headers,
+            body(),
+            ProxyRoutingMode::SelectiveSubagents,
+            &allowlist,
+            Some("Explore"),
+        );
+        assert_eq!(prepared.decision.target, RouteTarget::Router);
+        assert_eq!(prepared.decision.reason, "selective_subagent_header");
+    }
+
+    #[tokio::test]
+    async fn retry_until_some_resolves_after_initial_misses() {
+        let attempts = std::cell::Cell::new(0);
+        // Mirrors the race: the meta file is missing for the first two reads,
+        // then lands and resolves.
+        let resolved = retry_until_some(|| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            (n >= 2).then(|| "Explore".to_owned())
+        })
+        .await;
+        assert_eq!(resolved.as_deref(), Some("Explore"));
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_until_some_gives_up_after_max_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let resolved = retry_until_some(|| {
+            attempts.set(attempts.get() + 1);
+            None
+        })
+        .await;
+        assert_eq!(resolved, None);
+        assert_eq!(attempts.get(), AGENT_TYPE_RESOLVE_MAX_ATTEMPTS);
     }
 
     #[test]
