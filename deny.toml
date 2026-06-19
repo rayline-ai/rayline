@@ -1,0 +1,41 @@
+# cargo-deny policy for the Rayline Rust workspace.
+#
+# Keep this policy scoped to the committed workspace lockfile so OSS release
+# dependency review stays repeatable.
+
+[licenses]
+# Keep the global allow-list permissive and Apache-2.0-compatible. If a crate
+# needs a weaker/copyleft license, add a scoped exception with rationale instead
+# of broadening this list.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# `option-ext` is pulled transitively by `dirs` via `dirs-sys`. Keep this scoped
+# so any other MPL-2.0 dependency still requires explicit review.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[licenses.private]
+ignore = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

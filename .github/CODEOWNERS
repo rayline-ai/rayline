@@ -1,12 +1,19 @@
 * @chilang @madamowski
 
 /.github/ @chilang @madamowski
+/.github/workflows/release*.yml @chilang @madamowski
 /Cargo.lock @chilang @madamowski
 /Cargo.toml @chilang @madamowski
+/crates/*/Cargo.toml @chilang @madamowski
+/deny.toml @chilang @madamowski
+/rust-toolchain.toml @chilang @madamowski
 /LICENSE @chilang @madamowski
 /NOTICE @chilang @madamowski
 /SECURITY.md @chilang @madamowski
 /TRADEMARK.md @chilang @madamowski
+/scripts/install-rayline.sh @chilang @madamowski
+/scripts/install-rayline.ps1 @chilang @madamowski
+/packaging/homebrew/ @chilang @madamowski
 /crates/rayline-proxy/ @chilang @madamowski
 /crates/rayline-injector/ @chilang @madamowski
 /crates/rayline-cli/src/update.rs @chilang @madamowski

@@ -73,7 +73,7 @@ async fn injector_adds_headers_and_passes_307() {
     tokio::spawn(fake_router(router_port, captured.clone()));
     tokio::spawn(rayline_injector::serve(rayline_injector::InjectorOptions {
         port: injector_port,
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         local_model_id: "qwen3.6-35b-a3b-q4-k-m".into(),
         auth_cache: None,
         local_available: None,
@@ -87,7 +87,7 @@ async fn injector_adds_headers_and_passes_307() {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/messages", injector_port))
+        .post(format!("http://127.0.0.1:{injector_port}/v1/messages"))
         .header("authorization", "Bearer rayline-test-router-key")
         .body("{}")
         .send()
@@ -134,7 +134,7 @@ async fn injector_custom_mode_emits_custom_header_and_omits_hint() {
     tokio::spawn(fake_router(router_port, captured.clone()));
     tokio::spawn(rayline_injector::serve(rayline_injector::InjectorOptions {
         port: injector_port,
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         local_model_id: "google/gemma-4-e4b".into(),
         auth_cache: None,
         local_available: None,
@@ -147,7 +147,7 @@ async fn injector_custom_mode_emits_custom_header_and_omits_hint() {
         .build()
         .unwrap();
     let _ = client
-        .post(format!("http://127.0.0.1:{}/v1/messages", injector_port))
+        .post(format!("http://127.0.0.1:{injector_port}/v1/messages"))
         .header("authorization", "Bearer rayline-test-router-key")
         .body("{}")
         .send()
@@ -180,7 +180,7 @@ async fn injector_advertises_local_unavailable_when_unhealthy() {
     // Watchdog has marked the local model unhealthy.
     tokio::spawn(rayline_injector::serve(rayline_injector::InjectorOptions {
         port: injector_port,
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         local_model_id: "qwen3.6-35b-a3b-q4-k-m".into(),
         auth_cache: None,
         local_available: Some(Arc::new(AtomicBool::new(false))),
@@ -193,7 +193,7 @@ async fn injector_advertises_local_unavailable_when_unhealthy() {
         .build()
         .unwrap();
     let _ = client
-        .post(format!("http://127.0.0.1:{}/v1/messages", injector_port))
+        .post(format!("http://127.0.0.1:{injector_port}/v1/messages"))
         .header("authorization", "Bearer rayline-test-router-key")
         // Stale client-supplied local headers must NOT survive: the injector is
         // authoritative and must override them to reflect the unhealthy model.
@@ -237,7 +237,7 @@ async fn injector_healthz() {
         custom_mode: false,
     }));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/healthz", port))
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/healthz"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);

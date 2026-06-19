@@ -82,7 +82,7 @@ async fn adapter_passes_through_anthropic_messages_with_tool_use() {
     tokio::spawn(fake_anthropic_upstream(upstream_port, captured.clone()));
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
         router_url: "http://127.0.0.1:1".into(),
         auth_cache: None,
@@ -103,7 +103,7 @@ async fn adapter_passes_through_anthropic_messages_with_tool_use() {
         }]
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{}/api/v1/messages", adapter_port))
+        .post(format!("http://127.0.0.1:{adapter_port}/api/v1/messages"))
         .json(&req_body)
         .send()
         .await
@@ -144,7 +144,7 @@ async fn adapter_sanitizes_typeless_tool_schema_before_forwarding() {
     tokio::spawn(fake_anthropic_upstream(upstream_port, captured.clone()));
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
         router_url: "http://127.0.0.1:1".into(),
         auth_cache: None,
@@ -171,7 +171,7 @@ async fn adapter_sanitizes_typeless_tool_schema_before_forwarding() {
         }]
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/messages", adapter_port))
+        .post(format!("http://127.0.0.1:{adapter_port}/v1/messages"))
         .json(&req_body)
         .send()
         .await
@@ -200,7 +200,7 @@ async fn adapter_adds_llama_progress_only_when_enabled() {
     tokio::spawn(fake_anthropic_upstream(upstream_port, captured.clone()));
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
         router_url: "http://127.0.0.1:1".into(),
         auth_cache: None,
@@ -211,7 +211,7 @@ async fn adapter_adds_llama_progress_only_when_enabled() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/messages", adapter_port))
+        .post(format!("http://127.0.0.1:{adapter_port}/v1/messages"))
         .json(&json!({
             "model": "claude-test",
             "max_tokens": 16,
@@ -312,9 +312,9 @@ async fn usage_callback_prefers_stashed_router_key_over_inbound_oauth_jwt() {
 
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         auth_cache: Some(auth_cache),
         metrics: None,
         collect_llama_progress: false,
@@ -324,8 +324,7 @@ async fn usage_callback_prefers_stashed_router_key_over_inbound_oauth_jwt() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}",
-            adapter_port, doc_id
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id={doc_id}"
         ))
         // Post-307 inbound state: only the unverifiable OAuth JWT survives; the
         // Router x-api-key is gone.
@@ -458,9 +457,9 @@ async fn upstream_error_closes_placeholder_as_error() {
 
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         auth_cache: Some(auth_cache),
         metrics: None,
         collect_llama_progress: false,
@@ -470,8 +469,7 @@ async fn upstream_error_closes_placeholder_as_error() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}",
-            adapter_port, doc_id
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id={doc_id}"
         ))
         .json(&json!({
             "model": "claude-test",
@@ -531,9 +529,9 @@ async fn upstream_unreachable_closes_placeholder_as_error() {
 
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", dead_upstream_port),
+        target: format!("http://127.0.0.1:{dead_upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         auth_cache: Some(auth_cache),
         metrics: None,
         collect_llama_progress: false,
@@ -543,8 +541,7 @@ async fn upstream_unreachable_closes_placeholder_as_error() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}",
-            adapter_port, doc_id
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id={doc_id}"
         ))
         .json(&json!({
             "model": "claude-test",
@@ -624,9 +621,9 @@ async fn drive_streaming_and_capture_close(upstream_port: u16, doc_id: &str) -> 
 
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         auth_cache: Some(auth_cache),
         metrics: None,
         collect_llama_progress: false,
@@ -636,8 +633,7 @@ async fn drive_streaming_and_capture_close(upstream_port: u16, doc_id: &str) -> 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}",
-            adapter_port, doc_id
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id={doc_id}"
         ))
         .json(&json!({
             "model": "claude-test",
@@ -744,9 +740,9 @@ async fn streaming_prompt_progress_records_prompt_cache_ratio() {
     let metrics_sink: SharedMetricsSink = metrics.clone();
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
-        router_url: format!("http://127.0.0.1:{}", router_port),
+        router_url: format!("http://127.0.0.1:{router_port}"),
         auth_cache: Some(auth_cache),
         metrics: Some(metrics_sink),
         collect_llama_progress: true,
@@ -756,8 +752,7 @@ async fn streaming_prompt_progress_records_prompt_cache_ratio() {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}",
-            adapter_port, doc_id
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id={doc_id}"
         ))
         .json(&json!({
             "model": "claude-test",
@@ -797,7 +792,7 @@ async fn direct_messages_without_usage_doc_does_not_start_metrics_row() {
     let metrics_sink: SharedMetricsSink = metrics.clone();
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
         router_url: "http://127.0.0.1:1".into(),
         auth_cache: None,
@@ -807,7 +802,7 @@ async fn direct_messages_without_usage_doc_does_not_start_metrics_row() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let resp = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{}/v1/messages", adapter_port))
+        .post(format!("http://127.0.0.1:{adapter_port}/v1/messages"))
         .json(&json!({
             "model": "claude-test",
             "max_tokens": 32,
@@ -838,7 +833,7 @@ async fn redirected_messages_use_query_request_id_for_metrics() {
     let metrics_sink: SharedMetricsSink = metrics.clone();
     tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
         port: adapter_port,
-        target: format!("http://127.0.0.1:{}", upstream_port),
+        target: format!("http://127.0.0.1:{upstream_port}"),
         upstream_model: "qwen3.6-35b-a3b".into(),
         router_url: "http://127.0.0.1:1".into(),
         auth_cache: None,
@@ -849,8 +844,7 @@ async fn redirected_messages_use_query_request_id_for_metrics() {
 
     let resp = reqwest::Client::new()
         .post(format!(
-            "http://127.0.0.1:{}/api/v1/messages?usage_doc_id=local-1&rayline_request_id=req_shared",
-            adapter_port
+            "http://127.0.0.1:{adapter_port}/api/v1/messages?usage_doc_id=local-1&rayline_request_id=req_shared"
         ))
         .json(&json!({
             "model": "claude-test",
@@ -912,7 +906,7 @@ async fn adapter_healthz() {
         collect_llama_progress: false,
     }));
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/healthz", port))
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/healthz"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);

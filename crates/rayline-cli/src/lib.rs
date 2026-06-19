@@ -241,7 +241,7 @@ pub async fn run() -> ExitCode {
 
 pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     if root_version_requested(original_argv) {
-        println!("rayline {}", RAYLINE_VERSION);
+        println!("rayline {RAYLINE_VERSION}");
         return ExitCode::SUCCESS;
     }
 
@@ -252,7 +252,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
 
     match rayline_dispatch_for_argv(original_argv) {
         RaylineDispatch::Version => {
-            println!("rayline {}", RAYLINE_VERSION);
+            println!("rayline {RAYLINE_VERSION}");
             ExitCode::SUCCESS
         }
         RaylineDispatch::Status(request) => match status::render_status(&request) {
@@ -904,8 +904,7 @@ where
             }
             "--local" => {
                 eprintln!(
-                    "Warning: `--local` has been removed and is ignored. Use `{} claude --local-router` for public Rayline local routing.",
-                    CLI_BIN
+                    "Warning: `--local` has been removed and is ignored. Use `{CLI_BIN} claude --local-router` for public Rayline local routing."
                 );
                 continue;
             }
