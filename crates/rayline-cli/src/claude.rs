@@ -968,12 +968,14 @@ async fn resolve_engageable_local_config(
         }
         crate::local_model::LocalModelMode::Recommended => {
             if cfg.has_recommended_pick() {
-                let repo = cfg.model_repo.as_deref().unwrap_or_default();
-                let file = cfg.model_file.as_deref().unwrap_or_default();
-                if crate::router::hf_cache_has_gguf(home, repo, file) {
+                if crate::router::hf_cache_has_verified_config_gguf(home, &cfg) {
                     return Some(cfg);
                 }
-                let model_id = cfg.model_id.as_deref().unwrap_or(file);
+                let model_id = cfg
+                    .model_id
+                    .as_deref()
+                    .or(cfg.model_file.as_deref())
+                    .unwrap_or("selected model");
                 eprintln!(
                     "Warning: local routing is enabled, but the local model `{model_id}` is not downloaded. Continuing with cloud routing. Download it with `{cli} local download {model_id}`."
                 );

@@ -1381,10 +1381,12 @@ async fn resolve_start_model(
                     },
                 }
             };
-            let repo = cfg.model_repo.as_deref().unwrap_or_default();
-            let file = cfg.model_file.as_deref().unwrap_or_default();
-            if !hf_cache_has_gguf(home, repo, file) {
-                let model_id = cfg.model_id.as_deref().unwrap_or(file);
+            if !hf_cache_has_verified_config_gguf(home, &cfg) {
+                let model_id = cfg
+                    .model_id
+                    .as_deref()
+                    .or(cfg.model_file.as_deref())
+                    .unwrap_or("selected model");
                 return Err(io::Error::other(format!(
                     "Local model `{model_id}` is not downloaded. Run `{cli} local download {model_id}`."
                 )));
@@ -1951,7 +1953,13 @@ fn spawn_router(
     // Custom mode downloads no GGUF, so there is never a first-run download wait
     // to warn about — treat it like a warm cache.
     let cache_hit = request.upstream_url.is_some()
-        || hf_cache_has_gguf(home, &request.model_repo, &request.model_file);
+        || hf_cache_has_verified_gguf(
+            home,
+            &request.model_repo,
+            &request.model_file,
+            request.model_revision.as_deref(),
+            request.model_sha256.as_deref(),
+        );
     if cache_hit {
         output.push_str(" Waiting for healthz\u{2026}\n");
     } else {
@@ -2570,15 +2578,132 @@ fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn hf_cache_has_gguf(home: &Path, model_repo: &str, model_file: &str) -> bool {
-    let repo_dir = hf_hub_dir(home).join(format!("models--{}", model_repo.replace('/', "--")));
-    let snapshots = repo_dir.join("snapshots");
-    let Ok(entries) = std::fs::read_dir(snapshots) else {
+pub(crate) fn hf_cache_has_verified_config_gguf(
+    home: &Path,
+    cfg: &crate::local_model::LocalModelConfig,
+) -> bool {
+    hf_cache_has_verified_gguf(
+        home,
+        cfg.model_repo.as_deref().unwrap_or_default(),
+        cfg.model_file.as_deref().unwrap_or_default(),
+        cfg.model_revision.as_deref(),
+        cfg.model_sha256.as_deref(),
+    )
+}
+
+fn hf_cache_has_verified_gguf(
+    home: &Path,
+    model_repo: &str,
+    model_file: &str,
+    model_revision: Option<&str>,
+    model_sha256: Option<&str>,
+) -> bool {
+    hf_cache_has_verified_gguf_at(
+        &hf_hub_dir(home),
+        model_repo,
+        model_file,
+        model_revision,
+        model_sha256,
+    )
+}
+
+fn hf_cache_has_verified_gguf_at(
+    hub_dir: &Path,
+    model_repo: &str,
+    model_file: &str,
+    model_revision: Option<&str>,
+    model_sha256: Option<&str>,
+) -> bool {
+    let (Some(revision), Some(sha256)) = (model_revision, model_sha256) else {
         return false;
     };
-    entries
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().join(model_file).is_file())
+    let snapshot = hf_cache_verified_snapshot_path(hub_dir, model_repo, model_file, revision);
+    hf_cache_snapshot_is_verified(&snapshot, sha256)
+}
+
+fn hf_cache_snapshot_is_verified(snapshot: &Path, sha256: &str) -> bool {
+    snapshot.is_file() && rayline_hf::verify_file_sha256(snapshot, sha256).is_ok()
+}
+
+fn hf_cache_verified_snapshot_path(
+    hub_dir: &Path,
+    model_repo: &str,
+    model_file: &str,
+    revision: &str,
+) -> PathBuf {
+    hub_dir
+        .join(rayline_hf::repo_to_folder_name(model_repo))
+        .join("snapshots")
+        .join(revision)
+        .join(model_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn verified_cache_requires_exact_revision_and_sha256() {
+        let test_dir = unique_test_dir("verified-router-cache");
+        let hub = test_dir.join("hub");
+        let repo = "org/repo";
+        let filename = "model.gguf";
+        let revision = "ffffffffffffffffffffffffffffffffffffffff";
+        let old_revision = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let body = b"verified model bytes";
+        let sha256 = format!("{:x}", Sha256::digest(body));
+        let wrong_sha = format!("{:x}", Sha256::digest(b"wrong bytes"));
+
+        let old_snapshot = hf_cache_verified_snapshot_path(&hub, repo, filename, old_revision);
+        fs::create_dir_all(old_snapshot.parent().unwrap()).unwrap();
+        fs::write(&old_snapshot, body).unwrap();
+
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&sha256),
+        ));
+
+        let snapshot = hf_cache_verified_snapshot_path(&hub, repo, filename, revision);
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        fs::write(&snapshot, body).unwrap();
+
+        assert!(hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&sha256),
+        ));
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            Some(&wrong_sha),
+        ));
+        assert!(!hf_cache_has_verified_gguf_at(
+            &hub,
+            repo,
+            filename,
+            Some(revision),
+            None,
+        ));
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
 }
 
 fn hf_hub_dir(home: &Path) -> PathBuf {
