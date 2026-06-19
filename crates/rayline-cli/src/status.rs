@@ -731,20 +731,30 @@ async fn run_device_login(hosted: &HostedEnvironment) -> Result<LoginToken, Auth
 }
 
 fn write_device_login_prompt(code: &DeviceCode) -> Result<(), AuthLoginError> {
-    let mut stderr = io::stderr().lock();
-    let result = (|| -> io::Result<()> {
-        stderr.write_all(b"\n  Visit:  ")?;
-        stderr.write_all(code.verification_url.as_bytes())?;
-        stderr.write_all(b"\n  Code:   ")?;
-        stderr.write_all(code.user_code.as_bytes())?;
-        write!(
-            stderr,
-            "\n\n  Waiting for approval (timeout: {}s)...\n",
-            code.expires_in
-        )?;
-        Ok(())
-    })();
-    result.map_err(AuthLoginError::WriteFailed)
+    write_auth_message(&device_login_prompt(code)).map_err(AuthLoginError::WriteFailed)
+}
+
+fn device_login_prompt(code: &DeviceCode) -> String {
+    format!(
+        "\n  Visit:  {}\n  Code:   {}\n\n  Waiting for approval (timeout: {}s)...\n",
+        code.verification_url, code.user_code, code.expires_in
+    )
+}
+
+pub fn write_auth_message(message: &str) -> io::Result<()> {
+    write_interactive_message(message)
+}
+
+#[cfg(unix)]
+fn write_interactive_message(message: &str) -> io::Result<()> {
+    let mut tty = fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    tty.write_all(message.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_interactive_message(message: &str) -> io::Result<()> {
+    print!("{message}");
+    Ok(())
 }
 
 fn auth_http_client() -> Result<reqwest::Client, reqwest::Error> {
