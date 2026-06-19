@@ -2,7 +2,21 @@ name: Rust Supply Chain Security
 
 on:
   push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/security.yml"
   pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "deny.toml"
+      - "rust-toolchain.toml"
+      - ".github/workflows/security.yml"
   schedule:
     - cron: "23 7 * * 1" # Weekly Monday at 07:23 UTC
   workflow_dispatch:
