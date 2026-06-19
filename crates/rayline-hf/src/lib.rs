@@ -1058,6 +1058,7 @@ mod tests {
             while handled < 2 && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let request = read_http_request(&mut stream);
                         server_requests.lock().unwrap().push(request);
                         let body: &[u8] = if handled == 0 {
