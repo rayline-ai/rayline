@@ -571,6 +571,11 @@ async fn forward_anthropic_request(
     let request_id = rayline_request_id(&parts.headers)
         .map(ToOwned::to_owned)
         .unwrap_or_else(new_request_id);
+    let agent_id = routed
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| "<none>".to_owned());
+    let agent_type = routed.agent_type.clone();
     let proxy_owns_metrics = proxy_owns_metrics_for_route(&state.opts, decision.target);
     info!(
         "proxy route decision method={} path={} model={} agent_id={} agent_type={} target={:?} reason={} selective_subagents=[{}] local_available={} local_custom={}",
@@ -1844,6 +1849,8 @@ struct PreparedAnthropicRoute {
     decision: RouteDecision,
     body: Bytes,
     body_was_rewritten: bool,
+    agent_id: Option<String>,
+    agent_type: Option<String>,
 }
 
 #[cfg(test)]
@@ -1874,92 +1881,139 @@ fn prepare_anthropic_route_with_subagent_filter(
     selective_subagent_ids: &[String],
     resolved_agent_type: Option<&str>,
 ) -> PreparedAnthropicRoute {
+    let agent_id = claude_code_agent_id(headers).map(ToOwned::to_owned);
+    let agent_type = resolved_agent_type.map(ToOwned::to_owned);
+
     if routing_mode == ProxyRoutingMode::All {
-        return PreparedAnthropicRoute {
-            decision: classify_anthropic_request_for_mode(method, path, routing_mode),
+        return prepared_anthropic_route(
+            classify_anthropic_request_for_mode(method, path, routing_mode),
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
     if !is_selective_routable_method_path(method, path) {
-        return anthropic_passthrough(body, "selective_passthrough_path");
+        return anthropic_passthrough(body, "selective_passthrough_path", agent_id, agent_type);
     }
 
     if *method == Method::GET && is_virtual_model_lookup(path) {
-        return PreparedAnthropicRoute {
-            decision: RouteDecision {
+        return prepared_anthropic_route(
+            RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_virtual_model_lookup",
             },
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
     if *method == Method::GET && is_provider_model_lookup(path) {
-        return PreparedAnthropicRoute {
-            decision: RouteDecision {
+        return prepared_anthropic_route(
+            RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_provider_model_lookup",
             },
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
     if *method == Method::GET && is_model_list_path(path) {
-        return PreparedAnthropicRoute {
-            decision: RouteDecision {
+        return prepared_anthropic_route(
+            RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_model_list",
             },
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
     let body_model = request_body_model(&body);
     if is_virtual_model(body_model.as_deref()) {
-        return PreparedAnthropicRoute {
-            decision: RouteDecision {
+        return prepared_anthropic_route(
+            RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_virtual_model",
             },
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
     if path == "/v1/messages" {
-        let Some(agent_id) = claude_code_agent_id(headers) else {
-            return anthropic_passthrough(body, "selective_main_passthrough");
+        let Some(agent_id_value) = agent_id.as_deref() else {
+            return anthropic_passthrough(body, "selective_main_passthrough", agent_id, agent_type);
         };
-        if !subagent_filter_allows(agent_id, resolved_agent_type, selective_subagent_ids) {
-            return anthropic_passthrough(body, "selective_subagent_passthrough");
+        if !subagent_filter_allows(
+            agent_id_value,
+            agent_type.as_deref(),
+            selective_subagent_ids,
+        ) {
+            return anthropic_passthrough(
+                body,
+                "selective_subagent_passthrough",
+                agent_id,
+                agent_type,
+            );
         }
-        return PreparedAnthropicRoute {
-            decision: RouteDecision {
+        return prepared_anthropic_route(
+            RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_subagent_header",
             },
             body,
-            body_was_rewritten: false,
-        };
+            false,
+            agent_id,
+            agent_type,
+        );
     }
 
-    anthropic_passthrough(body, "selective_main_passthrough")
+    anthropic_passthrough(body, "selective_main_passthrough", agent_id, agent_type)
 }
 
-fn anthropic_passthrough(body: Bytes, reason: &'static str) -> PreparedAnthropicRoute {
+fn prepared_anthropic_route(
+    decision: RouteDecision,
+    body: Bytes,
+    body_was_rewritten: bool,
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+) -> PreparedAnthropicRoute {
     PreparedAnthropicRoute {
-        decision: RouteDecision {
+        decision,
+        body,
+        body_was_rewritten,
+        agent_id,
+        agent_type,
+    }
+}
+
+fn anthropic_passthrough(
+    body: Bytes,
+    reason: &'static str,
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+) -> PreparedAnthropicRoute {
+    prepared_anthropic_route(
+        RouteDecision {
             target: RouteTarget::Anthropic,
             reason,
         },
         body,
-        body_was_rewritten: false,
-    }
+        false,
+        agent_id,
+        agent_type,
+    )
 }
 
 fn is_selective_routable_method_path(method: &Method, path: &str) -> bool {
@@ -2846,6 +2900,8 @@ mod tests {
         );
         assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
         assert_eq!(prepared.decision.reason, "selective_subagent_passthrough");
+        assert_eq!(prepared.agent_id.as_deref(), Some("a4a4dba6877819a3a"));
+        assert_eq!(prepared.agent_type.as_deref(), None);
 
         // Resolved to an allowlisted type -> route locally through the router.
         let prepared = prepare_anthropic_route_with_subagent_filter(
@@ -2859,6 +2915,8 @@ mod tests {
         );
         assert_eq!(prepared.decision.target, RouteTarget::Router);
         assert_eq!(prepared.decision.reason, "selective_subagent_header");
+        assert_eq!(prepared.agent_id.as_deref(), Some("a4a4dba6877819a3a"));
+        assert_eq!(prepared.agent_type.as_deref(), Some("Explore"));
     }
 
     #[tokio::test]
