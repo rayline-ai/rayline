@@ -2,9 +2,13 @@
 name = "rayline-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Rayline public Rust CLI launcher"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "rayline"

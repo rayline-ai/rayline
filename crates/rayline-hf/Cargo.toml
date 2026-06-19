@@ -2,9 +2,13 @@
 name = "rayline-hf"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Hugging Face cache scan + download"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true

@@ -2,9 +2,13 @@
 name = "rayline-proxy"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Transparent proxy for Claude Code Rayline routing"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
