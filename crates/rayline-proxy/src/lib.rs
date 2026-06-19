@@ -2134,8 +2134,20 @@ where
 fn claude_projects_roots() -> Vec<PathBuf> {
     claude_projects_roots_from(
         env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
+        claude_home_dir(),
     )
+}
+
+/// Resolve the user's home directory cross-platform. `HOME` alone is wrong on
+/// Windows: native PowerShell / cmd do not set it (they use `USERPROFILE`), so
+/// relying on `HOME` left the Claude projects root empty and every subagent
+/// resolved to `<none>` and passed through to the cloud. `dirs::home_dir`
+/// resolves the Windows profile dir; the env fallbacks cover unusual setups.
+fn claude_home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 fn claude_projects_roots_from(config_dir: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {

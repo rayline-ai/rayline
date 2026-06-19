@@ -1537,6 +1537,7 @@ dependencies = [
  "async-compression",
  "brotli",
  "bytes",
+ "dirs",
  "flate2",
  "futures",
  "http-body-util",
