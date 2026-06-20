@@ -27,6 +27,7 @@ const TOP_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const TOP_TRACE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TOP_TRACE_LOOKBACK: Duration = Duration::from_secs(12 * 60 * 60);
 const TOP_TRACE_MATCH_WINDOW_MS: u64 = 120_000;
+const PROXIED_TRAFFIC_POLICY: &str = "selective_passthrough_path";
 pub const PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS: &str = "selective-subagents";
 pub const DECISION_PLANE_HOSTED: &str = "hosted";
 pub const DECISION_PLANE_LOCAL: &str = "local";
@@ -106,6 +107,7 @@ pub struct RouterLogsRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterTopRequest {
     pub json: bool,
+    pub show_all: bool,
     pub root_env_explicit: bool,
 }
 
@@ -266,6 +268,7 @@ async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Re
     if request.json {
         let mut snapshot = fetch_top_snapshot(&client, &url).await?;
         trace_cache.enrich_snapshot(&mut snapshot);
+        filter_top_snapshot(&mut snapshot, request.show_all);
         return serde_json::to_string_pretty(&snapshot)
             .map(|mut json| {
                 json.push('\n');
@@ -277,10 +280,10 @@ async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Re
     if !io::stdout().is_terminal() {
         let mut snapshot = fetch_top_snapshot(&client, &url).await?;
         trace_cache.enrich_snapshot(&mut snapshot);
-        return Ok(format_top_snapshot(&snapshot));
+        return Ok(format_top_snapshot(&snapshot, request.show_all));
     }
 
-    run_top_tui(&client, &url, trace_cache).await?;
+    run_top_tui(&client, &url, trace_cache, request.show_all).await?;
     Ok(String::new())
 }
 
@@ -788,6 +791,7 @@ async fn run_top_tui(
     client: &reqwest::Client,
     url: &str,
     mut trace_cache: ClaudeTraceCache,
+    show_all: bool,
 ) -> io::Result<()> {
     let mut stdout = io::stdout();
     let _guard = TopTerminalGuard::enter(&mut stdout)?;
@@ -798,6 +802,7 @@ async fn run_top_tui(
     let mut force_refresh = true;
     let mut needs_draw = true;
     let mut sort = TopSort::Started;
+    let mut show_all = show_all;
 
     loop {
         let should_refresh = force_refresh
@@ -822,7 +827,14 @@ async fn run_top_tui(
         }
 
         if needs_draw {
-            draw_top(&mut stdout, &snapshot, last_error.as_deref(), paused, sort)?;
+            draw_top(
+                &mut stdout,
+                &snapshot,
+                last_error.as_deref(),
+                paused,
+                sort,
+                show_all,
+            )?;
             needs_draw = false;
         }
 
@@ -838,6 +850,10 @@ async fn run_top_tui(
                     KeyCode::Char('r') => force_refresh = true,
                     KeyCode::Char('s') => {
                         sort = sort.next();
+                        needs_draw = true;
+                    }
+                    KeyCode::Char('a') => {
+                        show_all = !show_all;
                         needs_draw = true;
                     }
                     _ => {}
@@ -857,18 +873,14 @@ fn draw_top(
     last_error: Option<&str>,
     paused: bool,
     sort: TopSort,
+    show_all: bool,
 ) -> io::Result<()> {
     let (width, height) = terminal::size().map_err(io::Error::other)?;
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let mut y = 0;
-    y = draw_title(
-        stdout,
-        y,
-        width,
-        &format!("{} Router Top", crate::DISPLAY_NAME),
-    )?;
-    y = draw_top_summary(stdout, y, width, snapshot, paused, sort)?;
+    y = draw_title(stdout, y, width, "Rayline Local Router")?;
+    y = draw_top_summary(stdout, y, width, snapshot, paused, sort, show_all)?;
     if let Some(error) = last_error {
         y = draw_colored_line(
             stdout,
@@ -880,8 +892,8 @@ fn draw_top(
     }
     y = draw_line(stdout, y, width, "")?;
 
-    let active = sorted_top_rows(snapshot, "active", sort);
-    let recent = sorted_top_rows(snapshot, "recent", sort);
+    let active = sorted_top_rows(snapshot, "active", sort, show_all);
+    let recent = sorted_top_rows(snapshot, "recent", sort, show_all);
     let remaining = height.saturating_sub(y).saturating_sub(1);
     let active_budget = if remaining > 12 {
         remaining / 2
@@ -903,8 +915,7 @@ fn draw_top(
     y = draw_table_section(stdout, y, width, footer_y, "Recent", &recent)?;
 
     let _ = y;
-    let footer =
-        "q/Esc quit  p pause  r refresh  s sort  | daemon-memory metrics  | --json for scripts";
+    let footer = "q/Esc quit  p pause  r refresh  s sort  a all/llm  | daemon-memory metrics  | --json for scripts";
     queue!(
         stdout,
         MoveTo(0, footer_y),
@@ -923,24 +934,24 @@ fn draw_top_summary(
     snapshot: &Value,
     paused: bool,
     sort: TopSort,
+    show_all: bool,
 ) -> io::Result<u16> {
     let totals = snapshot.get("totals").unwrap_or(&Value::Null);
-    let active = snapshot
-        .get("active")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let recent = snapshot
-        .get("recent")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+    let active = visible_row_count(snapshot, "active", show_all);
+    let recent = visible_row_count(snapshot, "recent", show_all);
+    let hidden = hidden_proxied_row_count(snapshot);
     y = draw_line(
         stdout,
         y,
         width,
         &format!(
-            "current active={active}  recent={recent}  mode={}  sort={}  refresh={}ms",
+            "current active={active}  recent={recent}  traffic={}{}  mode={}  sort={}  refresh={}ms",
+            if show_all { "all" } else { "llm" },
+            if !show_all && hidden > 0 {
+                format!(" hidden-proxied={hidden}")
+            } else {
+                String::new()
+            },
             if paused { "paused" } else { "live" },
             sort.label(),
             TOP_REFRESH_INTERVAL.as_millis(),
@@ -1011,7 +1022,11 @@ fn draw_table_section(
     let available = bottom_exclusive.saturating_sub(y) as usize;
     let rendered_rows = rows.len().min(available);
     for row in rows.iter().take(rendered_rows) {
-        y = draw_line(stdout, y, width, &top_table_row(row, width))?;
+        let rendered = top_table_row(row, width);
+        y = match top_row_color(row) {
+            Some(color) => draw_colored_line(stdout, y, width, color, &rendered)?,
+            None => draw_line(stdout, y, width, &rendered)?,
+        };
     }
     if rows.len() > rendered_rows && y < bottom_exclusive {
         y = draw_colored_line(
@@ -1071,12 +1086,19 @@ fn draw_line(stdout: &mut io::Stdout, y: u16, width: u16, text: &str) -> io::Res
     Ok(y.saturating_add(1))
 }
 
-fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort) -> Vec<Value> {
+fn top_row_color(row: &Value) -> Option<Color> {
+    (value_str(row, "target") == "local").then_some(Color::DarkCyan)
+}
+
+fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort, show_all: bool) -> Vec<Value> {
     let mut rows = snapshot
         .get(key)
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if !show_all {
+        rows.retain(|row| !is_proxied_traffic(row));
+    }
     rows.sort_by(|left, right| {
         top_sort_value(right, sort)
             .partial_cmp(&top_sort_value(left, sort))
@@ -1099,13 +1121,13 @@ fn top_sort_value(row: &Value, sort: TopSort) -> f64 {
 fn top_table_header(width: u16) -> String {
     if width < 120 {
         format!(
-            "{:<14} {:<10} {:<7} {:<10} {:>6} {:>7} {:>6} {:>6} {:>5} MODEL",
-            "REQ", "AGENT", "TARGET", "STATE", "OUT", "TTFT", "PF", "TG", "CACHE"
+            "{:<14} {:<10} {:<7} {:<10} {:>7} {:>7} {:>7} {:>6} {:>6} MODEL",
+            "REQ", "AGENT", "TARGET", "STATE", "OUT", "CACHE %", "TTFT", "PF", "TG"
         )
     } else {
         format!(
-            "{:<18} {:<12} {:<8} {:<10} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} {:>5} MODEL / POLICY",
-            "REQ", "AGENT", "TARGET", "STATE", "IN", "OUT", "AGE", "TTFT", "PF", "TG", "CACHE"
+            "{:<18} {:<12} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
+            "REQ", "AGENT", "TARGET", "STATE", "IN", "OUT", "CACHE %", "AGE", "TTFT", "PF", "TG"
         )
     }
 }
@@ -1119,7 +1141,8 @@ fn top_table_row(row: &Value, width: u16) -> String {
         value_str(row, "agent_type"),
         if width < 120 { 10 } else { 12 },
     );
-    let target = truncate_cell(value_str(row, "target"), 8);
+    let target_value = top_target_cell(row);
+    let target = truncate_cell(&target_value, 8);
     let state = truncate_cell(value_str(row, "state"), 10);
     let output_tokens = count_cell(row, "output_tokens");
     let ttft = ms_cell(row, "ttft_ms");
@@ -1130,28 +1153,21 @@ fn top_table_row(row: &Value, width: u16) -> String {
 
     if width < 120 {
         return format!(
-            "{request_id:<14} {agent:<10} {target:<7} {state:<10} {output_tokens:>6} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {cache_hit:>5} {model}"
+            "{request_id:<14} {agent:<10} {target:<7} {state:<10} {output_tokens:>7} {cache_hit:>7} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {model}"
         );
     }
 
     let input_tokens = count_cell(row, "input_tokens");
     let age = ms_cell(row, "duration_ms");
     format!(
-        "{request_id:<18} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {cache_hit:>5} {model}"
+        "{request_id:<18} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
     )
 }
 
-fn format_top_snapshot(snapshot: &Value) -> String {
-    let active = snapshot
-        .get("active")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let recent = snapshot
-        .get("recent")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
+    let active = visible_row_count(snapshot, "active", show_all);
+    let recent = visible_row_count(snapshot, "recent", show_all);
+    let hidden = hidden_proxied_row_count(snapshot);
     let totals = snapshot.get("totals").unwrap_or(&Value::Null);
     let completed = totals
         .get("completed_requests")
@@ -1162,10 +1178,19 @@ fn format_top_snapshot(snapshot: &Value) -> String {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let mut output = format!(
-        "Rayline router top snapshot\nactive: {active}  recent: {recent}  completed: {completed}  errors: {errored}\n"
+        "Rayline router top snapshot\nactive: {active}  recent: {recent}  completed: {completed}  errors: {errored}  traffic: {}{}\n",
+        if show_all { "all" } else { "llm" },
+        if !show_all && hidden > 0 {
+            format!("  hidden-proxied: {hidden}")
+        } else {
+            String::new()
+        }
     );
     if let Some(rows) = snapshot.get("active").and_then(Value::as_array) {
         for row in rows {
+            if !show_all && is_proxied_traffic(row) {
+                continue;
+            }
             output.push_str(&format_top_row(row));
         }
     }
@@ -1178,24 +1203,16 @@ fn format_top_snapshot(snapshot: &Value) -> String {
 fn format_top_row(row: &Value) -> String {
     let request_id = value_str(row, "request_id");
     let agent = value_str(row, "agent_type");
-    let target = value_str(row, "target");
+    let target = top_target_cell(row);
     let model = value_str(row, "selected_model");
     let state = value_str(row, "state");
-    let ttft = row
-        .get("ttft_ms")
-        .and_then(Value::as_u64)
-        .map(|value| format!("{value}ms"))
-        .unwrap_or_else(|| "-".to_owned());
-    let output_tokens = row
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".to_owned());
+    let ttft = ms_cell(row, "ttft_ms");
+    let output_tokens = count_cell(row, "output_tokens");
     let prefill_tps = rate_cell(row, "prefill_tps");
     let generation_tps = rate_cell(row, "output_tps");
     let cache_hit = percent_cell(row, "cache_hit_ratio");
     format!(
-        "{request_id:<22} {agent:<12} {target:<10} {state:<10} out={output_tokens:<6} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} cache={cache_hit:<5} {model}\n"
+        "{request_id:<22} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
     )
 }
 
@@ -1213,7 +1230,7 @@ fn totals_u64(totals: &Value, key: &str) -> u64 {
 fn count_cell(row: &Value, key: &str) -> String {
     row.get(key)
         .and_then(Value::as_u64)
-        .map(|value| value.to_string())
+        .map(|value| format_compact_number(value as f64, 0))
         .unwrap_or_else(|| "-".to_owned())
 }
 
@@ -1228,7 +1245,7 @@ fn format_ms(value: u64) -> String {
     if value < 1000 {
         format!("{value}ms")
     } else {
-        format!("{:.1}s", value as f64 / 1000.0)
+        format!("{}s", format_compact_number(value as f64 / 1000.0, 1))
     }
 }
 
@@ -1243,23 +1260,129 @@ fn format_unix_ms_age(value: u64) -> String {
 fn rate_cell(row: &Value, key: &str) -> String {
     row.get(key)
         .and_then(Value::as_f64)
-        .map(|value| format!("{value:.1}"))
+        .map(|value| format_compact_number(value, 1))
         .unwrap_or_else(|| "-".to_owned())
 }
 
 fn percent_cell(row: &Value, key: &str) -> String {
     row.get(key)
         .and_then(Value::as_f64)
-        .map(|value| format!("{:.0}%", value * 100.0))
+        .map(|value| format!("{}%", format_compact_number(value * 100.0, 0)))
         .unwrap_or_else(|| "-".to_owned())
 }
 
+fn filter_top_snapshot(snapshot: &mut Value, show_all: bool) {
+    if show_all {
+        return;
+    }
+    for key in ["active", "recent"] {
+        if let Some(rows) = snapshot.get_mut(key).and_then(Value::as_array_mut) {
+            rows.retain(|row| !is_proxied_traffic(row));
+        }
+    }
+    let visible_active = visible_row_count(snapshot, "active", true);
+    if let Some(totals) = snapshot.get_mut("totals").and_then(Value::as_object_mut) {
+        totals.insert("active_requests".to_owned(), Value::from(visible_active));
+    }
+}
+
+fn visible_row_count(snapshot: &Value, key: &str, show_all: bool) -> usize {
+    snapshot
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| show_all || !is_proxied_traffic(row))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn hidden_proxied_row_count(snapshot: &Value) -> usize {
+    ["active", "recent"]
+        .into_iter()
+        .map(|key| {
+            snapshot
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|rows| rows.iter().filter(|row| is_proxied_traffic(row)).count())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn is_proxied_traffic(row: &Value) -> bool {
+    row.get("policy").and_then(Value::as_str) == Some(PROXIED_TRAFFIC_POLICY)
+}
+
+fn top_target_cell(row: &Value) -> String {
+    if is_proxied_traffic(row) {
+        "proxied".to_owned()
+    } else {
+        value_str(row, "target").to_owned()
+    }
+}
+
+fn top_policy_cell(row: &Value) -> String {
+    match value_str(row, "policy") {
+        PROXIED_TRAFFIC_POLICY => "proxied traffic",
+        "selective_main_passthrough" => "main passthrough",
+        "selective_subagent_passthrough" => "subagent passthrough",
+        "selective_subagent_header" => "subagent routed",
+        "selective_virtual_model" => "virtual model",
+        "selective_virtual_model_lookup" => "virtual model lookup",
+        "selective_provider_model_lookup" => "provider model lookup",
+        "selective_model_list" => "model list",
+        "router_routed_path" => "router routed",
+        "anthropic_passthrough" => "passthrough",
+        policy => policy,
+    }
+    .to_owned()
+}
+
+fn format_compact_number(value: f64, plain_decimals: usize) -> String {
+    if !value.is_finite() {
+        return "-".to_owned();
+    }
+
+    let units = [
+        (1.0, ""),
+        (1_000.0, "k"),
+        (1_000_000.0, "M"),
+        (1_000_000_000.0, "B"),
+        (1_000_000_000_000.0, "T"),
+    ];
+    let abs = value.abs();
+    let mut unit_index = 0;
+    while unit_index + 1 < units.len() && abs >= units[unit_index + 1].0 {
+        unit_index += 1;
+    }
+    while unit_index + 1 < units.len() && abs / units[unit_index].0 >= 999.95 {
+        unit_index += 1;
+    }
+
+    let (scale, suffix) = units[unit_index];
+    if unit_index == 0 {
+        format!("{value:.plain_decimals$}")
+    } else {
+        format!("{:.1}{suffix}", value / scale)
+    }
+}
+
 fn top_model_cell(row: &Value) -> String {
-    let model = match value_str(row, "selected_model") {
+    let model = if is_proxied_traffic(row) {
+        value_str(row, "endpoint_id")
+    } else {
+        match value_str(row, "selected_model") {
+            "-" => value_str(row, "requested_model"),
+            selected => selected,
+        }
+    };
+    let model = match model {
         "-" => value_str(row, "requested_model"),
         selected => selected,
     };
-    let policy = value_str(row, "policy");
+    let policy = top_policy_cell(row);
     if policy == "-" {
         model.to_owned()
     } else {
@@ -2643,6 +2766,168 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn top_numeric_cells_use_compact_suffixes() {
+        let row = serde_json::json!({
+            "input_tokens": 10_200,
+            "output_tokens": 1_200_000,
+            "duration_ms": 10_200,
+            "ttft_ms": 999,
+            "prefill_tps": 12_000.2,
+            "output_tps": 1_200_000.0,
+            "cache_hit_ratio": 0.876,
+        });
+
+        assert_eq!(count_cell(&row, "input_tokens"), "10.2k");
+        assert_eq!(count_cell(&row, "output_tokens"), "1.2M");
+        assert_eq!(ms_cell(&row, "duration_ms"), "10.2s");
+        assert_eq!(ms_cell(&row, "ttft_ms"), "999ms");
+        assert_eq!(rate_cell(&row, "prefill_tps"), "12.0k");
+        assert_eq!(rate_cell(&row, "output_tps"), "1.2M");
+        assert_eq!(percent_cell(&row, "cache_hit_ratio"), "88%");
+    }
+
+    #[test]
+    fn top_table_places_cache_percent_after_token_columns() {
+        let header = top_table_header(140);
+        let input = header.find("IN").expect("header includes input column");
+        let output = header.find("OUT").expect("header includes output column");
+        let cache = header
+            .find("CACHE %")
+            .expect("header includes cache percent column");
+        let age = header.rfind("AGE").expect("header includes age column");
+        assert!(input < output);
+        assert!(output < cache);
+        assert!(cache < age);
+
+        let row = serde_json::json!({
+            "request_id": "req",
+            "agent_type": "main",
+            "target": "local",
+            "state": "done",
+            "selected_model": "model",
+            "input_tokens": 10_200,
+            "output_tokens": 1_200_000,
+            "duration_ms": 10_200,
+            "ttft_ms": 999,
+            "prefill_tps": 12_000.2,
+            "output_tps": 1_200_000.0,
+            "cache_hit_ratio": 0.876,
+        });
+
+        let cells = top_table_row(&row, 140)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &cells[4..11],
+            ["10.2k", "1.2M", "88%", "10.2s", "999ms", "12.0k", "1.2M"]
+        );
+    }
+
+    #[test]
+    fn top_filters_proxied_sideband_rows_by_default() {
+        let mut snapshot = serde_json::json!({
+            "active": [
+                {
+                    "request_id": "llm",
+                    "agent_type": "main",
+                    "target": "anthropic",
+                    "state": "streaming",
+                    "selected_model": "claude-sonnet-4-5",
+                    "policy": "selective_main_passthrough"
+                },
+                {
+                    "request_id": "sideband",
+                    "agent_type": "main",
+                    "target": "anthropic",
+                    "state": "done",
+                    "selected_model": "-",
+                    "policy": PROXIED_TRAFFIC_POLICY
+                }
+            ],
+            "recent": [
+                {
+                    "request_id": "recent-sideband",
+                    "target": "anthropic",
+                    "state": "done",
+                    "policy": PROXIED_TRAFFIC_POLICY
+                }
+            ],
+            "totals": {
+                "active_requests": 2,
+                "completed_requests": 3,
+                "errored_requests": 0
+            }
+        });
+
+        assert_eq!(visible_row_count(&snapshot, "active", false), 1);
+        assert_eq!(visible_row_count(&snapshot, "recent", false), 0);
+        assert_eq!(hidden_proxied_row_count(&snapshot), 2);
+
+        let text = format_top_snapshot(&snapshot, false);
+        assert!(text.contains("active: 1"));
+        assert!(text.contains("hidden-proxied: 2"));
+        assert!(text.contains("llm"));
+        assert!(!text.contains("sideband"));
+
+        filter_top_snapshot(&mut snapshot, false);
+        assert_eq!(
+            snapshot["active"].as_array().expect("active array").len(),
+            1
+        );
+        assert_eq!(
+            snapshot["recent"].as_array().expect("recent array").len(),
+            0
+        );
+        assert_eq!(snapshot["totals"]["active_requests"], 1);
+    }
+
+    #[test]
+    fn top_all_mode_labels_proxied_sideband_rows() {
+        let row = serde_json::json!({
+            "request_id": "sideband",
+            "agent_type": "main",
+            "target": "anthropic",
+            "endpoint_id": "/api/oauth/token",
+            "state": "done",
+            "selected_model": "-",
+            "policy": PROXIED_TRAFFIC_POLICY
+        });
+
+        assert_eq!(top_target_cell(&row), "proxied");
+        assert_eq!(top_policy_cell(&row), "proxied traffic");
+        assert_eq!(top_model_cell(&row), "/api/oauth/token / proxied traffic");
+
+        let rendered = top_table_row(&row, 140);
+        assert!(rendered.contains("proxied"));
+        assert!(rendered.contains("proxied traffic"));
+        assert!(rendered.contains("/api/oauth/token"));
+    }
+
+    #[test]
+    fn top_policy_display_simplifies_proxy_reasons() {
+        for (raw, display) in [
+            ("selective_main_passthrough", "main passthrough"),
+            ("selective_subagent_passthrough", "subagent passthrough"),
+            ("selective_subagent_header", "subagent routed"),
+            ("router_routed_path", "router routed"),
+            ("anthropic_passthrough", "passthrough"),
+        ] {
+            let row = serde_json::json!({ "policy": raw });
+            assert_eq!(top_policy_cell(&row), display);
+        }
+    }
+
+    #[test]
+    fn top_row_color_highlights_local_requests() {
+        let local = serde_json::json!({ "target": "local" });
+        let remote = serde_json::json!({ "target": "anthropic" });
+
+        assert_eq!(top_row_color(&local), Some(Color::DarkCyan));
+        assert_eq!(top_row_color(&remote), None);
+    }
 
     #[test]
     fn verified_cache_requires_exact_revision_and_sha256() {

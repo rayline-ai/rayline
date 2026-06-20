@@ -35,6 +35,7 @@ Options:
 Commands:
   claude     Run Claude Code through local Rayline routing
   router     Inspect or stop the local Rayline router runtime
+  top        Show live router request metrics
   local      Configure local model routing
   update     Check for or install a rayline launcher update
 ";
@@ -134,9 +135,14 @@ Print local router logs.
 ";
 
 const ROUTER_TOP_HELP: &str = "\
-Usage: rayline router top [--json]
+Usage: rayline top [--json] [--all]
+       rayline router top [--json] [--all]
 
-Show live router request metrics.
+Show live LLM request metrics.
+
+Options:
+  --json      Print one snapshot as JSON
+  --all       Include proxied Anthropic sideband traffic
 ";
 
 const ROUTER_STOP_HELP: &str = "\
@@ -628,6 +634,9 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::Status)
                 .unwrap_or(RaylineDispatch::Unavailable),
+            "top" => parse_router_top_request(args, root_env_explicit)
+                .map(RaylineDispatch::RouterTop)
+                .unwrap_or(RaylineDispatch::Unavailable),
             "update" => parse_update_request(args)
                 .map(RaylineDispatch::Update)
                 .unwrap_or(RaylineDispatch::Unavailable),
@@ -1078,10 +1087,12 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut json = false;
+    let mut show_all = false;
     for arg in args {
         let arg = arg.to_str()?;
         match arg {
             "--json" => json = true,
+            "--all" => show_all = true,
             "--help" => return None,
             _ => return None,
         }
@@ -1089,6 +1100,7 @@ where
 
     Some(crate::router::RouterTopRequest {
         json,
+        show_all,
         root_env_explicit,
     })
 }
@@ -1390,6 +1402,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["router", "top"] => Some(ROUTER_TOP_HELP),
         ["router", "stop"] => Some(ROUTER_STOP_HELP),
         ["status"] => Some(STATUS_HELP),
+        ["top"] => Some(ROUTER_TOP_HELP),
         ["update"] => Some(UPDATE_HELP),
         _ => None,
     }
@@ -1538,6 +1551,7 @@ mod tests {
                 &["rayline", "router", "top", "--help"][..],
                 "rayline router top",
             ),
+            (&["rayline", "top", "--help"][..], "rayline top"),
             (
                 &["rayline", "router", "stop", "--help"][..],
                 "rayline router stop",
@@ -1699,6 +1713,25 @@ mod tests {
             ])),
             RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
                 json: true,
+                show_all: false,
+                root_env_explicit: true,
+            })
+        );
+    }
+
+    #[test]
+    fn public_parser_accepts_top_alias_json() {
+        assert!(
+            rayline_help_for_argv(&argv(&["rayline", "top"])).is_none(),
+            "top alias should execute without requiring a subcommand"
+        );
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline", "--env", "foo", "top", "--json", "--all"
+            ])),
+            RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
+                json: true,
+                show_all: true,
                 root_env_explicit: true,
             })
         );
