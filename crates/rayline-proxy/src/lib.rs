@@ -607,7 +607,7 @@ async fn forward_anthropic_request(
                 RouteTarget::BlindTunnel => "blind_tunnel",
             }
             .to_owned(),
-            endpoint_id: None,
+            endpoint_id: proxied_sideband_endpoint_id(&decision, path_and_query),
             selected_model: (decision.target == RouteTarget::Anthropic)
                 .then(|| body_model.clone())
                 .flatten(),
@@ -2016,6 +2016,11 @@ fn anthropic_passthrough(
     )
 }
 
+fn proxied_sideband_endpoint_id(decision: &RouteDecision, path_and_query: &str) -> Option<String> {
+    (decision.target == RouteTarget::Anthropic && decision.reason == "selective_passthrough_path")
+        .then(|| path_and_query.to_owned())
+}
+
 fn is_selective_routable_method_path(method: &Method, path: &str) -> bool {
     match (method, path) {
         (&Method::POST, "/v1/messages" | "/v1/messages/count_tokens") => true,
@@ -2800,6 +2805,41 @@ mod tests {
         assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
         assert_eq!(prepared.decision.reason, "selective_main_passthrough");
         assert!(!prepared.body_was_rewritten);
+    }
+
+    #[test]
+    fn proxied_sideband_metrics_endpoint_uses_path() {
+        assert_eq!(
+            proxied_sideband_endpoint_id(
+                &RouteDecision {
+                    target: RouteTarget::Anthropic,
+                    reason: "selective_passthrough_path",
+                },
+                "/api/oauth/token"
+            )
+            .as_deref(),
+            Some("/api/oauth/token")
+        );
+        assert_eq!(
+            proxied_sideband_endpoint_id(
+                &RouteDecision {
+                    target: RouteTarget::Anthropic,
+                    reason: "selective_main_passthrough",
+                },
+                "/v1/messages"
+            ),
+            None
+        );
+        assert_eq!(
+            proxied_sideband_endpoint_id(
+                &RouteDecision {
+                    target: RouteTarget::Router,
+                    reason: "selective_subagent_header",
+                },
+                "/v1/messages"
+            ),
+            None
+        );
     }
 
     #[test]
