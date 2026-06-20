@@ -124,7 +124,6 @@ pub struct ProxyOptions {
     pub ca_cert_path: PathBuf,
     pub ca_key_path: PathBuf,
     pub anthropic_url: String,
-    pub danger_accept_invalid_upstream_certs: bool,
     pub connect_overrides: HashMap<String, String>,
     /// Additional PEM file of root certificates the proxy should trust when
     /// connecting to upstream servers (real `api.anthropic.com`, the Rayline
@@ -168,7 +167,6 @@ impl ProxyOptions {
             ca_cert_path: ca_cert_path.into(),
             ca_key_path: ca_key_path.into(),
             anthropic_url: DEFAULT_ANTHROPIC_URL.to_string(),
-            danger_accept_invalid_upstream_certs: false,
             connect_overrides: HashMap::new(),
             upstream_ca_path: None,
             route_status_path: None,
@@ -251,9 +249,7 @@ pub fn load_upstream_ca_bundle(path: &Path) -> Result<Vec<reqwest::Certificate>>
 
 pub async fn serve(opts: ProxyOptions) -> Result<()> {
     let ca = LocalCa::load_or_generate(&opts.ca_cert_path, &opts.ca_key_path)?;
-    let mut http_builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(opts.danger_accept_invalid_upstream_certs);
+    let mut http_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(ca_path) = opts.upstream_ca_path.as_deref() {
         let certs = load_upstream_ca_bundle(ca_path)?;
         info!(
@@ -3240,7 +3236,6 @@ mod tests {
             ca_cert_path: PathBuf::from("/tmp/unused-cert.pem"),
             ca_key_path: PathBuf::from("/tmp/unused-key.pem"),
             anthropic_url: DEFAULT_ANTHROPIC_URL.to_string(),
-            danger_accept_invalid_upstream_certs: false,
             connect_overrides: HashMap::new(),
             upstream_ca_path: None,
             route_status_path: None,

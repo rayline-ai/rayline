@@ -47,6 +47,7 @@ struct FakeResponse {
 struct FakeHttpsServer {
     port: u16,
     cert_der: Vec<u8>,
+    cert_pem: String,
     captured: CapturedRequests,
 }
 
@@ -70,7 +71,7 @@ fn init_tracing() {
 async fn spawn_fake_https_server(hostname: &str, response: FakeResponse) -> FakeHttpsServer {
     let port = free_port();
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let (config, cert_der) = self_signed_server_config(hostname);
+    let (config, cert_der, cert_pem) = self_signed_server_config(hostname);
     let acceptor = TlsAcceptor::from(config);
     let captured_for_task = captured.clone();
 
@@ -127,6 +128,7 @@ async fn spawn_fake_https_server(hostname: &str, response: FakeResponse) -> Fake
     FakeHttpsServer {
         port,
         cert_der,
+        cert_pem,
         captured,
     }
 }
@@ -247,11 +249,16 @@ async fn capture_request(req: Request<Incoming>) -> CapturedRequest {
     }
 }
 
-fn self_signed_server_config(hostname: &str) -> (Arc<ServerConfig>, Vec<u8>) {
-    let params = CertificateParams::new(vec![hostname.to_string()]).unwrap();
+fn self_signed_server_config(hostname: &str) -> (Arc<ServerConfig>, Vec<u8>, String) {
+    let mut subject_alt_names = vec![hostname.to_string()];
+    if hostname == "localhost" {
+        subject_alt_names.push("127.0.0.1".to_string());
+    }
+    let params = CertificateParams::new(subject_alt_names).unwrap();
     let key_pair = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_der = cert.der().clone();
+    let cert_pem = cert.pem();
     let key_der = key_pair.serialize_der();
     let config =
         ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
@@ -260,7 +267,7 @@ fn self_signed_server_config(hostname: &str) -> (Arc<ServerConfig>, Vec<u8>) {
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key_der.into()))
             .unwrap();
-    (Arc::new(config), cert_der.to_vec())
+    (Arc::new(config), cert_der.to_vec(), cert_pem)
 }
 
 fn proxy_options(
@@ -268,6 +275,7 @@ fn proxy_options(
     ca_dir: &Path,
     router_url: String,
     anthropic_url: String,
+    upstreams: &[&FakeHttpsServer],
 ) -> rayline_proxy::ProxyOptions {
     let mut opts = rayline_proxy::ProxyOptions::with_ca_paths(
         "rsk-rayline-test",
@@ -277,7 +285,16 @@ fn proxy_options(
     opts.port = port;
     opts.router_url = router_url;
     opts.anthropic_url = anthropic_url;
-    opts.danger_accept_invalid_upstream_certs = true;
+    if !upstreams.is_empty() {
+        let upstream_ca_path = ca_dir.join("upstream-ca.pem");
+        let mut bundle = String::new();
+        for upstream in upstreams {
+            bundle.push_str(&upstream.cert_pem);
+            bundle.push('\n');
+        }
+        std::fs::write(&upstream_ca_path, bundle).unwrap();
+        opts.upstream_ca_path = Some(upstream_ca_path);
+    }
     opts
 }
 
@@ -338,6 +355,7 @@ async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
@@ -422,6 +440,7 @@ async fn selective_proxy_routes_only_subagent_messages_to_router() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
     let ca_cert_path = opts.ca_cert_path.clone();
@@ -523,6 +542,7 @@ async fn selective_proxy_routes_model_list_discovery_to_router() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
     let ca_cert_path = opts.ca_cert_path.clone();
@@ -609,6 +629,7 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     opts.route_status_path = Some(status_path.clone());
     let ca_cert_path = opts.ca_cert_path.clone();
@@ -694,6 +715,7 @@ async fn selective_main_passthrough_clears_route_status_sidecar() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
     opts.route_status_path = Some(status_path.clone());
@@ -770,6 +792,7 @@ async fn proxy_stashes_router_auth_for_local_307() {
         ca_dir.path(),
         format!("https://127.0.0.1:{}", router.port),
         format!("https://127.0.0.1:{}", anthropic.port),
+        &[&router, &anthropic],
     );
     let cache = rayline_proxy::new_auth_cache();
     opts.local_available = true;
@@ -816,6 +839,7 @@ async fn proxy_blind_tunnels_non_anthropic_https_without_proxy_ca() {
         ca_dir.path(),
         "https://127.0.0.1:1".to_string(),
         "https://127.0.0.1:1".to_string(),
+        &[],
     );
     opts.connect_overrides = HashMap::from([(
         "third.rayline.invalid:443".to_string(),

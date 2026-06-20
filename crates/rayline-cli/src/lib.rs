@@ -266,10 +266,13 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::AuthLogin(request) => match status::auth_login(&request).await {
-            Ok(message) => {
-                eprint!("{message}");
-                ExitCode::SUCCESS
-            }
+            Ok(message) => match status::write_auth_message(&message) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: failed to write login output: {error}");
+                    ExitCode::from(1)
+                }
+            },
             Err(error) => {
                 eprintln!("Error: {error}");
                 ExitCode::from(1)
@@ -290,10 +293,13 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::AuthLogout(request) => match status::logout(&request) {
-            Ok(message) => {
-                eprint!("{message}");
-                ExitCode::SUCCESS
-            }
+            Ok(message) => match status::write_auth_message(&message) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: failed to write logout output: {error}");
+                    ExitCode::from(1)
+                }
+            },
             Err(error) => {
                 eprintln!("Error: failed to update credentials: {error}");
                 ExitCode::from(1)

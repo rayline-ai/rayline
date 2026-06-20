@@ -649,11 +649,9 @@ async fn exchange_cli_code(
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthLoginError::LoginFailed(format!(
-            "CLI code exchange failed: {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            "CLI code exchange failed: HTTP {}",
+            status.as_u16()
         )));
     }
     let data: Value = response.json().await.map_err(|error| {
@@ -681,7 +679,10 @@ async fn sign_in_with_custom_token(
     firebase_api_key: &str,
     tenant_id: Option<&str>,
 ) -> Result<RefreshedToken, AuthLoginError> {
-    let url = format!("{IDENTITY_TOOLKIT_CUSTOM_TOKEN_URL}?key={firebase_api_key}");
+    let endpoint =
+        validated_firebase_endpoint(IDENTITY_TOOLKIT_CUSTOM_TOKEN_URL).map_err(|error| {
+            AuthLoginError::LoginFailed(format!("Custom-token sign-in failed: {error}"))
+        })?;
     let client = auth_http_client().map_err(|error| {
         AuthLoginError::LoginFailed(format!("Custom-token sign-in failed: {error}"))
     })?;
@@ -690,24 +691,29 @@ async fn sign_in_with_custom_token(
         request_body["tenantId"] = Value::String(tenant_id.to_owned());
     }
     let response = client
-        .post(url)
+        .post(endpoint)
+        .query(&[("key", firebase_api_key)])
         .json(&request_body)
         .send()
         .await
         .map_err(|error| {
-            AuthLoginError::LoginFailed(format!("Custom-token sign-in failed: {error}"))
+            AuthLoginError::LoginFailed(format!(
+                "Custom-token sign-in failed: {}",
+                reqwest_error_message(error)
+            ))
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthLoginError::LoginFailed(format!(
-            "Custom-token sign-in failed: {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            "Custom-token sign-in failed: HTTP {}",
+            status.as_u16()
         )));
     }
     let data: Value = response.json().await.map_err(|error| {
-        AuthLoginError::LoginFailed(format!("Custom-token sign-in failed: {error}"))
+        AuthLoginError::LoginFailed(format!(
+            "Custom-token sign-in failed: {}",
+            reqwest_error_message(error)
+        ))
     })?;
     Ok(RefreshedToken {
         id_token: required_login_string(&data, "idToken")?,
@@ -718,14 +724,37 @@ async fn sign_in_with_custom_token(
 
 async fn run_device_login(hosted: &HostedEnvironment) -> Result<LoginToken, AuthLoginError> {
     let code = request_device_code(hosted).await?;
-    eprintln!();
-    eprintln!("  Visit:  {}", code.verification_url);
-    eprintln!("  Code:   {}", code.user_code);
-    eprintln!();
-    eprintln!("  Waiting for approval (timeout: {}s)...", code.expires_in);
+    write_device_login_prompt(&code)?;
 
     let access_token = poll_device_token(hosted, &code).await?;
     exchange_for_firebase(&access_token, hosted).await
+}
+
+fn write_device_login_prompt(code: &DeviceCode) -> Result<(), AuthLoginError> {
+    write_auth_message(&device_login_prompt(code)).map_err(AuthLoginError::WriteFailed)
+}
+
+fn device_login_prompt(code: &DeviceCode) -> String {
+    format!(
+        "\n  Visit:  {}\n  Code:   {}\n\n  Waiting for approval (timeout: {}s)...\n",
+        code.verification_url, code.user_code, code.expires_in
+    )
+}
+
+pub fn write_auth_message(message: &str) -> io::Result<()> {
+    write_interactive_message(message)
+}
+
+#[cfg(unix)]
+fn write_interactive_message(message: &str) -> io::Result<()> {
+    let mut tty = fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    tty.write_all(message.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_interactive_message(message: &str) -> io::Result<()> {
+    print!("{message}");
+    Ok(())
 }
 
 fn auth_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -752,11 +781,9 @@ async fn request_device_code(hosted: &HostedEnvironment) -> Result<DeviceCode, A
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthLoginError::LoginFailed(format!(
-            "Device code request failed: {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            "Device code request failed: HTTP {}",
+            status.as_u16()
         )));
     }
     let data: Value = response.json().await.map_err(|error| {
@@ -859,9 +886,7 @@ fn parse_device_token_response(
             crate::CLI_BIN
         ))),
         _ => Err(AuthLoginError::LoginFailed(format!(
-            "Device-flow polling failed: {} {}",
-            status_code,
-            body.chars().take(200).collect::<String>()
+            "Device-flow polling failed: HTTP {status_code}"
         ))),
     }
 }
@@ -870,12 +895,15 @@ async fn exchange_for_firebase(
     access_token: &str,
     hosted: &HostedEnvironment,
 ) -> Result<LoginToken, AuthLoginError> {
-    let url = format!("{}?key={}", IDENTITY_TOOLKIT_URL, hosted.firebase_api_key);
+    let endpoint = validated_firebase_endpoint(IDENTITY_TOOLKIT_URL).map_err(|error| {
+        AuthLoginError::LoginFailed(format!("Firebase token exchange failed: {error}"))
+    })?;
     let client = auth_http_client().map_err(|error| {
         AuthLoginError::LoginFailed(format!("Firebase token exchange failed: {error}"))
     })?;
     let response = client
-        .post(url)
+        .post(endpoint)
+        .query(&[("key", hosted.firebase_api_key.as_str())])
         .json(&serde_json::json!({
             "postBody": format!("access_token={access_token}&providerId=google.com"),
             "requestUri": "http://localhost",
@@ -885,19 +913,23 @@ async fn exchange_for_firebase(
         .send()
         .await
         .map_err(|error| {
-            AuthLoginError::LoginFailed(format!("Firebase token exchange failed: {error}"))
+            AuthLoginError::LoginFailed(format!(
+                "Firebase token exchange failed: {}",
+                reqwest_error_message(error)
+            ))
         })?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthLoginError::LoginFailed(format!(
-            "Firebase token exchange failed: {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            "Firebase token exchange failed: HTTP {}",
+            status.as_u16()
         )));
     }
     let data: Value = response.json().await.map_err(|error| {
-        AuthLoginError::LoginFailed(format!("Firebase token exchange failed: {error}"))
+        AuthLoginError::LoginFailed(format!(
+            "Firebase token exchange failed: {}",
+            reqwest_error_message(error)
+        ))
     })?;
     Ok(LoginToken {
         email: data
@@ -1274,6 +1306,22 @@ fn is_local_http_env_domain(host: &str) -> bool {
         return true;
     }
     host.len() > ".localhost".len() && host.to_ascii_lowercase().ends_with(".localhost")
+}
+
+fn validated_firebase_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim();
+    let url =
+        Url::parse(endpoint).map_err(|error| format!("invalid Firebase endpoint URL: {error}"))?;
+    let valid = match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(host)) => is_local_http_env_host(host),
+        _ => false,
+    };
+    if valid {
+        Ok(endpoint.to_owned())
+    } else {
+        Err("Firebase endpoint must use HTTPS unless it targets loopback HTTP".to_owned())
+    }
 }
 
 fn cli_auth_url(hosted: &HostedEnvironment, state: &str) -> Result<String, AuthLoginError> {
@@ -1907,33 +1955,40 @@ async fn refresh_firebase_token(
     firebase_api_key: &str,
     secure_token_url: &str,
 ) -> Result<RefreshedToken, AuthTokenError> {
-    let url = format!("{secure_token_url}?key={firebase_api_key}");
+    let endpoint = validated_firebase_endpoint(secure_token_url)
+        .map_err(|error| AuthTokenError::RefreshFailed(format!("Token refresh failed: {error}")))?;
     let client = auth_http_client()
         .map_err(|error| AuthTokenError::RefreshFailed(format!("Token refresh failed: {error}")))?;
     let response = client
-        .post(url)
+        .post(endpoint)
+        .query(&[("key", firebase_api_key)])
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
         ])
         .send()
         .await
-        .map_err(|error| AuthTokenError::RefreshFailed(format!("Token refresh failed: {error}")))?;
+        .map_err(|error| {
+            AuthTokenError::RefreshFailed(format!(
+                "Token refresh failed: {}",
+                reqwest_error_message(error)
+            ))
+        })?;
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(AuthTokenError::RefreshFailed(format!(
-            "Token refresh failed: {} {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
+            "Token refresh failed: HTTP {}",
+            status.as_u16()
         )));
     }
 
-    let data: Value = response
-        .json()
-        .await
-        .map_err(|error| AuthTokenError::RefreshFailed(format!("Token refresh failed: {error}")))?;
+    let data: Value = response.json().await.map_err(|error| {
+        AuthTokenError::RefreshFailed(format!(
+            "Token refresh failed: {}",
+            reqwest_error_message(error)
+        ))
+    })?;
     Ok(RefreshedToken {
         id_token: required_string(&data, "id_token")?,
         refresh_token: required_string(&data, "refresh_token")?,
@@ -1942,6 +1997,10 @@ async fn refresh_firebase_token(
             .and_then(value_as_i64)
             .unwrap_or(3600),
     })
+}
+
+fn reqwest_error_message(error: reqwest::Error) -> String {
+    error.without_url().to_string()
 }
 
 pub(crate) async fn mint_router_key(

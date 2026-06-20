@@ -608,7 +608,8 @@ async fn resolve_auth_token_or_login(
     let message = crate::status::auth_login(&login_request)
         .await
         .map_err(|error| RunError::Login(error.to_string()))?;
-    eprint!("{message}");
+    crate::status::write_auth_message(&message)
+        .map_err(|error| RunError::Login(format!("failed to write login output: {error}")))?;
 
     match crate::status::resolve_auth_token(&token_request).await? {
         crate::status::AuthTokenOutcome::Token(token) => Ok(Some(token)),
