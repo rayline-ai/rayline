@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Rayline local-router runtime: llama-server + adapter + header-injector"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true

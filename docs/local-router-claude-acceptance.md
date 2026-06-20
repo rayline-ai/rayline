@@ -6,7 +6,7 @@ router and managed llama.cpp runtime.
 Prerequisites:
 
 - Claude Code is installed and already logged in.
-- Rust `1.85.0` is installed when testing from source.
+- Rust `1.88.0` is installed when testing from source.
 - `jq` is available for JSON inspection.
 
 ## Install Matching Binaries

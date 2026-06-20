@@ -46,6 +46,26 @@ not affiliated with any model provider.
 
 More clients may be supported over time.
 
+## Install
+
+Rayline Local release assets are published on
+[GitHub Releases](https://github.com/rayline-ai/rayline/releases).
+
+macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rayline-ai/rayline/main/scripts/install-rayline.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/rayline-ai/rayline/main/scripts/install-rayline.ps1 | iex
+```
+
+The installers place `rayline` and `rld` in `~/.rayline/bin` by default and
+verify downloaded binaries against the release `SHA256SUMS` file.
+
 ## Build
 
 ```bash
