@@ -693,9 +693,9 @@ async fn auth_login_legacy_firebase(
             unix_now_secs(),
         )
         .map_err(AuthLoginError::WriteFailed)?;
-        let mut message = login_success_message(&env_name, &token.email);
+        let mut message = login_success_message(env_name, &token.email);
         if cleared_router_key {
-            message.push_str(&router_key_cleared_note(&env_name));
+            message.push_str(&router_key_cleared_note(env_name));
         }
         return Ok(message);
     }
