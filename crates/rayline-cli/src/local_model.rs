@@ -526,7 +526,7 @@ async fn set_router_enabled_in_home(
         .map_err(|error| format!("Not signed in: {error}. Run: {} auth login", crate::CLI_BIN))?
     {
         crate::status::AuthTokenOutcome::Available(token) => token,
-        crate::status::AuthTokenOutcome::NotLoggedIn { .. } => {
+        crate::status::AuthTokenOutcome::NotLoggedIn => {
             return Err(format!("Not signed in. Run: {} auth login", crate::CLI_BIN));
         }
     };
@@ -576,7 +576,7 @@ async fn fetch_router_settings(
         .ok()?
     {
         crate::status::AuthTokenOutcome::Available(token) => token,
-        crate::status::AuthTokenOutcome::NotLoggedIn { .. } => return None,
+        crate::status::AuthTokenOutcome::NotLoggedIn => return None,
     };
     let url = format!("{}/v1/settings", hosted.router_url);
     let response = reqwest::Client::builder()

@@ -282,20 +282,25 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::AuthToken(request) => match status::resolve_auth_token(&request).await {
-            Ok(status::AuthTokenOutcome::Available(value)) => {
-                println!("{value}");
-                ExitCode::SUCCESS
+        RaylineDispatch::AuthToken(request) => {
+            let env_name =
+                status::resolve_env(request.env_name.as_deref(), dirs::home_dir().as_deref());
+            match status::resolve_auth_token(&request).await {
+                Ok(status::AuthTokenOutcome::Available(value)) => {
+                    let output = terminal_output_text(&value);
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Ok(status::AuthTokenOutcome::NotLoggedIn) => {
+                    eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
+                    ExitCode::from(1)
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(1)
+                }
             }
-            Ok(status::AuthTokenOutcome::NotLoggedIn { env_name }) => {
-                eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
-                ExitCode::from(1)
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
+        }
         RaylineDispatch::AuthLogout(request) => match status::logout(&request).await {
             Ok(message) => match status::write_auth_message(&message) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -503,6 +508,10 @@ fn local_error(error: String, json: bool) -> ExitCode {
         eprintln!("Error: {error}");
     }
     ExitCode::from(1)
+}
+
+fn terminal_output_text(value: &str) -> String {
+    value.chars().collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

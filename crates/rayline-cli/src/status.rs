@@ -79,7 +79,7 @@ pub struct ClaudeLogoutRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthTokenOutcome {
     Available(String),
-    NotLoggedIn { env_name: String },
+    NotLoggedIn,
 }
 
 #[derive(Debug)]
@@ -348,7 +348,7 @@ pub async fn resolve_auth_token(
     let home = dirs::home_dir();
     let env_name = resolve_env(request.env_name.as_deref(), home.as_deref());
     let Some(home) = home else {
-        return Ok(AuthTokenOutcome::NotLoggedIn { env_name });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
 
     resolve_auth_token_from_home(&env_name, &home, unix_now_secs()).await
@@ -414,9 +414,7 @@ where
     Fut: std::future::Future<Output = Result<SessionToken, AuthTokenError>>,
 {
     let Some(credentials) = read_json(&credentials_file(home)) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
     let Some(env_data) = credentials
         .get("environments")
@@ -424,9 +422,7 @@ where
         .and_then(|envs| envs.get(env_name))
         .and_then(Value::as_object)
     else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
 
     if env_data
@@ -434,9 +430,7 @@ where
         .and_then(value_as_str)
         .is_some_and(|kind| kind != RAYLINE_SESSION_AUTH_KIND)
     {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     }
 
     let access_token = env_data
@@ -454,14 +448,10 @@ where
     }
 
     let Some(refresh_token) = env_data.get("refreshToken").and_then(value_as_str) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
     if refresh_token.is_empty() {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     }
 
     let stored_subject = env_data
@@ -504,9 +494,7 @@ where
     Fut: std::future::Future<Output = Result<RefreshedToken, AuthTokenError>>,
 {
     let Some(credentials) = read_json(&credentials_file(home)) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
     let Some(env_data) = credentials
         .get("environments")
@@ -514,20 +502,14 @@ where
         .and_then(|envs| envs.get(env_name))
         .and_then(Value::as_object)
     else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
 
     let Some(refresh_token) = env_data.get("refresh_token").and_then(value_as_str) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     };
     if refresh_token.is_empty() {
-        return Ok(AuthTokenOutcome::NotLoggedIn {
-            env_name: env_name.to_owned(),
-        });
+        return Ok(AuthTokenOutcome::NotLoggedIn);
     }
 
     let id_token = env_data
@@ -1173,10 +1155,11 @@ pub fn write_auth_message(message: &str) -> io::Result<()> {
 
 #[cfg(unix)]
 fn write_interactive_message(message: &str) -> io::Result<()> {
+    let output = terminal_output_text(message);
     match fs::OpenOptions::new().write(true).open("/dev/tty") {
-        Ok(mut tty) => tty.write_all(message.as_bytes()),
+        Ok(mut tty) => tty.write_all(output.as_bytes()),
         Err(_) => {
-            eprint!("{message}");
+            eprint!("{output}");
             Ok(())
         }
     }
@@ -1184,8 +1167,13 @@ fn write_interactive_message(message: &str) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_interactive_message(message: &str) -> io::Result<()> {
-    print!("{message}");
+    let output = terminal_output_text(message);
+    print!("{output}");
     Ok(())
+}
+
+fn terminal_output_text(message: &str) -> String {
+    message.chars().collect()
 }
 
 fn auth_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -1387,9 +1375,7 @@ pub async fn claude_login(request: &ClaudeLoginRequest) -> Result<String, Claude
     };
     let token = match resolve_auth_token(&token_request).await? {
         AuthTokenOutcome::Available(token) => token,
-        AuthTokenOutcome::NotLoggedIn { .. } => {
-            return Err(ClaudeLoginError::NotLoggedIn(env_name));
-        }
+        AuthTokenOutcome::NotLoggedIn => return Err(ClaudeLoginError::NotLoggedIn(env_name)),
     };
     let Some(home) = home else {
         return Err(ClaudeLoginError::WriteFailed(io::Error::new(

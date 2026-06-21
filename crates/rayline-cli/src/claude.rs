@@ -592,10 +592,10 @@ async fn resolve_auth_token_or_login(
         // Credentials are missing or stale (expired/revoked refresh token). On a
         // terminal, re-running sign-in repairs both; otherwise preserve the prior
         // behavior (missing-key error, or surfacing the refresh failure).
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn { .. }) if !interactive => {
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) if !interactive => {
             return Ok(None);
         }
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn { .. }) => {}
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => {}
         Err(error) if !interactive => return Err(error.into()),
         Err(_) => {}
     }
@@ -615,7 +615,7 @@ async fn resolve_auth_token_or_login(
 
     match crate::status::resolve_auth_token(&token_request).await? {
         crate::status::AuthTokenOutcome::Available(token) => Ok(Some(token)),
-        crate::status::AuthTokenOutcome::NotLoggedIn { .. } => Ok(None),
+        crate::status::AuthTokenOutcome::NotLoggedIn => Ok(None),
     }
 }
 
@@ -920,7 +920,7 @@ async fn fetch_router_settings(
     };
     let bearer_token = match crate::status::resolve_auth_token(&token_request).await {
         Ok(crate::status::AuthTokenOutcome::Available(token)) => token,
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn { .. }) => router_key.to_owned(),
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => router_key.to_owned(),
         Err(_) => router_key.to_owned(),
     };
     let url = format!("{router_base}/v1/settings");
