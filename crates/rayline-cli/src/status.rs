@@ -15,6 +15,10 @@ use url::{Host, Url};
 const AUTH_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const TOKEN_REFRESH_MARGIN_SECONDS: f64 = 300.0;
 const WEB_CALLBACK_TIMEOUT_SECONDS: u64 = 300;
+const RAYLINE_SESSION_AUTH_KIND: &str = "rayline_session";
+const LEGACY_FIREBASE_AUTH_KIND: &str = "firebase";
+const PROD_CLI_AUTH_URL: &str = "https://platform.rayline.ai/cli-auth";
+const PROD_ACCOUNT_URL: &str = "https://platform.rayline.ai";
 const SECURE_TOKEN_URL: &str = "https://securetoken.googleapis.com/v1/token";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -108,9 +112,16 @@ pub(crate) struct HostedEnvironment {
     pub router_url: String,
     pub cli_auth_url: String,
     pub account_url: Option<String>,
-    pub firebase_api_key: String,
+    pub auth_kind: HostedAuthKind,
+    pub firebase_api_key: Option<String>,
     pub google_device_client_id: Option<String>,
     pub google_device_client_secret: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedAuthKind {
+    RaylineSession,
+    FirebaseLegacy,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -129,6 +140,11 @@ pub(crate) enum HostedEnvironmentError {
         env_name: String,
         settings_path: PathBuf,
         field: &'static str,
+        value: String,
+    },
+    InvalidAuthKind {
+        env_name: String,
+        settings_path: PathBuf,
         value: String,
     },
 }
@@ -194,12 +210,6 @@ impl std::fmt::Display for HostedEnvironmentError {
             ),
             Self::Unknown {
                 env_name,
-                settings_path: _,
-            } if env_name == PROD_ENV => formatter.write_str(
-                "Hosted Rayline auth is not included in this release. Use local-router mode or define a custom environment in ~/.config/rayline/settings.json.",
-            ),
-            Self::Unknown {
-                env_name,
                 settings_path,
             } => write!(
                 formatter,
@@ -226,6 +236,15 @@ impl std::fmt::Display for HostedEnvironmentError {
             } => write!(
                 formatter,
                 "Rayline environment '{env_name}' in {} has invalid URL field '{field}': {value}",
+                settings_path.display()
+            ),
+            Self::InvalidAuthKind {
+                env_name,
+                settings_path,
+                value,
+            } => write!(
+                formatter,
+                "Rayline environment '{env_name}' in {} has invalid auth_kind: {value}",
                 settings_path.display()
             ),
         }
@@ -286,15 +305,32 @@ pub fn is_valid_root_env(value: &str) -> bool {
 pub(crate) fn render_status(request: &StatusRequest) -> Result<String, HostedEnvironmentError> {
     let home = dirs::home_dir();
     let env_name = resolve_env(request.env_name.as_deref(), home.as_deref());
-    resolve_hosted_environment(&env_name, home.as_deref())?;
-    let env_token = env::var("RAYLINE_ID_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty());
-    let token = request.auth_token.as_deref().or(env_token.as_deref());
+    let hosted = resolve_hosted_environment(&env_name, home.as_deref())?;
+    let env_token = env_auth_token();
+    let token = request
+        .auth_token
+        .as_deref()
+        .or(env_token.as_ref().map(|(token, _source)| token.as_str()));
+    let token_source = if request
+        .auth_token
+        .as_ref()
+        .is_some_and(|token| !token.is_empty())
+    {
+        Some("--auth-token")
+    } else {
+        env_token.as_ref().map(|(_token, source)| *source)
+    };
     let now = unix_now_secs();
 
     match home {
-        Some(home) => Ok(render_status_from_home(&env_name, &home, token, now)),
+        Some(home) => Ok(render_status_from_home_with_source(
+            &env_name,
+            &home,
+            token,
+            token_source,
+            Some(hosted.auth_kind),
+            now,
+        )),
         None => Ok(format!("Not logged in. Run: {}\n", auth_command())),
     }
 }
@@ -305,10 +341,8 @@ pub async fn resolve_auth_token(
     if let Some(token) = request.auth_token.as_deref() {
         return Ok(AuthTokenOutcome::Token(token.to_owned()));
     }
-    if let Ok(token) = env::var("RAYLINE_ID_TOKEN") {
-        if !token.is_empty() {
-            return Ok(AuthTokenOutcome::Token(token));
-        }
+    if let Some((token, _source)) = env_auth_token() {
+        return Ok(AuthTokenOutcome::Token(token));
     }
 
     let home = dirs::home_dir();
@@ -336,19 +370,120 @@ pub async fn resolve_auth_token_from_home_with_endpoint(
 ) -> Result<AuthTokenOutcome, AuthTokenError> {
     let hosted = resolve_hosted_environment(env_name, Some(home))
         .map_err(|error| AuthTokenError::RefreshFailed(error.to_string()))?;
-    let firebase_api_key = hosted.firebase_api_key.clone();
-    resolve_auth_token_from_home_with_refresher(
-        env_name,
-        home,
-        now,
-        move |refresh_token, _env_name| async move {
-            refresh_firebase_token(&refresh_token, &firebase_api_key, secure_token_url).await
-        },
-    )
-    .await
+    match hosted.auth_kind {
+        HostedAuthKind::RaylineSession => {
+            let router_url = hosted.router_url.clone();
+            resolve_session_token_from_home_with_refresher(
+                env_name,
+                home,
+                now,
+                move |refresh_token, _env_name| async move {
+                    refresh_rayline_session(&router_url, &refresh_token).await
+                },
+            )
+            .await
+        }
+        HostedAuthKind::FirebaseLegacy => {
+            let firebase_api_key = hosted.firebase_api_key.clone().ok_or_else(|| {
+                AuthTokenError::RefreshFailed(format!(
+                    "Rayline environment '{env_name}' is missing required field 'firebase_api_key'."
+                ))
+            })?;
+            resolve_legacy_firebase_token_from_home_with_refresher(
+                env_name,
+                home,
+                now,
+                move |refresh_token, _env_name| async move {
+                    refresh_firebase_token(&refresh_token, &firebase_api_key, secure_token_url)
+                        .await
+                },
+            )
+            .await
+        }
+    }
 }
 
-async fn resolve_auth_token_from_home_with_refresher<F, Fut>(
+async fn resolve_session_token_from_home_with_refresher<F, Fut>(
+    env_name: &str,
+    home: &Path,
+    now: f64,
+    refresh: F,
+) -> Result<AuthTokenOutcome, AuthTokenError>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<SessionToken, AuthTokenError>>,
+{
+    let Some(credentials) = read_json(&credentials_file(home)) else {
+        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+    };
+    let Some(env_data) = credentials
+        .get("environments")
+        .and_then(Value::as_object)
+        .and_then(|envs| envs.get(env_name))
+        .and_then(Value::as_object)
+    else {
+        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+    };
+
+    if env_data
+        .get("authKind")
+        .and_then(value_as_str)
+        .is_some_and(|kind| kind != RAYLINE_SESSION_AUTH_KIND)
+    {
+        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+    }
+
+    let access_token = env_data
+        .get("accessToken")
+        .and_then(value_as_str)
+        .unwrap_or_default();
+    let access_expires_at = env_data
+        .get("accessTokenExpiresAtMs")
+        .and_then(value_as_f64)
+        .map(|value| value / 1000.0)
+        .unwrap_or(0.0);
+
+    if !access_token.is_empty() && access_expires_at - now > TOKEN_REFRESH_MARGIN_SECONDS {
+        return Ok(AuthTokenOutcome::Token(access_token.to_owned()));
+    }
+
+    let Some(refresh_token) = env_data.get("refreshToken").and_then(value_as_str) else {
+        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+    };
+    if refresh_token.is_empty() {
+        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+    }
+
+    let stored_subject = env_data
+        .get("subject")
+        .and_then(value_as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let stored_email = env_data
+        .get("email")
+        .and_then(value_as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let mut refreshed = refresh(refresh_token.to_owned(), env_name.to_owned()).await?;
+    if refreshed.subject.is_empty() {
+        refreshed.subject = stored_subject;
+    }
+    if refreshed.email.is_empty() {
+        refreshed.email = stored_email;
+    }
+    if refreshed.subject.is_empty() {
+        return Err(AuthTokenError::RefreshFailed(
+            "Token refresh failed: missing stored subject".to_owned(),
+        ));
+    }
+    save_session_credentials_from_home(env_name, home, &refreshed, now)
+        .map_err(AuthTokenError::WriteFailed)?;
+
+    Ok(AuthTokenOutcome::Token(refreshed.access_token))
+}
+
+async fn resolve_legacy_firebase_token_from_home_with_refresher<F, Fut>(
     env_name: &str,
     home: &Path,
     now: f64,
@@ -420,14 +555,27 @@ where
     Ok(AuthTokenOutcome::Token(refreshed.id_token))
 }
 
-pub fn logout(request: &AuthLogoutRequest) -> io::Result<String> {
+pub async fn logout(request: &AuthLogoutRequest) -> io::Result<String> {
     let home = dirs::home_dir();
     let env_name = resolve_env(request.env_name.as_deref(), home.as_deref());
     let Some(home) = home else {
         return Ok(format!("Not logged in to {env_name}\n"));
     };
 
-    logout_from_home(&env_name, &home)
+    let revoke_result =
+        session_revoke_request(&env_name, &home).map(|(router_url, token)| async move {
+            revoke_rayline_session(&router_url, &token).await
+        });
+    let revoke_error = match revoke_result {
+        Some(revoke) => revoke.await.err(),
+        None => None,
+    };
+
+    let mut message = logout_from_home(&env_name, &home)?;
+    if let Some(error) = revoke_error {
+        message.push_str(&format!("Remote session revoke failed: {error}\n"));
+    }
+    Ok(message)
 }
 
 pub fn logout_from_home(env_name: &str, home: &Path) -> io::Result<String> {
@@ -439,7 +587,7 @@ pub fn logout_from_home(env_name: &str, home: &Path) -> io::Result<String> {
         .get_mut("environments")
         .and_then(Value::as_object_mut)
         .is_some_and(|envs| envs.remove(env_name).is_some());
-    // The router key minted under this login stays usable after the OAuth
+    // The router key minted under this login stays usable after the account
     // credentials are gone; drop it too so a later login as a different
     // account cannot keep routing on the previous account's key.
     let removed_key = credentials
@@ -473,12 +621,55 @@ pub async fn auth_login(request: &AuthLoginRequest) -> Result<String, AuthLoginE
     let hosted = resolve_hosted_environment(&env_name, Some(&home))
         .map_err(|error| AuthLoginError::LoginFailed(error.to_string()))?;
 
+    match hosted.auth_kind {
+        HostedAuthKind::RaylineSession => {
+            auth_login_session(request, &env_name, &home, &hosted).await
+        }
+        HostedAuthKind::FirebaseLegacy => {
+            auth_login_legacy_firebase(request, &env_name, &home, &hosted).await
+        }
+    }
+}
+
+async fn auth_login_session(
+    request: &AuthLoginRequest,
+    env_name: &str,
+    home: &Path,
+    hosted: &HostedEnvironment,
+) -> Result<String, AuthLoginError> {
+    let session = if request.paste {
+        run_session_paste_flow(hosted).await?
+    } else if request.no_browser || is_headless() {
+        if !request.no_browser {
+            eprintln!("  No local browser detected (SSH session). Using device-code login.");
+        }
+        run_rayline_device_login(hosted).await?
+    } else {
+        run_web_callback_session_flow(hosted).await?
+    };
+
+    let cleared_router_key =
+        save_session_credentials_from_home(env_name, home, &session, unix_now_secs())
+            .map_err(AuthLoginError::WriteFailed)?;
+    let mut message = login_success_message(env_name, &session.email);
+    if cleared_router_key {
+        message.push_str(&router_key_cleared_note(env_name));
+    }
+    Ok(message)
+}
+
+async fn auth_login_legacy_firebase(
+    request: &AuthLoginRequest,
+    env_name: &str,
+    home: &Path,
+    hosted: &HostedEnvironment,
+) -> Result<String, AuthLoginError> {
     if request.paste {
-        let (refresh_token, fragment_email) = run_paste_flow(&hosted)?;
-        let firebase_api_key = hosted.firebase_api_key.clone();
+        let (refresh_token, fragment_email) = run_legacy_paste_flow(hosted)?;
+        let firebase_api_key = firebase_api_key(hosted)?;
         return auth_login_refresh_token_from_home_with_refresher(
-            &env_name,
-            &home,
+            env_name,
+            home,
             refresh_token,
             fragment_email,
             unix_now_secs(),
@@ -493,10 +684,10 @@ pub async fn auth_login(request: &AuthLoginRequest) -> Result<String, AuthLoginE
         if !request.no_browser {
             eprintln!("  No local browser detected (SSH session). Using device-code login.");
         }
-        let token = run_device_login(&hosted).await?;
+        let token = run_legacy_device_login(hosted).await?;
         let cleared_router_key = save_env_credentials_from_home(
-            &env_name,
-            &home,
+            env_name,
+            home,
             &token.refreshed,
             &token.email,
             unix_now_secs(),
@@ -509,11 +700,11 @@ pub async fn auth_login(request: &AuthLoginRequest) -> Result<String, AuthLoginE
         return Ok(message);
     }
 
-    let (refresh_token, fragment_email) = run_web_callback_flow(&hosted).await?;
-    let firebase_api_key = hosted.firebase_api_key.clone();
+    let (refresh_token, fragment_email) = run_web_callback_legacy_flow(hosted).await?;
+    let firebase_api_key = firebase_api_key(hosted)?;
     auth_login_refresh_token_from_home_with_refresher(
-        &env_name,
-        &home,
+        env_name,
+        home,
         refresh_token,
         fragment_email,
         unix_now_secs(),
@@ -555,7 +746,37 @@ where
     Ok(message)
 }
 
-fn run_paste_flow(hosted: &HostedEnvironment) -> Result<(String, String), AuthLoginError> {
+async fn run_session_paste_flow(
+    hosted: &HostedEnvironment,
+) -> Result<SessionToken, AuthLoginError> {
+    let state = random_state();
+    let (code_verifier, code_challenge) = generate_pkce();
+    let auth_url = cli_auth_url_with_callback(
+        hosted,
+        &state,
+        Some("http://127.0.0.1/"),
+        Some(&code_challenge),
+    )?;
+    eprintln!();
+    eprintln!("  To sign in, open this URL in any browser:");
+    eprintln!();
+    eprintln!("  {auth_url}");
+    eprintln!();
+    eprintln!("  After sign-in, copy the final http://127.0.0.1/... URL from");
+    eprintln!("  the browser address bar and paste it here.");
+    eprintln!();
+    eprint!("  Paste the callback URL: ");
+    io::stderr().flush().map_err(AuthLoginError::WriteFailed)?;
+
+    let mut pasted = String::new();
+    io::stdin()
+        .read_line(&mut pasted)
+        .map_err(AuthLoginError::WriteFailed)?;
+    let code = parse_paste_callback_url(pasted.trim(), &state)?;
+    exchange_cli_code_for_session(hosted, &code, &code_verifier).await
+}
+
+fn run_legacy_paste_flow(hosted: &HostedEnvironment) -> Result<(String, String), AuthLoginError> {
     let state = random_state();
     let auth_url = cli_auth_url(hosted, &state)?;
     eprintln!();
@@ -573,10 +794,24 @@ fn run_paste_flow(hosted: &HostedEnvironment) -> Result<(String, String), AuthLo
     io::stdin()
         .read_line(&mut pasted)
         .map_err(AuthLoginError::WriteFailed)?;
-    parse_paste_success_url(pasted.trim(), &state)
+    parse_legacy_paste_success_url(pasted.trim(), &state)
 }
 
-async fn run_web_callback_flow(
+async fn run_web_callback_session_flow(
+    hosted: &HostedEnvironment,
+) -> Result<SessionToken, AuthLoginError> {
+    let (code, code_verifier) = run_web_callback_code_flow(hosted).await?;
+    exchange_cli_code_for_session(hosted, &code, &code_verifier).await
+}
+
+async fn run_web_callback_legacy_flow(
+    hosted: &HostedEnvironment,
+) -> Result<(String, String), AuthLoginError> {
+    let (code, code_verifier) = run_web_callback_code_flow(hosted).await?;
+    exchange_cli_code_for_legacy_firebase(hosted, &code, &code_verifier).await
+}
+
+async fn run_web_callback_code_flow(
     hosted: &HostedEnvironment,
 ) -> Result<(String, String), AuthLoginError> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
@@ -610,7 +845,7 @@ async fn run_web_callback_flow(
             AuthLoginError::LoginFailed(format!("Login callback failed: {error}"))
         })??;
 
-    exchange_cli_code(hosted, &code, &code_verifier).await
+    Ok((code, code_verifier))
 }
 
 /// Generate a PKCE (RFC 7636) verifier and its S256 challenge.
@@ -626,11 +861,47 @@ fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-/// Redeem the one-time loopback code at the router's CLI-auth broker, then
-/// exchange the returned Firebase custom token for credentials. Returns
+async fn exchange_cli_code_for_session(
+    hosted: &HostedEnvironment,
+    code: &str,
+    code_verifier: &str,
+) -> Result<SessionToken, AuthLoginError> {
+    let url = format!("{}/v1/auth/cli/token", hosted.router_url);
+    let client = auth_http_client().map_err(|error| {
+        AuthLoginError::LoginFailed(format!("CLI code exchange failed: {error}"))
+    })?;
+    let response = client
+        .post(url)
+        .json(&serde_json::json!({
+            "code": code,
+            "codeVerifier": code_verifier,
+            "responseType": RAYLINE_SESSION_AUTH_KIND
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            AuthLoginError::LoginFailed(format!("CLI code exchange failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AuthLoginError::LoginFailed(http_error_message(
+            "CLI code exchange failed",
+            status.as_u16(),
+            &body,
+        )));
+    }
+    let data: Value = response.json().await.map_err(|error| {
+        AuthLoginError::LoginFailed(format!("CLI code exchange failed: {error}"))
+    })?;
+    parse_session_token_response(&data, "CLI code exchange").map_err(AuthLoginError::LoginFailed)
+}
+
+/// Redeem the one-time loopback code at the router's legacy CLI-auth broker,
+/// then exchange the returned Firebase custom token for credentials. Returns
 /// `(refresh_token, email)` so the caller's existing refresh+save path is
 /// unchanged.
-async fn exchange_cli_code(
+async fn exchange_cli_code_for_legacy_firebase(
     hosted: &HostedEnvironment,
     code: &str,
     code_verifier: &str,
@@ -666,8 +937,8 @@ async fn exchange_cli_code(
     // Okta/SSO users are minted in a Firebase tenant; signInWithCustomToken must
     // run in the same tenant or the exchange fails.
     let tenant_id = data.get("tenantId").and_then(value_as_str);
-    let refreshed =
-        sign_in_with_custom_token(&custom_token, &hosted.firebase_api_key, tenant_id).await?;
+    let firebase_api_key = firebase_api_key(hosted)?;
+    let refreshed = sign_in_with_custom_token(&custom_token, &firebase_api_key, tenant_id).await?;
     Ok((refreshed.refresh_token, email))
 }
 
@@ -722,7 +993,144 @@ async fn sign_in_with_custom_token(
     })
 }
 
-async fn run_device_login(hosted: &HostedEnvironment) -> Result<LoginToken, AuthLoginError> {
+async fn run_rayline_device_login(
+    hosted: &HostedEnvironment,
+) -> Result<SessionToken, AuthLoginError> {
+    let device = request_rayline_device_session(hosted).await?;
+    write_rayline_device_login_prompt(&device)?;
+    poll_rayline_device_session(hosted, &device).await
+}
+
+async fn request_rayline_device_session(
+    hosted: &HostedEnvironment,
+) -> Result<RaylineDeviceSession, AuthLoginError> {
+    let url = format!("{}/v1/auth/cli/device/start", hosted.router_url);
+    let response = auth_http_client()
+        .map_err(|error| {
+            AuthLoginError::LoginFailed(format!("Device login start failed: {error}"))
+        })?
+        .post(url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|error| {
+            AuthLoginError::LoginFailed(format!("Device login start failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AuthLoginError::LoginFailed(http_error_message(
+            "Device login start failed",
+            status.as_u16(),
+            &body,
+        )));
+    }
+    let data: Value = response.json().await.map_err(|error| {
+        AuthLoginError::LoginFailed(format!("Device login start failed: {error}"))
+    })?;
+    Ok(RaylineDeviceSession {
+        session_id: required_login_string(&data, "sessionId")?,
+        user_code: required_login_string(&data, "userCode")?,
+        verification_uri: required_login_string(&data, "verificationUri")?,
+        interval_seconds: data
+            .get("intervalSeconds")
+            .and_then(value_as_i64)
+            .unwrap_or(5)
+            .max(1),
+        expires_in_seconds: data
+            .get("expiresInSeconds")
+            .and_then(value_as_i64)
+            .unwrap_or(600)
+            .max(1),
+    })
+}
+
+fn write_rayline_device_login_prompt(device: &RaylineDeviceSession) -> Result<(), AuthLoginError> {
+    write_auth_message(&rayline_device_login_prompt(device)).map_err(AuthLoginError::WriteFailed)
+}
+
+fn rayline_device_login_prompt(device: &RaylineDeviceSession) -> String {
+    format!(
+        "\n  Visit:  {}\n  Code:   {}\n\n  Waiting for approval (timeout: {}s)...\n",
+        device.verification_uri, device.user_code, device.expires_in_seconds
+    )
+}
+
+async fn poll_rayline_device_session(
+    hosted: &HostedEnvironment,
+    device: &RaylineDeviceSession,
+) -> Result<SessionToken, AuthLoginError> {
+    let url = format!("{}/v1/auth/cli/device/poll", hosted.router_url);
+    let started = Instant::now();
+    let timeout = Duration::from_secs(device.expires_in_seconds as u64);
+    let mut interval = device.interval_seconds as u64;
+    let client = auth_http_client().map_err(|error| {
+        AuthLoginError::LoginFailed(format!("Device login polling failed: {error}"))
+    })?;
+
+    loop {
+        if started.elapsed() >= timeout {
+            return Err(AuthLoginError::LoginFailed(format!(
+                "Login timed out before approval. Run `{} auth login --no-browser` to try again.",
+                crate::CLI_BIN
+            )));
+        }
+
+        let response = client
+            .post(&url)
+            .json(&serde_json::json!({ "sessionId": device.session_id.as_str() }))
+            .send()
+            .await
+            .map_err(|error| {
+                AuthLoginError::LoginFailed(format!("Device login polling failed: {error}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AuthLoginError::LoginFailed(http_error_message(
+                "Device login polling failed",
+                status.as_u16(),
+                &body,
+            )));
+        }
+
+        let data: Value = serde_json::from_str(&body).map_err(|error| {
+            AuthLoginError::LoginFailed(format!("Device login polling failed: {error}"))
+        })?;
+        match data
+            .get("status")
+            .and_then(value_as_str)
+            .unwrap_or_default()
+        {
+            "approved" => {
+                return parse_session_token_response(&data, "Device login polling")
+                    .map_err(AuthLoginError::LoginFailed);
+            }
+            "pending" => {
+                interval = data
+                    .get("intervalSeconds")
+                    .and_then(value_as_i64)
+                    .unwrap_or(interval as i64)
+                    .max(1) as u64;
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+            "expired" => {
+                return Err(AuthLoginError::LoginFailed(format!(
+                    "Login code expired before approval. Run `{} auth login --no-browser` to try again.",
+                    crate::CLI_BIN
+                )));
+            }
+            other => {
+                return Err(AuthLoginError::LoginFailed(format!(
+                    "Device login polling failed: unexpected status '{}'",
+                    if other.is_empty() { "(missing)" } else { other }
+                )));
+            }
+        }
+    }
+}
+
+async fn run_legacy_device_login(hosted: &HostedEnvironment) -> Result<LoginToken, AuthLoginError> {
     let code = request_device_code(hosted).await?;
     write_device_login_prompt(&code)?;
 
@@ -747,8 +1155,14 @@ pub fn write_auth_message(message: &str) -> io::Result<()> {
 
 #[cfg(unix)]
 fn write_interactive_message(message: &str) -> io::Result<()> {
-    let mut tty = fs::OpenOptions::new().write(true).open("/dev/tty")?;
-    tty.write_all(message.as_bytes())
+    match fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(mut tty) => tty.write_all(message.as_bytes()),
+        Err(_) => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(message.as_bytes())?;
+            stderr.flush()
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -901,9 +1315,10 @@ async fn exchange_for_firebase(
     let client = auth_http_client().map_err(|error| {
         AuthLoginError::LoginFailed(format!("Firebase token exchange failed: {error}"))
     })?;
+    let firebase_api_key = firebase_api_key(hosted)?;
     let response = client
         .post(endpoint)
-        .query(&[("key", hosted.firebase_api_key.as_str())])
+        .query(&[("key", firebase_api_key.as_str())])
         .json(&serde_json::json!({
             "postBody": format!("access_token={access_token}&providerId=google.com"),
             "requestUri": "http://localhost",
@@ -1025,7 +1440,15 @@ pub fn load_claude_key_from_home(env_name: &str, home: &Path) -> Option<String> 
         .as_object()?
         .get(env_name)?
         .as_object()?
-        .get("api_key")
+        .get("apiKey")
+        .or_else(|| {
+            credentials
+                .get("router_keys")?
+                .as_object()?
+                .get(env_name)?
+                .as_object()?
+                .get("api_key")
+        })
         .and_then(value_as_str)
         .filter(|key| !key.is_empty())
         .map(ToOwned::to_owned)
@@ -1042,6 +1465,7 @@ pub fn save_claude_key_from_home(
     if !credentials.is_object() {
         credentials = Value::Object(Map::new());
     }
+    let subject = stored_env_subject(&credentials, env_name);
     let root = credentials
         .as_object_mut()
         .expect("credentials value was normalized to an object");
@@ -1055,7 +1479,10 @@ pub fn save_claude_key_from_home(
         .expect("router_keys was normalized to an object");
 
     let mut entry = Map::new();
-    entry.insert("api_key".to_owned(), Value::String(api_key.to_owned()));
+    entry.insert("apiKey".to_owned(), Value::String(api_key.to_owned()));
+    if let Some(subject) = subject {
+        entry.insert("subject".to_owned(), Value::String(subject));
+    }
     entry.insert("saved_at".to_owned(), Value::String(utc_timestamp(now)));
     router_keys.insert(env_name.to_owned(), Value::Object(entry));
 
@@ -1105,7 +1532,31 @@ pub fn render_status_from_home(
     env_token: Option<&str>,
     now: f64,
 ) -> String {
-    let Some(status) = stored_status(env_name, home, env_token) else {
+    render_status_from_home_with_source(
+        env_name,
+        home,
+        env_token,
+        env_token.map(|_| "RAYLINE_AUTH_TOKEN"),
+        None,
+        now,
+    )
+}
+
+fn render_status_from_home_with_source(
+    env_name: &str,
+    home: &Path,
+    env_token: Option<&str>,
+    env_token_source: Option<&str>,
+    expected_auth_kind: Option<HostedAuthKind>,
+    now: f64,
+) -> String {
+    let Some(status) = stored_status(
+        env_name,
+        home,
+        env_token,
+        env_token_source,
+        expected_auth_kind,
+    ) else {
         return format!("Not logged in. Run: {}\n", auth_command());
     };
 
@@ -1122,7 +1573,7 @@ pub fn render_status_from_home(
         output.push_str(&format!("  Logged in:   {}\n", status.logged_in_at));
     }
 
-    if status.auth_source == "RAYLINE_ID_TOKEN" {
+    if status.env_token {
         output.push_str("  Token:       provided via env var (expiry unknown)\n");
     } else {
         let remaining = status.expires_at - now;
@@ -1171,6 +1622,9 @@ pub(crate) fn resolve_hosted_environment(
     if !is_valid_root_env(env_name) {
         return Err(HostedEnvironmentError::InvalidName(env_name.to_owned()));
     }
+    if env_name == PROD_ENV {
+        return Ok(prod_hosted_environment());
+    }
     let Some(home) = home else {
         return Err(HostedEnvironmentError::Unknown {
             env_name: env_name.to_owned(),
@@ -1199,21 +1653,79 @@ pub(crate) fn resolve_hosted_environment(
     configured_hosted_environment(env_name, &settings_path, entry)
 }
 
+fn prod_hosted_environment() -> HostedEnvironment {
+    HostedEnvironment {
+        name: PROD_ENV.to_owned(),
+        credential_key: PROD_ENV.to_owned(),
+        router_url: crate::ROUTER_PROD_URL.to_owned(),
+        cli_auth_url: PROD_CLI_AUTH_URL.to_owned(),
+        account_url: Some(PROD_ACCOUNT_URL.to_owned()),
+        auth_kind: HostedAuthKind::RaylineSession,
+        firebase_api_key: None,
+        google_device_client_id: None,
+        google_device_client_secret: None,
+    }
+}
+
 fn configured_hosted_environment(
     env_name: &str,
     settings_path: &Path,
     entry: &Map<String, Value>,
 ) -> Result<HostedEnvironment, HostedEnvironmentError> {
+    let auth_kind = configured_auth_kind(env_name, settings_path, entry)?;
+    let firebase_api_key = match auth_kind {
+        HostedAuthKind::FirebaseLegacy => Some(required_env_string(
+            env_name,
+            settings_path,
+            entry,
+            "firebase_api_key",
+        )?),
+        HostedAuthKind::RaylineSession => optional_env_string(entry, "firebase_api_key"),
+    };
+
     Ok(HostedEnvironment {
         name: env_name.to_owned(),
         credential_key: env_name.to_owned(),
         router_url: required_env_url(env_name, settings_path, entry, "router_url")?,
         cli_auth_url: required_env_url(env_name, settings_path, entry, "cli_auth_url")?,
         account_url: optional_env_url(env_name, settings_path, entry, "account_url")?,
-        firebase_api_key: required_env_string(env_name, settings_path, entry, "firebase_api_key")?,
+        auth_kind,
+        firebase_api_key,
         google_device_client_id: optional_env_string(entry, "google_device_client_id"),
         google_device_client_secret: optional_env_string(entry, "google_device_client_secret"),
     })
+}
+
+fn configured_auth_kind(
+    env_name: &str,
+    settings_path: &Path,
+    entry: &Map<String, Value>,
+) -> Result<HostedAuthKind, HostedEnvironmentError> {
+    let Some(raw) = entry
+        .get("auth_kind")
+        .or_else(|| entry.get("authKind"))
+        .and_then(value_as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(if entry.get("firebase_api_key").is_some() {
+            HostedAuthKind::FirebaseLegacy
+        } else {
+            HostedAuthKind::RaylineSession
+        });
+    };
+
+    match raw {
+        RAYLINE_SESSION_AUTH_KIND | "session" => Ok(HostedAuthKind::RaylineSession),
+        LEGACY_FIREBASE_AUTH_KIND | "firebase_legacy" | "legacy_firebase" => {
+            Ok(HostedAuthKind::FirebaseLegacy)
+        }
+        value => Err(HostedEnvironmentError::InvalidAuthKind {
+            env_name: env_name.to_owned(),
+            settings_path: settings_path.to_owned(),
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn required_env_string(
@@ -1353,7 +1865,40 @@ fn cli_auth_url_with_callback(
     Ok(format!("{base_url}?{}", query.finish()))
 }
 
-fn parse_paste_success_url(
+fn parse_paste_callback_url(pasted: &str, expected_state: &str) -> Result<String, AuthLoginError> {
+    if pasted.starts_with('?') {
+        return Err(AuthLoginError::InvalidPaste(
+            "Please paste the full callback URL, not just the ?query string.".to_owned(),
+        ));
+    }
+
+    let parsed = Url::parse(pasted).map_err(|_| {
+        AuthLoginError::InvalidPaste(
+            "Please paste the full callback URL (including http://127.0.0.1/...).".to_owned(),
+        )
+    })?;
+    let code = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+        .unwrap_or_default();
+    let state = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap_or_default();
+    if state != expected_state {
+        return Err(AuthLoginError::InvalidPaste(
+            "State mismatch: the pasted URL does not belong to this login session.".to_owned(),
+        ));
+    }
+    if code.is_empty() {
+        return Err(AuthLoginError::InvalidPaste(
+            "Could not extract login code from the pasted URL.".to_owned(),
+        ));
+    }
+    Ok(code)
+}
+
+fn parse_legacy_paste_success_url(
     pasted: &str,
     expected_state: &str,
 ) -> Result<(String, String), AuthLoginError> {
@@ -1758,7 +2303,80 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Persist fresh OAuth credentials for `env_name`. Returns `true` when the
+fn save_session_credentials_from_home(
+    env_name: &str,
+    home: &Path,
+    session: &SessionToken,
+    now: f64,
+) -> io::Result<bool> {
+    let credentials_path = credentials_file(home);
+    let mut credentials = read_json(&credentials_path).unwrap_or_else(|| Value::Object(Map::new()));
+    if !credentials.is_object() {
+        credentials = Value::Object(Map::new());
+    }
+
+    let previous_subject = stored_env_subject(&credentials, env_name);
+    let previous_auth_kind = stored_env_auth_kind(&credentials, env_name);
+    let root = credentials
+        .as_object_mut()
+        .expect("credentials value was normalized to an object");
+    root.insert("version".to_owned(), Value::from(2));
+    if !root.get("environments").is_some_and(Value::is_object) {
+        root.insert("environments".to_owned(), Value::Object(Map::new()));
+    }
+    let environments = root
+        .get_mut("environments")
+        .and_then(Value::as_object_mut)
+        .expect("environments was normalized to an object");
+
+    let logged_in_at = environments
+        .get(env_name)
+        .and_then(|entry| entry.get("logged_in_at"))
+        .and_then(value_as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| utc_timestamp(now));
+
+    let mut entry = Map::new();
+    entry.insert(
+        "authKind".to_owned(),
+        Value::String(RAYLINE_SESSION_AUTH_KIND.to_owned()),
+    );
+    entry.insert("subject".to_owned(), Value::String(session.subject.clone()));
+    entry.insert("email".to_owned(), Value::String(session.email.clone()));
+    entry.insert(
+        "accessToken".to_owned(),
+        Value::String(session.access_token.clone()),
+    );
+    entry.insert(
+        "accessTokenExpiresAtMs".to_owned(),
+        numeric_value(session.access_token_expires_at_ms),
+    );
+    entry.insert(
+        "refreshToken".to_owned(),
+        Value::String(session.refresh_token.clone()),
+    );
+    entry.insert(
+        "refreshTokenExpiresAtMs".to_owned(),
+        numeric_value(session.refresh_token_expires_at_ms),
+    );
+    entry.insert("logged_in_at".to_owned(), Value::String(logged_in_at));
+    environments.insert(env_name.to_owned(), Value::Object(entry));
+
+    let same_session_account = previous_auth_kind.as_deref() == Some(RAYLINE_SESSION_AUTH_KIND)
+        && previous_subject
+            .as_deref()
+            .is_some_and(|previous| previous == session.subject);
+    let cleared_router_key = !same_session_account
+        && root
+            .get_mut("router_keys")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|keys| keys.remove(env_name).is_some());
+
+    write_json_atomic(&credentials_path, &credentials)?;
+    Ok(cleared_router_key)
+}
+
+/// Persist fresh legacy Firebase credentials for `env_name`. Returns `true` when the
 /// stored router key for that environment was dropped because this login
 /// could not be proven to match the account it was minted under.
 fn save_env_credentials_from_home(
@@ -1833,6 +2451,37 @@ fn router_key_cleared_note(env_name: &str) -> String {
     )
 }
 
+fn stored_env_subject(credentials: &Value, env_name: &str) -> Option<String> {
+    let env_data = credentials
+        .get("environments")?
+        .as_object()?
+        .get(env_name)?
+        .as_object()?;
+    env_data
+        .get("subject")
+        .and_then(value_as_str)
+        .filter(|subject| !subject.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            env_data
+                .get("id_token")
+                .and_then(value_as_str)
+                .and_then(extract_sub_from_token)
+        })
+}
+
+fn stored_env_auth_kind(credentials: &Value, env_name: &str) -> Option<String> {
+    credentials
+        .get("environments")?
+        .as_object()?
+        .get(env_name)?
+        .as_object()?
+        .get("authKind")
+        .and_then(value_as_str)
+        .filter(|kind| !kind.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn extract_email_from_token(id_token: &str) -> Option<String> {
     decode_token_payload(id_token).and_then(|payload| {
         payload
@@ -1904,6 +2553,176 @@ fn required_login_string(data: &Value, key: &str) -> Result<String, AuthLoginErr
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| AuthLoginError::LoginFailed(format!("Login response missing {key}")))
+}
+
+fn required_response_string(data: &Value, key: &str, context: &str) -> Result<String, String> {
+    data.get(key)
+        .and_then(value_as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{context} failed: missing {key}"))
+}
+
+fn required_response_f64(data: &Value, key: &str, context: &str) -> Result<f64, String> {
+    data.get(key)
+        .and_then(value_as_f64)
+        .ok_or_else(|| format!("{context} failed: missing {key}"))
+}
+
+fn parse_session_token_response(data: &Value, context: &str) -> Result<SessionToken, String> {
+    Ok(SessionToken {
+        access_token: required_response_string(data, "accessToken", context)?,
+        refresh_token: required_response_string(data, "refreshToken", context)?,
+        access_token_expires_at_ms: required_response_f64(data, "accessTokenExpiresAtMs", context)?,
+        refresh_token_expires_at_ms: required_response_f64(
+            data,
+            "refreshTokenExpiresAtMs",
+            context,
+        )?,
+        subject: required_response_string(data, "subject", context)?,
+        email: data
+            .get("email")
+            .and_then(value_as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+fn parse_session_refresh_response(data: &Value, context: &str) -> Result<SessionToken, String> {
+    Ok(SessionToken {
+        access_token: required_response_string(data, "accessToken", context)?,
+        refresh_token: required_response_string(data, "refreshToken", context)?,
+        access_token_expires_at_ms: required_response_f64(data, "accessTokenExpiresAtMs", context)?,
+        refresh_token_expires_at_ms: required_response_f64(
+            data,
+            "refreshTokenExpiresAtMs",
+            context,
+        )?,
+        subject: data
+            .get("subject")
+            .and_then(value_as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        email: data
+            .get("email")
+            .and_then(value_as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+async fn refresh_rayline_session(
+    router_base_url: &str,
+    refresh_token: &str,
+) -> Result<SessionToken, AuthTokenError> {
+    let url = format!("{router_base_url}/v1/auth/cli/refresh");
+    let response = auth_http_client()
+        .map_err(|error| AuthTokenError::RefreshFailed(format!("Token refresh failed: {error}")))?
+        .post(url)
+        .json(&serde_json::json!({ "refreshToken": refresh_token }))
+        .send()
+        .await
+        .map_err(|error| {
+            AuthTokenError::RefreshFailed(format!(
+                "Token refresh failed: {}",
+                reqwest_error_message(error)
+            ))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AuthTokenError::RefreshFailed(http_error_message(
+            "Token refresh failed",
+            status.as_u16(),
+            &body,
+        )));
+    }
+
+    let data: Value = response.json().await.map_err(|error| {
+        AuthTokenError::RefreshFailed(format!(
+            "Token refresh failed: {}",
+            reqwest_error_message(error)
+        ))
+    })?;
+    parse_session_refresh_response(&data, "Token refresh").map_err(AuthTokenError::RefreshFailed)
+}
+
+fn session_revoke_request(env_name: &str, home: &Path) -> Option<(String, String)> {
+    let credentials = read_json(&credentials_file(home))?;
+    let env_data = credentials
+        .get("environments")?
+        .as_object()?
+        .get(env_name)?
+        .as_object()?;
+    if env_data
+        .get("authKind")
+        .and_then(value_as_str)
+        .is_some_and(|kind| kind != RAYLINE_SESSION_AUTH_KIND)
+    {
+        return None;
+    }
+    let token = env_data
+        .get("refreshToken")
+        .and_then(value_as_str)
+        .or_else(|| env_data.get("accessToken").and_then(value_as_str))
+        .filter(|token| !token.is_empty())?
+        .to_owned();
+    let hosted = resolve_hosted_environment(env_name, Some(home)).ok()?;
+    Some((hosted.router_url, token))
+}
+
+async fn revoke_rayline_session(router_base_url: &str, token: &str) -> Result<(), String> {
+    let url = format!("{router_base_url}/v1/auth/cli/revoke");
+    let response = auth_http_client()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?
+        .post(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "reason": "cli_logout" }))
+        .send()
+        .await
+        .map_err(|error| format!("failed to reach router: {}", reqwest_error_message(error)))?;
+
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        Err(http_error_message(
+            "session revoke failed",
+            status.as_u16(),
+            &body,
+        ))
+    }
+}
+
+fn http_error_message(context: &str, status_code: u16, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        format!("{context}: HTTP {status_code}")
+    } else {
+        format!("{context}: HTTP {status_code}: {body}")
+    }
+}
+
+fn env_auth_token() -> Option<(String, &'static str)> {
+    for source in ["RAYLINE_AUTH_TOKEN", "RAYLINE_ID_TOKEN"] {
+        if let Ok(token) = env::var(source) {
+            if !token.is_empty() {
+                return Some((token, source));
+            }
+        }
+    }
+    None
+}
+
+fn firebase_api_key(hosted: &HostedEnvironment) -> Result<String, AuthLoginError> {
+    hosted.firebase_api_key.clone().ok_or_else(|| {
+        AuthLoginError::LoginFailed(format!(
+            "Legacy Firebase auth is not configured for {}: missing firebase_api_key",
+            hosted.name
+        ))
+    })
 }
 
 fn open_browser(url: &str) {
@@ -2007,23 +2826,23 @@ pub(crate) async fn mint_router_key(
     env_name: &str,
     home: &Path,
     name: &str,
-    id_token: &str,
+    bearer_token: &str,
 ) -> Result<String, ClaudeLoginError> {
     let hosted = resolve_hosted_environment(env_name, Some(home))
         .map_err(|error| ClaudeLoginError::MintFailed(error.to_string()))?;
-    mint_router_key_at(&hosted.router_url, name, id_token).await
+    mint_router_key_at(&hosted.router_url, name, bearer_token).await
 }
 
 async fn mint_router_key_at(
     router_base_url: &str,
     name: &str,
-    id_token: &str,
+    bearer_token: &str,
 ) -> Result<String, ClaudeLoginError> {
     let url = format!("{router_base_url}/v1/keys");
     let response = auth_http_client()
         .map_err(|error| ClaudeLoginError::MintFailed(format!("Failed to reach router: {error}")))?
         .post(url)
-        .bearer_auth(id_token)
+        .bearer_auth(bearer_token)
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await
@@ -2074,9 +2893,9 @@ pub(crate) async fn provision_router_key(
     env_name: &str,
     home: &Path,
     name: &str,
-    id_token: &str,
+    bearer_token: &str,
 ) -> Result<String, ClaudeLoginError> {
-    let api_key = mint_router_key(env_name, home, name, id_token).await?;
+    let api_key = mint_router_key(env_name, home, name, bearer_token).await?;
     save_claude_key_from_home(env_name, home, &api_key, unix_now_secs())?;
     Ok(api_key)
 }
@@ -2091,7 +2910,13 @@ fn required_string(data: &Value, key: &str) -> Result<String, AuthTokenError> {
         })
 }
 
-fn stored_status(env_name: &str, home: &Path, env_token: Option<&str>) -> Option<StoredStatus> {
+fn stored_status(
+    env_name: &str,
+    home: &Path,
+    env_token: Option<&str>,
+    env_token_source: Option<&str>,
+    expected_auth_kind: Option<HostedAuthKind>,
+) -> Option<StoredStatus> {
     if env_token.is_some_and(|token| !token.is_empty()) {
         return Some(StoredStatus {
             email: "(env-var token)".to_owned(),
@@ -2099,7 +2924,8 @@ fn stored_status(env_name: &str, home: &Path, env_token: Option<&str>) -> Option
             env_name: env_name.to_owned(),
             logged_in_at: String::new(),
             refresh_margin: TOKEN_REFRESH_MARGIN_SECONDS,
-            auth_source: "RAYLINE_ID_TOKEN".to_owned(),
+            auth_source: env_token_source.unwrap_or("RAYLINE_AUTH_TOKEN").to_owned(),
+            env_token: true,
         });
     }
 
@@ -2110,16 +2936,39 @@ fn stored_status(env_name: &str, home: &Path, env_token: Option<&str>) -> Option
         .get(env_name)?
         .as_object()?;
 
+    let auth_kind = env_data
+        .get("authKind")
+        .and_then(value_as_str)
+        .unwrap_or(LEGACY_FIREBASE_AUTH_KIND);
+    match expected_auth_kind {
+        Some(HostedAuthKind::RaylineSession) if auth_kind != RAYLINE_SESSION_AUTH_KIND => {
+            return None;
+        }
+        Some(HostedAuthKind::FirebaseLegacy) if auth_kind == RAYLINE_SESSION_AUTH_KIND => {
+            return None;
+        }
+        _ => {}
+    }
+    let expires_at = if auth_kind == RAYLINE_SESSION_AUTH_KIND {
+        env_data
+            .get("accessTokenExpiresAtMs")
+            .and_then(value_as_f64)
+            .map(|value| value / 1000.0)
+            .unwrap_or(0.0)
+    } else {
+        env_data
+            .get("id_token_expires_at")
+            .and_then(value_as_f64)
+            .unwrap_or(0.0)
+    };
+
     Some(StoredStatus {
         email: env_data
             .get("email")
             .and_then(value_as_str)
             .unwrap_or_default()
             .to_owned(),
-        expires_at: env_data
-            .get("id_token_expires_at")
-            .and_then(value_as_f64)
-            .unwrap_or(0.0),
+        expires_at,
         env_name: env_name.to_owned(),
         logged_in_at: env_data
             .get("logged_in_at")
@@ -2127,7 +2976,8 @@ fn stored_status(env_name: &str, home: &Path, env_token: Option<&str>) -> Option
             .unwrap_or_default()
             .to_owned(),
         refresh_margin: TOKEN_REFRESH_MARGIN_SECONDS,
-        auth_source: "oauth".to_owned(),
+        auth_source: auth_kind.to_owned(),
+        env_token: false,
     })
 }
 
@@ -2313,6 +3163,7 @@ struct StoredStatus {
     logged_in_at: String,
     refresh_margin: f64,
     auth_source: String,
+    env_token: bool,
 }
 
 struct RefreshedToken {
@@ -2321,9 +3172,27 @@ struct RefreshedToken {
     expires_in: i64,
 }
 
+struct SessionToken {
+    access_token: String,
+    refresh_token: String,
+    access_token_expires_at_ms: f64,
+    refresh_token_expires_at_ms: f64,
+    subject: String,
+    email: String,
+}
+
 struct LoginToken {
     refreshed: RefreshedToken,
     email: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RaylineDeviceSession {
+    session_id: String,
+    user_code: String,
+    verification_uri: String,
+    interval_seconds: i64,
+    expires_in_seconds: i64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2367,6 +3236,26 @@ mod tests {
         ))
     }
 
+    fn sample_session(subject: &str, access_token: &str, refresh_token: &str) -> SessionToken {
+        SessionToken {
+            access_token: access_token.to_owned(),
+            refresh_token: refresh_token.to_owned(),
+            access_token_expires_at_ms: 3_600_000.0,
+            refresh_token_expires_at_ms: 86_400_000.0,
+            subject: subject.to_owned(),
+            email: format!("{subject}@example.com"),
+        }
+    }
+
+    fn fake_jwt_with_subject(subject: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({ "sub": subject, "email": format!("{subject}@example.com") })
+                .to_string(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
     #[test]
     fn render_status_ignores_empty_env_token() {
         let home = temp_home("empty-token");
@@ -2390,7 +3279,7 @@ mod tests {
         let output = render_status_from_home("dev", &home, Some(""), 0.0);
 
         assert!(output.contains("Email:       dev@example.com"));
-        assert!(output.contains("Auth source: oauth"));
+        assert!(output.contains("Auth source: firebase"));
         assert!(!output.contains("RAYLINE_ID_TOKEN"));
 
         let _ = fs::remove_dir_all(&home);
@@ -2409,15 +3298,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_hosted_environment_rejects_unconfigured_prod() {
-        let error =
-            resolve_hosted_environment(&resolve_env(None, None), None).expect_err("prod env");
+    fn resolve_hosted_environment_reads_builtin_prod() {
+        let hosted = resolve_hosted_environment(&resolve_env(None, None), None).expect("prod env");
 
-        assert!(
-            error
-                .to_string()
-                .contains("Hosted Rayline auth is not included")
-        );
+        assert_eq!(hosted.name, "prod");
+        assert_eq!(hosted.router_url, crate::ROUTER_PROD_URL);
+        assert_eq!(hosted.cli_auth_url, PROD_CLI_AUTH_URL);
+        assert_eq!(hosted.auth_kind, HostedAuthKind::RaylineSession);
+        assert!(hosted.firebase_api_key.is_none());
+        assert!(hosted.google_device_client_id.is_none());
+        assert!(hosted.google_device_client_secret.is_none());
     }
 
     #[test]
@@ -2455,7 +3345,8 @@ mod tests {
             hosted.account_url.as_deref(),
             Some("https://platform.example.test")
         );
-        assert_eq!(hosted.firebase_api_key, "firebase-key");
+        assert_eq!(hosted.auth_kind, HostedAuthKind::FirebaseLegacy);
+        assert_eq!(hosted.firebase_api_key.as_deref(), Some("firebase-key"));
         assert_eq!(hosted.google_device_client_id.as_deref(), Some("client-id"));
         assert_eq!(
             hosted.google_device_client_secret.as_deref(),
@@ -2606,8 +3497,35 @@ mod tests {
 
         assert!(output.contains("Logged out (prod)"));
         assert!(output.contains("Cleared prod router key."));
-        assert!(stored_status("prod", &home, None).is_none());
+        assert!(stored_status("prod", &home, None, None, None).is_none());
         assert!(load_claude_key_from_home("prod", &home).is_none());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn render_status_rejects_legacy_credentials_for_session_environment() {
+        let home = temp_home("status-session-env");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+        let legacy = RefreshedToken {
+            id_token: fake_jwt_with_subject("sub-one"),
+            refresh_token: "legacy-refresh".to_owned(),
+            expires_in: 3600,
+        };
+        save_env_credentials_from_home("prod", &home, &legacy, "sub-one@example.com", 0.0)
+            .expect("save legacy credentials");
+
+        let output = render_status_from_home_with_source(
+            "prod",
+            &home,
+            None,
+            None,
+            Some(HostedAuthKind::RaylineSession),
+            0.0,
+        );
+
+        assert!(output.contains("Not logged in"));
 
         let _ = fs::remove_dir_all(&home);
     }
@@ -2627,13 +3545,206 @@ mod tests {
             .expect("save credentials");
         save_claude_key_from_home("foo", &home, "rk_foo", 0.0).expect("save router key");
 
-        assert!(stored_status("foo", &home, None).is_some());
-        assert!(stored_status("prod", &home, None).is_none());
+        assert!(stored_status("foo", &home, None, None, None).is_some());
+        assert!(stored_status("prod", &home, None, None, None).is_none());
         assert_eq!(
             load_claude_key_from_home("foo", &home).as_deref(),
             Some("rk_foo")
         );
         assert!(load_claude_key_from_home("prod", &home).is_none());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn session_credentials_use_opaque_shape_and_clear_stale_router_key() {
+        let home = temp_home("session-storage");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let first = sample_session("sub-one", "rls_first", "rlr_first");
+        save_session_credentials_from_home("prod", &home, &first, 0.0).expect("save first session");
+        save_claude_key_from_home("prod", &home, "rlk-first", 1.0).expect("save router key");
+
+        let credentials = read_json(&credentials_file(&home)).expect("credentials");
+        let key = credentials
+            .get("router_keys")
+            .and_then(Value::as_object)
+            .and_then(|keys| keys.get("prod"))
+            .and_then(Value::as_object)
+            .expect("router key");
+        assert_eq!(key.get("apiKey").and_then(value_as_str), Some("rlk-first"));
+        assert_eq!(key.get("subject").and_then(value_as_str), Some("sub-one"));
+
+        let second = sample_session("sub-two", "rls_second", "rlr_second");
+        let cleared = save_session_credentials_from_home("prod", &home, &second, 2.0)
+            .expect("save second session");
+        assert!(cleared);
+        assert!(load_claude_key_from_home("prod", &home).is_none());
+
+        let credentials = read_json(&credentials_file(&home)).expect("credentials");
+        let env_data = credentials
+            .get("environments")
+            .and_then(Value::as_object)
+            .and_then(|envs| envs.get("prod"))
+            .and_then(Value::as_object)
+            .expect("prod credentials");
+        assert_eq!(
+            env_data.get("authKind").and_then(value_as_str),
+            Some(RAYLINE_SESSION_AUTH_KIND)
+        );
+        assert_eq!(
+            env_data.get("subject").and_then(value_as_str),
+            Some("sub-two")
+        );
+        assert_eq!(
+            env_data.get("accessToken").and_then(value_as_str),
+            Some("rls_second")
+        );
+        assert_eq!(
+            env_data.get("refreshToken").and_then(value_as_str),
+            Some("rlr_second")
+        );
+
+        let output = render_status_from_home("prod", &home, None, 10.0);
+        assert!(output.contains("Auth source: rayline_session"));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn session_login_clears_legacy_router_key_even_for_same_subject() {
+        let home = temp_home("session-clears-legacy-key");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+        let legacy = RefreshedToken {
+            id_token: fake_jwt_with_subject("sub-one"),
+            refresh_token: "legacy-refresh".to_owned(),
+            expires_in: 3600,
+        };
+        save_env_credentials_from_home("prod", &home, &legacy, "sub-one@example.com", 0.0)
+            .expect("save legacy credentials");
+        save_claude_key_from_home("prod", &home, "rlk-legacy", 1.0)
+            .expect("save legacy router key");
+
+        let session = sample_session("sub-one", "rls_session", "rlr_session");
+        let cleared = save_session_credentials_from_home("prod", &home, &session, 2.0)
+            .expect("save session credentials");
+
+        assert!(cleared);
+        assert!(load_claude_key_from_home("prod", &home).is_none());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn resolve_session_token_refreshes_expired_access_token() {
+        let home = temp_home("session-refresh");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let expired = SessionToken {
+            access_token: "rls_old".to_owned(),
+            refresh_token: "rlr_old".to_owned(),
+            access_token_expires_at_ms: 1_000.0,
+            refresh_token_expires_at_ms: 86_400_000.0,
+            subject: "sub-one".to_owned(),
+            email: "one@example.com".to_owned(),
+        };
+        save_session_credentials_from_home("prod", &home, &expired, 0.0)
+            .expect("save expired session");
+
+        let outcome = resolve_session_token_from_home_with_refresher(
+            "prod",
+            &home,
+            10.0,
+            |refresh, _env| async move {
+                assert_eq!(refresh, "rlr_old");
+                Ok(SessionToken {
+                    access_token: "rls_new".to_owned(),
+                    refresh_token: "rlr_new".to_owned(),
+                    access_token_expires_at_ms: 3_600_000.0,
+                    refresh_token_expires_at_ms: 86_400_000.0,
+                    subject: "sub-one".to_owned(),
+                    email: "one@example.com".to_owned(),
+                })
+            },
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(outcome, AuthTokenOutcome::Token("rls_new".to_owned()));
+        let credentials = read_json(&credentials_file(&home)).expect("credentials");
+        let env_data = credentials
+            .get("environments")
+            .and_then(Value::as_object)
+            .and_then(|envs| envs.get("prod"))
+            .and_then(Value::as_object)
+            .expect("prod credentials");
+        assert_eq!(
+            env_data.get("accessToken").and_then(value_as_str),
+            Some("rls_new")
+        );
+        assert_eq!(
+            env_data.get("refreshToken").and_then(value_as_str),
+            Some("rlr_new")
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn resolve_session_token_refresh_preserves_identity_when_response_omits_it() {
+        let home = temp_home("session-refresh-identity");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+
+        let expired = SessionToken {
+            access_token: "rls_old".to_owned(),
+            refresh_token: "rlr_old".to_owned(),
+            access_token_expires_at_ms: 1_000.0,
+            refresh_token_expires_at_ms: 86_400_000.0,
+            subject: "sub-one".to_owned(),
+            email: "one@example.com".to_owned(),
+        };
+        save_session_credentials_from_home("prod", &home, &expired, 0.0)
+            .expect("save expired session");
+
+        let outcome = resolve_session_token_from_home_with_refresher(
+            "prod",
+            &home,
+            10.0,
+            |refresh, _env| async move {
+                assert_eq!(refresh, "rlr_old");
+                Ok(SessionToken {
+                    access_token: "rls_new".to_owned(),
+                    refresh_token: "rlr_new".to_owned(),
+                    access_token_expires_at_ms: 3_600_000.0,
+                    refresh_token_expires_at_ms: 86_400_000.0,
+                    subject: String::new(),
+                    email: String::new(),
+                })
+            },
+        )
+        .await
+        .expect("refresh");
+
+        assert_eq!(outcome, AuthTokenOutcome::Token("rls_new".to_owned()));
+        let credentials = read_json(&credentials_file(&home)).expect("credentials");
+        let env_data = credentials
+            .get("environments")
+            .and_then(Value::as_object)
+            .and_then(|envs| envs.get("prod"))
+            .and_then(Value::as_object)
+            .expect("prod credentials");
+        assert_eq!(
+            env_data.get("subject").and_then(value_as_str),
+            Some("sub-one")
+        );
+        assert_eq!(
+            env_data.get("email").and_then(value_as_str),
+            Some("one@example.com")
+        );
 
         let _ = fs::remove_dir_all(&home);
     }

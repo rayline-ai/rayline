@@ -567,7 +567,7 @@ async fn ensure_router_key(
         .map_err(|error| RunError::KeyProvision(error.to_string()))
 }
 
-/// Return the Firebase ID token for `env_name`, launching the interactive
+/// Return an account bearer token for `env_name`, launching the interactive
 /// sign-in flow when no usable credentials are stored. Returns `Ok(None)` when
 /// no token is available and we cannot prompt (non-interactive session), so the
 /// caller can fall back to the existing "not logged in" error.
@@ -899,7 +899,7 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the caller's router settings once per launch. Prefer OAuth credentials
+/// Fetch the caller's router settings once per launch. Prefer account credentials
 /// when available, but fall back to the already-provisioned router key because
 /// the router accepts either bearer form. `None` on request failure or an error
 /// payload, so callers fall back to safe defaults.
@@ -911,7 +911,7 @@ async fn fetch_router_settings(
 ) -> Option<Value> {
     let token_request = crate::status::AuthTokenRequest {
         env_name: Some(env_name.to_owned()),
-        // Honor an explicit `--auth-token` first; when OAuth credentials are
+        // Honor an explicit `--auth-token` first; when account credentials are
         // absent or expired, the stored router key below can still read settings.
         auth_token: auth_token.map(ToOwned::to_owned),
         root_env_explicit: false,
