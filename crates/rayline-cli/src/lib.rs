@@ -283,11 +283,11 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::AuthToken(request) => match status::resolve_auth_token(&request).await {
-            Ok(status::AuthTokenOutcome::Token(token)) => {
-                println!("{token}");
+            Ok(status::AuthTokenOutcome::Available(value)) => {
+                println!("{value}");
                 ExitCode::SUCCESS
             }
-            Ok(status::AuthTokenOutcome::NotLoggedIn(env_name)) => {
+            Ok(status::AuthTokenOutcome::NotLoggedIn { env_name }) => {
                 eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
                 ExitCode::from(1)
             }

@@ -78,8 +78,8 @@ pub struct ClaudeLogoutRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthTokenOutcome {
-    Token(String),
-    NotLoggedIn(String),
+    Available(String),
+    NotLoggedIn { env_name: String },
 }
 
 #[derive(Debug)]
@@ -338,17 +338,17 @@ pub(crate) fn render_status(request: &StatusRequest) -> Result<String, HostedEnv
 pub async fn resolve_auth_token(
     request: &AuthTokenRequest,
 ) -> Result<AuthTokenOutcome, AuthTokenError> {
-    if let Some(token) = request.auth_token.as_deref() {
-        return Ok(AuthTokenOutcome::Token(token.to_owned()));
+    if let Some(value) = request.auth_token.as_deref() {
+        return Ok(AuthTokenOutcome::Available(value.to_owned()));
     }
-    if let Some((token, _source)) = env_auth_token() {
-        return Ok(AuthTokenOutcome::Token(token));
+    if let Some((value, _source)) = env_auth_token() {
+        return Ok(AuthTokenOutcome::Available(value));
     }
 
     let home = dirs::home_dir();
     let env_name = resolve_env(request.env_name.as_deref(), home.as_deref());
     let Some(home) = home else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name));
+        return Ok(AuthTokenOutcome::NotLoggedIn { env_name });
     };
 
     resolve_auth_token_from_home(&env_name, &home, unix_now_secs()).await
@@ -414,7 +414,9 @@ where
     Fut: std::future::Future<Output = Result<SessionToken, AuthTokenError>>,
 {
     let Some(credentials) = read_json(&credentials_file(home)) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
     let Some(env_data) = credentials
         .get("environments")
@@ -422,7 +424,9 @@ where
         .and_then(|envs| envs.get(env_name))
         .and_then(Value::as_object)
     else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
 
     if env_data
@@ -430,7 +434,9 @@ where
         .and_then(value_as_str)
         .is_some_and(|kind| kind != RAYLINE_SESSION_AUTH_KIND)
     {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     }
 
     let access_token = env_data
@@ -444,14 +450,18 @@ where
         .unwrap_or(0.0);
 
     if !access_token.is_empty() && access_expires_at - now > TOKEN_REFRESH_MARGIN_SECONDS {
-        return Ok(AuthTokenOutcome::Token(access_token.to_owned()));
+        return Ok(AuthTokenOutcome::Available(access_token.to_owned()));
     }
 
     let Some(refresh_token) = env_data.get("refreshToken").and_then(value_as_str) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
     if refresh_token.is_empty() {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     }
 
     let stored_subject = env_data
@@ -480,7 +490,7 @@ where
     save_session_credentials_from_home(env_name, home, &refreshed, now)
         .map_err(AuthTokenError::WriteFailed)?;
 
-    Ok(AuthTokenOutcome::Token(refreshed.access_token))
+    Ok(AuthTokenOutcome::Available(refreshed.access_token))
 }
 
 async fn resolve_legacy_firebase_token_from_home_with_refresher<F, Fut>(
@@ -494,7 +504,9 @@ where
     Fut: std::future::Future<Output = Result<RefreshedToken, AuthTokenError>>,
 {
     let Some(credentials) = read_json(&credentials_file(home)) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
     let Some(env_data) = credentials
         .get("environments")
@@ -502,14 +514,20 @@ where
         .and_then(|envs| envs.get(env_name))
         .and_then(Value::as_object)
     else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
 
     let Some(refresh_token) = env_data.get("refresh_token").and_then(value_as_str) else {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     };
     if refresh_token.is_empty() {
-        return Ok(AuthTokenOutcome::NotLoggedIn(env_name.to_owned()));
+        return Ok(AuthTokenOutcome::NotLoggedIn {
+            env_name: env_name.to_owned(),
+        });
     }
 
     let id_token = env_data
@@ -522,7 +540,7 @@ where
         .unwrap_or(0.0);
 
     if !id_token.is_empty() && expires_at - now > TOKEN_REFRESH_MARGIN_SECONDS {
-        return Ok(AuthTokenOutcome::Token(id_token.to_owned()));
+        return Ok(AuthTokenOutcome::Available(id_token.to_owned()));
     }
 
     let refreshed = refresh(refresh_token.to_owned(), env_name.to_owned()).await?;
@@ -552,7 +570,7 @@ where
     );
     write_json_atomic(&credentials_file(home), &updated).map_err(AuthTokenError::WriteFailed)?;
 
-    Ok(AuthTokenOutcome::Token(refreshed.id_token))
+    Ok(AuthTokenOutcome::Available(refreshed.id_token))
 }
 
 pub async fn logout(request: &AuthLogoutRequest) -> io::Result<String> {
@@ -1158,9 +1176,8 @@ fn write_interactive_message(message: &str) -> io::Result<()> {
     match fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(mut tty) => tty.write_all(message.as_bytes()),
         Err(_) => {
-            let mut stderr = io::stderr().lock();
-            stderr.write_all(message.as_bytes())?;
-            stderr.flush()
+            eprint!("{message}");
+            Ok(())
         }
     }
 }
@@ -1369,8 +1386,10 @@ pub async fn claude_login(request: &ClaudeLoginRequest) -> Result<String, Claude
         root_env_explicit: request.root_env_explicit,
     };
     let token = match resolve_auth_token(&token_request).await? {
-        AuthTokenOutcome::Token(token) => token,
-        AuthTokenOutcome::NotLoggedIn(_) => return Err(ClaudeLoginError::NotLoggedIn(env_name)),
+        AuthTokenOutcome::Available(token) => token,
+        AuthTokenOutcome::NotLoggedIn { .. } => {
+            return Err(ClaudeLoginError::NotLoggedIn(env_name));
+        }
     };
     let Some(home) = home else {
         return Err(ClaudeLoginError::WriteFailed(io::Error::new(
@@ -3673,7 +3692,7 @@ mod tests {
         .await
         .expect("refresh");
 
-        assert_eq!(outcome, AuthTokenOutcome::Token("rls_new".to_owned()));
+        assert_eq!(outcome, AuthTokenOutcome::Available("rls_new".to_owned()));
         let credentials = read_json(&credentials_file(&home)).expect("credentials");
         let env_data = credentials
             .get("environments")
@@ -3729,7 +3748,7 @@ mod tests {
         .await
         .expect("refresh");
 
-        assert_eq!(outcome, AuthTokenOutcome::Token("rls_new".to_owned()));
+        assert_eq!(outcome, AuthTokenOutcome::Available("rls_new".to_owned()));
         let credentials = read_json(&credentials_file(&home)).expect("credentials");
         let env_data = credentials
             .get("environments")
