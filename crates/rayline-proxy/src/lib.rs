@@ -538,6 +538,33 @@ async fn handle_anthropic_request(state: AppState, req: Request<Incoming>) -> Re
     }
 }
 
+/// Detect the "agent-id present but type unresolved" state, emit a `warn!`,
+/// and increment the `routing_uncertain` counter.  Extracted from
+/// `forward_anthropic_request` so the branch can be unit-tested without
+/// standing up the full async HTTP machinery.
+///
+/// Returns `true` when the uncertain branch fired (i.e. the counter was
+/// incremented), `false` otherwise.
+fn emit_if_agent_type_unresolved(
+    agent_id_present: bool,
+    agent_type: Option<&str>,
+    agent_id: String,
+    metrics: Option<&SharedMetricsSink>,
+) -> bool {
+    let unresolved = agent_id_present && agent_type.is_none();
+    if unresolved {
+        warn!(
+            "proxy agent-type resolution exhausted retries: agent_id={} — \
+             Claude Code meta file not found; routing uncertain",
+            agent_id
+        );
+        if let Some(metrics) = metrics {
+            metrics.record(MetricsUpdate::RoutingUncertain { agent_id });
+        }
+    }
+    unresolved
+}
+
 async fn forward_anthropic_request(
     state: AppState,
     req: Request<Incoming>,
@@ -562,19 +589,12 @@ async fn forward_anthropic_request(
     // meta file was never found. This most likely means Claude Code changed
     // its schema or path layout. Emit a warning and bump the counter so
     // operators notice rather than silently degrading.
-    let agent_type_unresolved = agent_id_present && agent_type.is_none();
-    if agent_type_unresolved {
-        warn!(
-            "proxy agent-type resolution exhausted retries: agent_id={} — \
-             Claude Code meta file not found; routing uncertain",
-            agent_id
-        );
-        if let Some(metrics) = state.opts.metrics.as_ref() {
-            metrics.record(MetricsUpdate::RoutingUncertain {
-                agent_id: agent_id.clone(),
-            });
-        }
-    }
+    let agent_type_unresolved = emit_if_agent_type_unresolved(
+        agent_id_present,
+        agent_type.as_deref(),
+        agent_id.clone(),
+        state.opts.metrics.as_ref(),
+    );
     let routed = prepare_anthropic_route_with_subagent_filter(
         &parts.method,
         parts.uri.path(),
@@ -3754,25 +3774,59 @@ mod tests {
         assert!(!path.exists(), "stale generation should not write status");
     }
 
-    /// Golden contract: parse a REAL captured Claude Code agent meta file and
-    /// assert the `agentType` field name and shape. This test FAILS if Claude
-    /// Code renames the field or restructures the JSON — that is the intent.
-    /// The fixture at `tests/fixtures/agent-test.meta.json` was sanitized from
-    /// an actual capture (description scrubbed; agentType value kept verbatim).
+    /// Golden contract: the PRODUCTION resolver (`resolve_claude_code_agent_type_from_roots`)
+    /// must find `agentType` in a real captured Claude Code agent meta file.
+    ///
+    /// This test FAILS if Claude Code renames the field, restructures the JSON, or changes
+    /// the path layout — that is the intent.  The fixture at
+    /// `tests/fixtures/agent-test.meta.json` was sanitized from an actual capture
+    /// (description scrubbed; agentType value kept verbatim).
+    ///
+    /// Path layout written to a temp dir:
+    ///   <projects_root>/<project-dir>/<session-dir>/subagents/agent-<id>.meta.json
+    ///
+    /// The agent-id header sent by Claude Code is `x-claude-code-agent-id`.
     #[test]
     fn golden_contract_pins_cc_agent_metadata_shape() {
-        let raw = include_str!("../tests/fixtures/agent-test.meta.json");
-        let value: serde_json::Value =
-            serde_json::from_str(raw).expect("fixture must be valid JSON");
-        // The field name is `agentType` (camelCase). If CC renames it this
-        // assertion fails, making breakage explicit rather than silent.
-        let agent_type = value
-            .get("agentType")
-            .and_then(serde_json::Value::as_str)
-            .expect("fixture must contain a non-null string field `agentType`");
+        // The header name Claude Code uses to identify the subagent.
         assert_eq!(
-            agent_type, "general-purpose",
-            "agentType value in the real capture must match; update fixture if CC changes values"
+            CLAUDE_CODE_AGENT_ID_HEADER, "x-claude-code-agent-id",
+            "header constant must match the documented CC header name"
+        );
+
+        let fixture_content = include_str!("../tests/fixtures/agent-test.meta.json");
+        let agent_id = "aaea8a9732b057638";
+        let filename = format!("agent-{agent_id}.meta.json");
+
+        // Build the path layout the production resolver walks:
+        //   <projects_root>/<project-dir>/<session-dir>/subagents/agent-<id>.meta.json
+        let tmp = std::env::temp_dir().join(format!(
+            "rayline-golden-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects_root = tmp.clone();
+        let project_dir = projects_root.join("some-project-dir");
+        let session_dir = project_dir.join("some-session-dir");
+        let subagents_dir = session_dir.join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create temp fixture dir");
+        let meta_path = subagents_dir.join(&filename);
+        fs::write(&meta_path, fixture_content).expect("write fixture");
+
+        // Call the PRODUCTION resolver — not raw JSON parsing.
+        let result = resolve_claude_code_agent_type_from_roots(&filename, &[projects_root], None);
+
+        // Clean up before asserting so failure doesn't leave temp files.
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            result,
+            Some("general-purpose".to_owned()),
+            "production resolver must find agentType=general-purpose from fixture; \
+             update fixture if CC changes the field name or value"
         );
     }
 
@@ -3791,5 +3845,60 @@ mod tests {
             agent_id: "def456".to_owned(),
         });
         assert_eq!(metrics.snapshot().totals.routing_uncertain, 2);
+    }
+
+    /// Exercises the proxy's own warn+counter branch via the extracted helper
+    /// `emit_if_agent_type_unresolved`.  Because `forward_anthropic_request`
+    /// delegates to this helper, deleting or bypassing the helper in the async
+    /// function causes this test to fail.
+    ///
+    /// Scenario: `agent_id` was present in the request (agent_id_present=true)
+    /// but resolution exhausted all retries (agent_type=None).
+    #[test]
+    fn proxy_branch_increments_routing_uncertain_when_agent_type_unresolved() {
+        let metrics = rayline_metrics::RouterMetrics::new("test-proxy-branch");
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+
+        // agent_id present, type not resolved → must warn and increment.
+        let incremented = emit_if_agent_type_unresolved(
+            true,
+            None,
+            "agent-xyz".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(incremented, "must return true when the uncertain branch fires");
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must increment via the proxy branch helper"
+        );
+
+        // agent_id present, type resolved → must NOT increment.
+        let incremented = emit_if_agent_type_unresolved(
+            true,
+            Some("Explore"),
+            "agent-xyz".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(!incremented, "must return false when type is resolved");
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must not increment when type is resolved"
+        );
+
+        // agent_id absent → must NOT increment even if type is also absent.
+        let incremented = emit_if_agent_type_unresolved(
+            false,
+            None,
+            "<none>".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(!incremented, "must return false when agent_id is absent");
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must not increment when agent_id is absent"
+        );
     }
 }

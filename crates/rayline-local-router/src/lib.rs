@@ -539,7 +539,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed);
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(header_str)
@@ -722,6 +722,34 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         },
         route_id,
     }
+}
+
+/// Thin wrapper around `select_route` that detects the inconsistent state where
+/// `is_subagent` resolved to `true` but no `agent_id` header was present.
+/// When that happens the function emits a `warn!` and increments the
+/// `routing_uncertain` counter so operators notice rather than silently
+/// degrading.  This state should be impossible in normal operation — its
+/// occurrence means the `agent_type` header was set by some external caller
+/// without a corresponding `agent_id`, or the subagent model name was used
+/// without an `agent_id` header.
+fn select_route_with_warn(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
+    let decision = select_route(state, headers, body);
+    let agent_id = headers
+        .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .and_then(header_str);
+    if decision.task_class == "subagent" && agent_id.is_none() {
+        warn!(
+            "local router: subagent flagged with no agent id — \
+             agent_type header set without agent_id or DEFAULT_SUBAGENT_MODEL \
+             used without agent_id header; routing uncertain"
+        );
+        if let Some(metrics) = state.opts.metrics.as_ref() {
+            metrics.record(MetricsUpdate::RoutingUncertain {
+                agent_id: "<none>".to_owned(),
+            });
+        }
+    }
+    decision
 }
 
 fn header_str(value: &HeaderValue) -> Option<&str> {
@@ -2200,6 +2228,43 @@ mod tests {
             decision.task_class, "main",
             "main virtual model request must be classified as main, not subagent, \
              even when a stray agent_id header is present"
+        );
+    }
+
+    /// When `is_subagent` is true but `agent_id` is None (e.g. because
+    /// `agent_type` header is present without an `agent_id` header, or the
+    /// request uses `DEFAULT_SUBAGENT_MODEL` with no agent_id header),
+    /// `select_route_with_warn` must increment the `routing_uncertain` counter
+    /// and emit a warning.  This is an inconsistent/impossible state in normal
+    /// operation, so surfacing it makes schema changes observable.
+    #[test]
+    fn subagent_without_agent_id_increments_routing_uncertain_counter() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let mut opts = LocalRouterOptions::default();
+        opts.metrics = Some(metrics.clone());
+        let app_state = AppState {
+            opts: Arc::new(opts),
+            config: Arc::new(default_config("local-model")),
+            http: reqwest::Client::new(),
+            route_counter: Arc::new(AtomicU64::new(1)),
+            started_at: "0".to_owned(),
+        };
+
+        // agent_type header is set but NO agent_id header — this triggers
+        // is_subagent=true while agent_id=None.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+        select_route_with_warn(&app_state, &headers, &body);
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "routing_uncertain must increment when is_subagent=true but agent_id is None"
         );
     }
 }
