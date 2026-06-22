@@ -105,6 +105,25 @@ download() {
 }
 
 download "$base_url/SHA256SUMS" "$tmp_dir/SHA256SUMS"
+
+# Signature verification (best-effort: required when minisign is available).
+if command -v minisign >/dev/null 2>&1; then
+  download "$base_url/SHA256SUMS.minisig" "$tmp_dir/SHA256SUMS.minisig"
+  # TODO(release): replace this placeholder with the production public key before shipping.
+  #                See RELEASING-SIGNING.md.
+  RAYLINE_PUBKEY="${RAYLINE_MINISIGN_PUBKEY:-RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP}"
+  if ! minisign -Vm "$tmp_dir/SHA256SUMS" -P "$RAYLINE_PUBKEY" >/dev/null 2>&1; then
+    echo "error: SHA256SUMS signature verification failed. The release may be tampered." >&2
+    echo "       To override (not recommended), uninstall minisign before running this script." >&2
+    exit 1
+  fi
+  echo "SHA256SUMS signature verified."
+else
+  printf 'Notice: minisign not found — skipping signature verification.\n' >&2
+  printf '        Install minisign for supply-chain protection: https://jedisct1.github.io/minisign/\n' >&2
+  printf '        Proceeding over HTTPS (TOFU).\n' >&2
+fi
+
 download "$base_url/$rayline_asset" "$tmp_dir/$rayline_asset"
 download "$base_url/$daemon_asset" "$tmp_dir/$daemon_asset"
 

@@ -25,6 +25,12 @@ pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".config/rayline/claude-daemon-launches
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
 pub const RAYLINE_CHANNEL: &str = env!("RAYLINE_CHANNEL");
 
+// TODO(release): replace with the real production minisign public key before shipping — see RELEASING-SIGNING.md
+// This is a TEST placeholder generated for development. NOT the production key.
+pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
+    "RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP", // test placeholder — REPLACE BEFORE SHIPPING
+];
+
 const ROOT_HELP: &str = "\
 Usage: rayline [OPTIONS] COMMAND [ARGS]...
 
