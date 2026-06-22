@@ -1848,7 +1848,7 @@ async fn start_proxy_from_home_with_client(
         stop_proxy(&paths, client, &mut output, true).await?;
     }
 
-    let metrics_url = metrics_url_from_router_meta(home);
+    let metrics_url = serve_metrics_forward_url(home, client).await;
     let self_hosted_metrics_port = metrics_url
         .is_none()
         .then(|| resolve_metrics_port(isolated));
@@ -2410,12 +2410,31 @@ fn router_meta(
     meta
 }
 
-fn metrics_url_from_router_meta(home: &Path) -> Option<String> {
-    let meta = read_meta(&RouterPaths::new(home).meta_file);
-    if meta.is_empty() {
+/// The serve daemon's metrics-control URL the proxy should forward to, or
+/// `None` when the proxy should self-host its own metrics instead.
+///
+/// Forwarding is chosen only when a serve daemon is actually live. Stale serve
+/// meta left behind by a crashed daemon must not pin a cloud-only proxy to a
+/// dead endpoint — that would leave `rayline top` with no metrics. The empty
+/// fast-path skips the liveness probe entirely for the common cloud-only launch
+/// where no serve daemon has ever published meta.
+async fn serve_metrics_forward_url(home: &Path, client: &reqwest::Client) -> Option<String> {
+    let paths = RouterPaths::new(home);
+    let serve_meta = read_meta(&paths.meta_file);
+    if serve_meta.is_empty() {
         return None;
     }
-    let port = parse_optional_port(meta.get("metrics_port"))
+    let serve_running = is_serve_daemon_running(&paths, client).await;
+    serve_metrics_url(serve_running, &serve_meta)
+}
+
+/// Pure decision: the serve metrics-control URL when a serve daemon is live and
+/// has published meta, else `None` so the proxy self-hosts.
+fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>) -> Option<String> {
+    if !serve_running || serve_meta.is_empty() {
+        return None;
+    }
+    let port = parse_optional_port(serve_meta.get("metrics_port"))
         .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT);
     Some(format!("http://127.0.0.1:{port}"))
 }
@@ -2925,6 +2944,47 @@ mod tests {
         let ports = metrics_port_candidates(&empty, &empty, &empty);
 
         assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
+    }
+
+    #[test]
+    fn serve_metrics_url_none_when_serve_not_running() {
+        // Regression: a crashed serve daemon can leave stale meta behind. The
+        // proxy must not forward metrics to that dead endpoint — it should
+        // self-host instead so `rayline top` still works.
+        let stale = meta_with_metrics_port(20813);
+
+        assert_eq!(serve_metrics_url(false, &stale), None);
+    }
+
+    #[test]
+    fn serve_metrics_url_forwards_when_serve_running() {
+        let serve = meta_with_metrics_port(20990);
+
+        assert_eq!(
+            serve_metrics_url(true, &serve),
+            Some("http://127.0.0.1:20990".to_owned())
+        );
+    }
+
+    #[test]
+    fn serve_metrics_url_none_when_meta_empty() {
+        let empty = BTreeMap::new();
+
+        assert_eq!(serve_metrics_url(true, &empty), None);
+    }
+
+    #[test]
+    fn serve_metrics_url_defaults_port_when_running_without_port() {
+        let mut serve = BTreeMap::new();
+        serve.insert("router_url".to_owned(), "https://api.rayline.ai".to_owned());
+
+        assert_eq!(
+            serve_metrics_url(true, &serve),
+            Some(format!(
+                "http://127.0.0.1:{}",
+                rayline_metrics::DEFAULT_METRICS_PORT
+            ))
+        );
     }
 
     #[test]
