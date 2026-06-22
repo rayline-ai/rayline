@@ -1006,24 +1006,13 @@ async fn response_from_reqwest(
             }
         }
         if observe_response {
-            let decoded_body = match decode_body_for_metrics(&body, content_encoding.as_deref()) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    warn!(
-                        "failed to decode proxied response for metrics content_encoding={}: {error}",
-                        content_encoding.as_deref().unwrap_or("<none>")
-                    );
-                    body.clone()
-                }
-            };
+            let decoded_body = decode_body_for_metrics(&body, content_encoding.as_deref());
             if !parse_chunks_live {
-                if let Some(capture) = sse_capture.as_ref() {
+                if let (Some(capture), Some(decoded)) =
+                    (sse_capture.as_ref(), decoded_body.as_deref())
+                {
                     let mut decoded_capture_buffer = String::new();
-                    capture_anthropic_sse_chunk(
-                        &decoded_body,
-                        &mut decoded_capture_buffer,
-                        capture,
-                    );
+                    capture_anthropic_sse_chunk(decoded, &mut decoded_capture_buffer, capture);
                     capture_anthropic_sse_chunk(b"\n\n", &mut decoded_capture_buffer, capture);
                 }
             }
@@ -1031,12 +1020,14 @@ async fn response_from_reqwest(
             let previous_output_tokens = output_tokens;
             let previous_prompt_cache_tokens = prompt_cache_tokens;
             let previous_prompt_processed_tokens = prompt_processed_tokens;
-            usage_from_anthropic_body(&decoded_body).merge_into(
-                &mut input_tokens,
-                &mut output_tokens,
-                &mut prompt_cache_tokens,
-                &mut prompt_processed_tokens,
-            );
+            if let Some(decoded) = decoded_body.as_deref() {
+                usage_from_anthropic_body(decoded).merge_into(
+                    &mut input_tokens,
+                    &mut output_tokens,
+                    &mut prompt_cache_tokens,
+                    &mut prompt_processed_tokens,
+                );
+            }
             if let Some(capture) = sse_capture.as_ref() {
                 let raw_path = capture.raw_path();
                 if let Err(error) = write_sse_capture_raw(&raw_path, &body) {
@@ -1085,7 +1076,7 @@ async fn response_from_reqwest(
                             if parse_chunks_live {
                                 sse_buffer.len()
                             } else {
-                                decoded_body.len()
+                                decoded_body.as_deref().map(|b| b.len()).unwrap_or(0)
                             }
                         );
                     }
@@ -1660,48 +1651,171 @@ fn normalized_content_encodings(content_encoding: Option<&str>) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>> {
+/// Maximum number of bytes allowed when decompressing an upstream response body
+/// for metrics extraction. Prevents a gzip/brotli/zstd bomb from an upstream
+/// server (buggy, compromised, or MITM'd) from OOM-ing the daemon.
+/// On exceeding this cap, metrics are silently skipped for that request only;
+/// the raw downstream stream is never affected.
+const MAX_DECODE_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+
+/// Decompress `body` according to `content_encoding` for metrics extraction.
+///
+/// Returns `Some(decoded)` when decompression succeeds within `MAX_DECODE_BYTES`.
+/// Returns `None` when:
+/// - The decoded output would exceed `MAX_DECODE_BYTES` (cap exceeded; emits one `warn!`).
+/// - The encoding is unsupported or decompression fails (emits one `warn!`).
+///
+/// Returning `None` means "skip metrics for this request" — never an error to the caller.
+fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Option<Vec<u8>> {
     let encodings = normalized_content_encodings(content_encoding);
     if encodings.is_empty() || encodings.iter().all(|encoding| encoding == "identity") {
-        return Ok(body.to_vec());
+        return Some(body.to_vec());
     }
 
     let mut decoded = body.to_vec();
     for encoding in encodings.iter().rev() {
         decoded = match encoding.as_str() {
             "identity" => decoded,
-            "gzip" | "x-gzip" => read_all(flate2::read::GzDecoder::new(Cursor::new(decoded)))
-                .with_context(|| "decode gzip response body for metrics")?,
-            "deflate" => decode_deflate_body(decoded)?,
-            "br" => read_all(brotli::Decompressor::new(Cursor::new(decoded), 4096))
-                .with_context(|| "decode brotli response body for metrics")?,
+            "gzip" | "x-gzip" => {
+                match read_bounded(
+                    flate2::read::GzDecoder::new(Cursor::new(decoded)),
+                    MAX_DECODE_BYTES,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream gzip response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "failed to decode gzip response body for metrics: {error}"
+                        );
+                        return None;
+                    }
+                }
+            }
+            "deflate" => match decode_deflate_body(decoded) {
+                Some(bytes) => bytes,
+                None => return None,
+            },
+            "br" => {
+                match read_bounded(
+                    brotli::Decompressor::new(Cursor::new(decoded), 4096),
+                    MAX_DECODE_BYTES,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream brotli response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "failed to decode brotli response body for metrics: {error}"
+                        );
+                        return None;
+                    }
+                }
+            }
             "zstd" => {
-                let decoder = zstd::stream::read::Decoder::new(Cursor::new(decoded))
-                    .with_context(|| "initialize zstd response decoder for metrics")?;
-                read_all(decoder).with_context(|| "decode zstd response body for metrics")?
+                let decoder = match zstd::stream::read::Decoder::new(Cursor::new(decoded)) {
+                    Ok(d) => d,
+                    Err(error) => {
+                        warn!(
+                            "failed to initialize zstd decoder for metrics: {error}"
+                        );
+                        return None;
+                    }
+                };
+                match read_bounded(decoder, MAX_DECODE_BYTES) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream zstd response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "failed to decode zstd response body for metrics: {error}"
+                        );
+                        return None;
+                    }
+                }
             }
             other => {
-                return Err(anyhow!("unsupported content-encoding {other:?}"));
+                warn!("unsupported content-encoding {other:?} for metrics decode; skipping metrics");
+                return None;
             }
         };
     }
-    Ok(decoded)
+    Some(decoded)
 }
 
-fn decode_deflate_body(body: Vec<u8>) -> Result<Vec<u8>> {
-    match read_all(flate2::read::ZlibDecoder::new(Cursor::new(body.clone()))) {
-        Ok(decoded) => Ok(decoded),
-        Err(zlib_error) => read_all(flate2::read::DeflateDecoder::new(Cursor::new(body)))
-            .with_context(|| {
-                format!("decode deflate response body for metrics (zlib failed: {zlib_error})")
-            }),
+fn decode_deflate_body(body: Vec<u8>) -> Option<Vec<u8>> {
+    match read_bounded(
+        flate2::read::ZlibDecoder::new(Cursor::new(body.clone())),
+        MAX_DECODE_BYTES,
+    ) {
+        Ok(Some(decoded)) => Some(decoded),
+        Ok(None) => {
+            warn!(
+                "upstream deflate (zlib) response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                 skipping metrics for this request",
+                MAX_DECODE_BYTES / (1024 * 1024)
+            );
+            None
+        }
+        Err(zlib_error) => {
+            match read_bounded(
+                flate2::read::DeflateDecoder::new(Cursor::new(body)),
+                MAX_DECODE_BYTES,
+            ) {
+                Ok(Some(decoded)) => Some(decoded),
+                Ok(None) => {
+                    warn!(
+                        "upstream deflate response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                         skipping metrics for this request",
+                        MAX_DECODE_BYTES / (1024 * 1024)
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to decode deflate response body for metrics \
+                         (zlib failed: {zlib_error}): {error}"
+                    );
+                    None
+                }
+            }
+        }
     }
 }
 
-fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+/// Read from `reader` up to `limit` bytes.
+///
+/// Returns:
+/// - `Ok(Some(bytes))` when the reader reaches EOF before `limit` bytes.
+/// - `Ok(None)` when more than `limit` bytes would be produced (cap exceeded).
+/// - `Err(e)` on an I/O error.
+fn read_bounded(reader: impl Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
+    // Read up to limit+1 bytes so we can detect if the output exceeds the cap.
+    let read = reader.take(limit + 1).read_to_end(&mut output)?;
+    if read as u64 > limit {
+        Ok(None)
+    } else {
+        Ok(Some(output))
+    }
 }
 
 /// The router's per-turn decision, captured from the `X-Rayline-*` response
@@ -2753,6 +2867,44 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(17));
         assert_eq!(usage.prompt_cache_tokens, Some(30));
         assert_eq!(usage.prompt_processed_tokens, Some(12));
+    }
+
+    /// Verifies that a gzip-compressed payload that expands beyond MAX_DECODE_BYTES
+    /// causes decode_body_for_metrics to return None (skip metrics) rather than OOM.
+    /// RED: before fix, decode_body_for_metrics returns Result<Vec<u8>> (no Option variant).
+    #[test]
+    fn decompression_is_capped_and_skips_metrics_on_bomb() {
+        // 64 MiB of zeros compresses to a tiny gzip stream — a classic gzip bomb pattern.
+        let plaintext = vec![0u8; 64 * 1024 * 1024];
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all(&plaintext).unwrap();
+        let bomb = encoder.finish().unwrap();
+
+        // Must return None (cap exceeded) — never OOM.
+        assert!(
+            decode_body_for_metrics(&bomb, Some("gzip")).is_none(),
+            "expected decode_body_for_metrics to return None for oversized decompressed output"
+        );
+    }
+
+    /// Verifies that a small gzip body still decodes successfully (cap is not over-aggressive).
+    #[test]
+    fn decompression_succeeds_for_small_gzip_body() {
+        let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all(body).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decoded = decode_body_for_metrics(&compressed, Some("gzip"));
+        assert!(
+            decoded.is_some(),
+            "expected small gzip body to decode successfully"
+        );
+        assert_eq!(decoded.unwrap(), body);
     }
 
     #[test]

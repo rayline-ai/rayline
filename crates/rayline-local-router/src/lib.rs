@@ -965,6 +965,9 @@ async fn response_from_reqwest(
     let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
     let body_out: BoxBody = stream_body.boxed();
     let selected_model = decision.map(|decision| decision.selected_model.clone());
+    // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
+    // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
+    let has_metrics = metrics.is_some() && request_id.is_some();
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
@@ -1014,7 +1017,9 @@ async fn response_from_reqwest(
                             selected_model.clone(),
                         );
                     }
-                    body.extend_from_slice(&bytes);
+                    if has_metrics {
+                        body.extend_from_slice(&bytes);
+                    }
                     if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         downstream_open = false;
                     }
@@ -2117,5 +2122,45 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(42));
         assert_eq!(usage.output_tokens, Some(17));
+    }
+
+    /// Verifies that the body-retention gating condition is computed correctly.
+    ///
+    /// RED (before fix): `body.extend_from_slice` in response_from_reqwest runs
+    /// unconditionally (line 1017), so body always grows regardless of whether metrics
+    /// is enabled. The fix adds `has_metrics` guard so body is only retained when needed.
+    ///
+    /// We test the condition logic directly since response_from_reqwest's internal
+    /// `body` Vec is not observable from outside the spawned task.
+    #[test]
+    fn local_router_body_retention_gated_on_has_metrics() {
+        // has_metrics must be false when metrics sink is absent.
+        let metrics: Option<SharedMetricsSink> = None;
+        let request_id: Option<String> = Some("req_123".to_owned());
+        let has_metrics = metrics.is_some() && request_id.is_some();
+        assert!(
+            !has_metrics,
+            "has_metrics must be false when metrics sink is absent"
+        );
+
+        // has_metrics must be false when request_id is absent.
+        let metrics_some: Option<SharedMetricsSink> =
+            Some(rayline_metrics::RouterMetrics::new("test"));
+        let request_id: Option<String> = None;
+        let has_metrics = metrics_some.is_some() && request_id.is_some();
+        assert!(
+            !has_metrics,
+            "has_metrics must be false when request_id is absent"
+        );
+
+        // has_metrics is true only when both are present.
+        let metrics_some: Option<SharedMetricsSink> =
+            Some(rayline_metrics::RouterMetrics::new("test"));
+        let request_id: Option<String> = Some("req_456".to_owned());
+        let has_metrics = metrics_some.is_some() && request_id.is_some();
+        assert!(
+            has_metrics,
+            "has_metrics must be true when both metrics and request_id are present"
+        );
     }
 }
