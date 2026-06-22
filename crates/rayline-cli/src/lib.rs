@@ -1062,12 +1062,18 @@ fn apply_deprecated_routing_mode(
             eprintln!(
                 "Warning: `--routing-mode proxy` is deprecated; use `{CLI_BIN} claude --route all`."
             );
+            // Full-mode alias: restore the proxy mechanism so it overrides an
+            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
+            *via = Some(ViaArg::Proxy);
             *route_scope = Some(RouteScope::All);
         }
         "proxy-subagents" => {
             eprintln!(
                 "Warning: `--routing-mode proxy-subagents` is deprecated; use `{CLI_BIN} claude --route subagents`."
             );
+            // Full-mode alias: restore the proxy mechanism so it overrides an
+            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
+            *via = Some(ViaArg::Proxy);
             *route_scope = Some(RouteScope::Subagents);
         }
         _ => return None,
@@ -1717,6 +1723,28 @@ mod tests {
         assert_eq!(
             claude_run(&["rayline", "claude", "--no-proxy"]).routing_mode,
             RoutingMode::Override
+        );
+    }
+
+    #[test]
+    fn deprecated_no_proxy_then_routing_mode_proxy_restores_proxy() {
+        // Last-value-wins: a later deprecated full-mode alias must override an
+        // earlier `--no-proxy`, restoring the proxy mechanism (not stay Override).
+        assert_eq!(
+            claude_run(&["rayline", "claude", "--no-proxy", "--routing-mode", "proxy"])
+                .routing_mode,
+            RoutingMode::Proxy
+        );
+        assert_eq!(
+            claude_run(&[
+                "rayline",
+                "claude",
+                "--no-proxy",
+                "--routing-mode",
+                "proxy-subagents"
+            ])
+            .routing_mode,
+            RoutingMode::ProxySubagents
         );
     }
 
