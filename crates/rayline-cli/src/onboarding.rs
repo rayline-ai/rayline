@@ -49,6 +49,40 @@ pub struct OnboardingMarker {
     pub outcome: OnboardingOutcome,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnboardingDecision {
+    /// An engageable local model already exists — launch with it.
+    UseExisting,
+    /// Prompt the user to configure a local model.
+    RunWizard,
+    /// Do not prompt (non-interactive, or a prior completion that shouldn't
+    /// re-trigger). The caller warns and does not engage local.
+    Decline,
+}
+
+/// Pure first-run decision (§5.1 of the spec). `engageable` is whether a usable
+/// `local_model` exists; `interactive` is the TTY gate.
+pub fn decide(
+    engageable: bool,
+    interactive: bool,
+    marker: Option<&OnboardingMarker>,
+    current_schema: u32,
+) -> OnboardingDecision {
+    if engageable {
+        return OnboardingDecision::UseExisting;
+    }
+    if !interactive {
+        return OnboardingDecision::Decline;
+    }
+    match marker {
+        None => OnboardingDecision::RunWizard,
+        Some(m) if m.schema < current_schema => OnboardingDecision::RunWizard,
+        Some(m) if m.outcome == OnboardingOutcome::Skipped => OnboardingDecision::RunWizard,
+        // Configured before, schema current, but not engageable now: don't nag.
+        Some(_) => OnboardingDecision::Decline,
+    }
+}
+
 /// Seconds since the Unix epoch (dep-free timestamp for the marker; for
 /// diagnostics only).
 pub fn now_unix() -> u64 {
@@ -103,6 +137,59 @@ pub fn write_onboarding_in_home(home: &Path, marker: &OnboardingMarker) -> io::R
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn marker(schema: u32, outcome: OnboardingOutcome) -> OnboardingMarker {
+        OnboardingMarker {
+            schema,
+            completed_at: 0,
+            cli_version: "t".into(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn decide_uses_existing_when_engageable() {
+        assert_eq!(decide(true, true, None, 1), OnboardingDecision::UseExisting);
+    }
+
+    #[test]
+    fn decide_declines_when_non_interactive() {
+        assert_eq!(decide(false, false, None, 1), OnboardingDecision::Decline);
+    }
+
+    #[test]
+    fn decide_runs_wizard_on_first_run() {
+        assert_eq!(decide(false, true, None, 1), OnboardingDecision::RunWizard);
+    }
+
+    #[test]
+    fn decide_runs_wizard_on_stale_schema() {
+        let m = marker(0, OnboardingOutcome::LocalModel);
+        assert_eq!(
+            decide(false, true, Some(&m), 1),
+            OnboardingDecision::RunWizard
+        );
+    }
+
+    #[test]
+    fn decide_re_prompts_after_skip() {
+        let m = marker(1, OnboardingOutcome::Skipped);
+        assert_eq!(
+            decide(false, true, Some(&m), 1),
+            OnboardingDecision::RunWizard
+        );
+    }
+
+    #[test]
+    fn decide_declines_when_configured_but_unusable() {
+        // outcome recorded, schema current, but model not engageable (e.g. GGUF
+        // deleted): do NOT re-prompt — warn/decline instead.
+        let m = marker(1, OnboardingOutcome::LocalModel);
+        assert_eq!(
+            decide(false, true, Some(&m), 1),
+            OnboardingDecision::Decline
+        );
+    }
 
     fn tmp_home() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rl-onboard-{}", std::process::id()));
