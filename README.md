@@ -7,7 +7,7 @@ to, deciding where each request should go. It provides the `rayline` CLI and
 support, and update checks.
 
 This repository contains the Rayline Local router. Local-router-only use through
-`rayline claude --local-router` does not require a hosted account and does not
+`rayline claude --local` does not require a hosted account and does not
 connect to any remote hosted service.
 
 ## Demo
@@ -26,16 +26,19 @@ single session.
 ## How It Works
 
 Run `rayline claude` to start a Claude Code session with hosted Rayline routing
-layered on top, or `rayline claude --local-router` for the auth-free local
-static router. Your conversation works as it normally would, but Rayline Local
-can route cheaper, high-volume work such as background subagent tasks to a fast
+layered on top, or `rayline claude --local` for the auth-free local static
+router. Your conversation works as it normally would, but Rayline Local can
+route cheaper, high-volume work such as background subagent tasks to a fast
 model running locally on your machine.
 
-By default, your main conversation stays on Claude, and only configured
-local-router traffic is routed to local or alternative endpoints. Hosted client
-features use Rayline CLI session auth and are not required for local-router
-workflows. Run `rayline --help` to see the available commands and configuration
-options.
+Routing is set by three orthogonal flags: `--local` picks the on-device router
+(versus the hosted cloud router), `--via proxy|env` picks how Claude Code
+connects, and `--route all|subagents` picks what flows through the router. Most
+users only ever need `--local`. By default, your main conversation stays on
+Claude, and only configured subagent traffic is routed to local or alternative
+endpoints. See [docs/rayline-local-router.md](docs/rayline-local-router.md#routing-arguments)
+for the full matrix. Run `rayline --help` to see the available commands and
+configuration options.
 
 Rayline Local operates on your machine and with your provider credentials. It is
 not affiliated with any model provider.
