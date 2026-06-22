@@ -2512,6 +2512,24 @@ impl LocalCa {
                     .with_context(|| format!("read CA key {}", key_path.display()))?,
             };
             if ca.is_valid_existing_pair() {
+                // Tighten permissions on the happy-load path so that a CA
+                // directory/key created by an older release at 0755/0644 is
+                // repaired on next load, keeping the SECURITY.md guarantee true
+                // for existing installs.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(parent) = cert_path.parent() {
+                        let _ = fs::set_permissions(
+                            parent,
+                            fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    let _ = fs::set_permissions(
+                        key_path,
+                        fs::Permissions::from_mode(0o600),
+                    );
+                }
                 return Ok(ca);
             }
             warn!(
@@ -4014,6 +4032,48 @@ mod tests {
             0o700,
             "CA dir must be 0700, got 0o{:o}",
             mode & 0o777
+        );
+    }
+
+    /// `load_or_generate` must repair loose permissions (0755 dir / 0644 key)
+    /// on the happy-load path (valid existing CA, no regeneration).
+    /// Before the fix this test fails: perms stay 0755/0644.
+    /// After the fix it passes: load_or_generate tightens to 0700/0600.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_tightens_loose_perms_on_existing_ca() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+        let cert_path = ca_dir.join("proxy-ca.pem");
+        let key_path = ca_dir.join("proxy-ca-key.pem");
+
+        // Create a valid CA on disk (generates with correct perms).
+        LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+
+        // Deliberately loosen permissions to simulate an older install.
+        std::fs::set_permissions(&ca_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Reload — must reuse the existing CA (not regenerate) and tighten perms.
+        let loaded = LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+        // Sanity: the reused CA must still be valid.
+        loaded.validate_existing_pair().unwrap();
+
+        let dir_mode = std::fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "CA dir must be tightened to 0700 on load, got 0o{:o}",
+            dir_mode & 0o777
+        );
+        let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(
+            key_mode & 0o777,
+            0o600,
+            "CA key must be tightened to 0600 on load, got 0o{:o}",
+            key_mode & 0o777
         );
     }
 }

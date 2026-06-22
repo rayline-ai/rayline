@@ -72,7 +72,8 @@ sessions to the Rayline router. It is:
   (`crates/rayline-cli/src/claude.rs`, `configure_proxy_auth_env`), so the key
   is not inherited by the Claude Code process or its children.
 - **Residual risk**: the key remains readable in the `rld` daemon's process
-  environment via `/proc/<pid>/environ` on Linux by any process running as the
+  environment via `/proc/<pid>/environ` on Linux (or equivalently via
+  `ps eww <pid>` / `proc_pidinfo` on macOS) by any process running as the
   same UID. This is a known residual. Same-UID isolation requires OS-level
   controls.
 
