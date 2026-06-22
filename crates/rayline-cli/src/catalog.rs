@@ -109,6 +109,13 @@ pub struct CatalogModel {
     pub max_context_window: u64,
     pub quality_score: u64,
     pub description: String,
+    /// Mixture-of-Experts model. Defaults to `false` (dense) when the registry
+    /// omits it. Carried for the JSON payload + phase-2 MoE-aware sizing.
+    pub is_moe: bool,
+    /// Hot weight footprint (non-expert + active experts). Equals
+    /// `base_ram_bytes` for dense models. NOT used in the v1 verdict (the daemon
+    /// launches `-ngl 99`, so MoE savings can't be realized yet) — phase 2.
+    pub active_ram_bytes: u64,
 }
 
 /// Hardware fit at the recommended context length, matching the desktop's
@@ -218,6 +225,12 @@ fn parse_curated(body: &Value) -> Vec<CatalogModel> {
 fn parse_model(entry: &Value) -> Option<CatalogModel> {
     let revision = parse_revision(entry)?;
     let sha256 = parse_sha256(entry)?;
+    let base_ram_bytes = entry.get("baseRamBytes")?.as_u64()?;
+    let is_moe = entry.get("isMoe").and_then(Value::as_bool).unwrap_or(false);
+    let active_ram_bytes = entry
+        .get("activeRamBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(base_ram_bytes);
     Some(CatalogModel {
         id: string_field(entry, "id")?,
         name: string_field(entry, "name")?,
@@ -226,11 +239,13 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
         revision,
         sha256,
         size_bytes: entry.get("sizeBytes")?.as_u64()?,
-        base_ram_bytes: entry.get("baseRamBytes")?.as_u64()?,
+        base_ram_bytes,
         kv_cache_bytes_per_token: entry.get("kvCacheBytesPerToken")?.as_u64()?,
         max_context_window: entry.get("maxContextWindow")?.as_u64()?,
         quality_score: entry.get("qualityScore")?.as_u64()?,
         description: entry.get("description")?.as_str()?.to_owned(),
+        is_moe,
+        active_ram_bytes,
     })
 }
 
@@ -450,6 +465,8 @@ pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u
                 "fit": listing.fit.as_str(),
                 "downloaded": listing.downloaded,
                 "selected": listing.selected,
+                "is_moe": listing.model.is_moe,
+                "active_ram_bytes": listing.model.active_ram_bytes,
             })
         })
         .collect::<Vec<_>>();
@@ -1020,5 +1037,27 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "qwen3.5-9b-q4km");
         assert_eq!(models[0].filename, "new.gguf");
+    }
+
+    #[test]
+    fn parse_curated_defaults_moe_fields_to_dense() {
+        let body = json!({ "models": [registry_model("dense-7b", 7)] });
+        let models = parse_curated(&body);
+        assert_eq!(models.len(), 1);
+        assert!(!models[0].is_moe);
+        assert_eq!(models[0].active_ram_bytes, models[0].base_ram_bytes);
+    }
+
+    #[test]
+    fn parse_curated_reads_moe_fields_when_present() {
+        let mut entry = registry_model("moe-35b-a3b", 35);
+        let object = entry.as_object_mut().unwrap();
+        object.insert("isMoe".to_owned(), json!(true));
+        object.insert("activeRamBytes".to_owned(), json!(3u64));
+        let body = json!({ "models": [entry] });
+        let models = parse_curated(&body);
+        assert_eq!(models.len(), 1);
+        assert!(models[0].is_moe);
+        assert_eq!(models[0].active_ram_bytes, 3);
     }
 }
