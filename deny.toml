@@ -3,6 +3,17 @@
 # Keep this policy scoped to the committed workspace lockfile so OSS release
 # dependency review stays repeatable.
 
+[advisories]
+# RUSTSEC-2026-0185: remote memory exhaustion in quinn-proto's QUIC stream
+# reassembly. quinn is an *optional* reqwest dependency that is NOT compiled
+# into any Rayline binary (we build reqwest with default-features = false and
+# no http3; `cargo tree -i quinn` resolves to nothing), so the QUIC path is
+# unreachable here. The fix (quinn-proto >= 0.11.15) was published the same day
+# as the advisory (2026-06-22) and our supply-chain policy bars adopting a
+# release < 7 days old. Remove this ignore and bump the lockfile once 0.11.15
+# clears that window.
+ignore = ["RUSTSEC-2026-0185"]
+
 [licenses]
 # Keep the global allow-list permissive and Apache-2.0-compatible. If a crate
 # needs a weaker/copyleft license, add a scoped exception with rationale instead

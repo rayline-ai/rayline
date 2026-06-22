@@ -45,7 +45,12 @@ jobs:
         run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
 
       - name: Run cargo audit
-        run: cargo audit --file Cargo.lock
+        # RUSTSEC-2026-0185 (quinn-proto): quinn is an optional reqwest dep that
+        # is not compiled into any Rayline binary, and the fix (0.11.15) was
+        # published the same day, which our 7-day supply-chain policy bars us
+        # from adopting yet. Drop this ignore when bumping the lockfile. The
+        # rationale is mirrored in deny.toml [advisories].
+        run: cargo audit --file Cargo.lock --ignore RUSTSEC-2026-0185
 
   cargo-deny:
     name: Cargo deny
