@@ -640,8 +640,16 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
         .and_then(header_str);
     let agent_type = headers.get(RAYLINE_AGENT_TYPE_HEADER).and_then(header_str);
-    let is_subagent =
-        agent_type.is_some() || agent_id.is_some() || requested_model == DEFAULT_SUBAGENT_MODEL;
+    // Guard: a bare `agent_id` header on a main-virtual-model request is
+    // treated as stray and does NOT trigger subagent classification. Only a
+    // confirmed `agent_type` (set by the proxy after successful meta-file
+    // resolution) or the explicit `DEFAULT_SUBAGENT_MODEL` model name is a
+    // reliable subagent signal when the main virtual model is requested.
+    // This prevents CC from wrongly downgrading main-thread traffic to a
+    // local/subagent endpoint when a stray agent-id header leaks through.
+    let is_subagent = agent_type.is_some()
+        || requested_model == DEFAULT_SUBAGENT_MODEL
+        || (agent_id.is_some() && requested_model != DEFAULT_VIRTUAL_MODEL);
     let mut policy = if is_subagent { "subagent" } else { "main" }.to_owned();
     let mut route = if let Some(route) = state.config.routes.model_routes.get(&requested_model) {
         policy = format!("model:{requested_model}");
@@ -1754,12 +1762,19 @@ mod tests {
     }
 
     #[test]
-    fn routes_subagent_header_to_local_by_default() {
+    fn routes_confirmed_subagent_to_local_by_default() {
+        // A confirmed subagent (agent_type resolved by the proxy from meta file)
+        // is routed to the local model even when using the main virtual model name.
+        // Bare agent_id alone is NOT sufficient — see the stray-agent-id test below.
         let state = state(default_config("local-model"));
         let mut headers = HeaderMap::new();
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
             HeaderValue::from_static("explore"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
@@ -1922,6 +1937,8 @@ mod tests {
 
     #[test]
     fn named_subagent_overrides_default_subagent_route() {
+        // A confirmed subagent (agent_type resolved) whose type matches a named
+        // route overrides the default subagent route.
         let mut config = default_config("local-model");
         config.routes.subagents.insert(
             "reviewer".to_owned(),
@@ -1934,6 +1951,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("abc123"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
             HeaderValue::from_static("reviewer"),
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
@@ -2155,6 +2176,30 @@ mod tests {
             buf,
             b"hello world",
             "body must be retained in full when has_metrics=true"
+        );
+    }
+
+    /// A stray `agent_id` header on a request that explicitly asks for the
+    /// main virtual model must NOT reclassify the request as a subagent.
+    /// This guards against the dangerous downgrade: CC sometimes forwards
+    /// agent-id headers even on main-model requests.
+    #[test]
+    fn main_virtual_model_with_stray_agent_id_is_not_downgraded_to_subagent() {
+        let state = state(default_config("local-model"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("stray-agent-xyz"),
+        );
+        // Explicitly requesting the main virtual model
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.task_class, "main",
+            "main virtual model request must be classified as main, not subagent, \
+             even when a stray agent_id header is present"
         );
     }
 }

@@ -967,16 +967,25 @@ fn draw_top_summary(
         stdout,
         y,
         width,
-        &format!(
-            "overall completed={}  errors={}  local={}  remote={}  input={}  output={}  {}",
-            totals_u64(totals, "completed_requests"),
-            totals_u64(totals, "errored_requests"),
-            totals_u64(totals, "local_requests"),
-            totals_u64(totals, "remote_requests"),
-            totals_u64(totals, "input_tokens"),
-            totals_u64(totals, "output_tokens"),
-            llama_perf_summary(snapshot),
-        ),
+        &{
+            let uncertain = totals_u64(totals, "routing_uncertain");
+            let uncertain_label = if uncertain > 0 {
+                format!("  routing_uncertain={uncertain}")
+            } else {
+                String::new()
+            };
+            format!(
+                "overall completed={}  errors={}  local={}  remote={}  input={}  output={}{}  {}",
+                totals_u64(totals, "completed_requests"),
+                totals_u64(totals, "errored_requests"),
+                totals_u64(totals, "local_requests"),
+                totals_u64(totals, "remote_requests"),
+                totals_u64(totals, "input_tokens"),
+                totals_u64(totals, "output_tokens"),
+                uncertain_label,
+                llama_perf_summary(snapshot),
+            )
+        },
     )
 }
 

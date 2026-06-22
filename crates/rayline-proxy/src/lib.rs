@@ -552,11 +552,29 @@ async fn forward_anthropic_request(
     let agent_id = claude_code_agent_id(&parts.headers)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "<none>".to_owned());
-    let agent_type = if agent_id != "<none>" {
+    let agent_id_present = agent_id != "<none>";
+    let agent_type = if agent_id_present {
         resolve_claude_code_agent_type_with_retry(&agent_id).await
     } else {
         None
     };
+    // When agent-id was present but resolution exhausted all retries the
+    // meta file was never found. This most likely means Claude Code changed
+    // its schema or path layout. Emit a warning and bump the counter so
+    // operators notice rather than silently degrading.
+    let agent_type_unresolved = agent_id_present && agent_type.is_none();
+    if agent_type_unresolved {
+        warn!(
+            "proxy agent-type resolution exhausted retries: agent_id={} — \
+             Claude Code meta file not found; routing uncertain",
+            agent_id
+        );
+        if let Some(metrics) = state.opts.metrics.as_ref() {
+            metrics.record(MetricsUpdate::RoutingUncertain {
+                agent_id: agent_id.clone(),
+            });
+        }
+    }
     let routed = prepare_anthropic_route_with_subagent_filter(
         &parts.method,
         parts.uri.path(),
@@ -577,13 +595,20 @@ async fn forward_anthropic_request(
         .unwrap_or_else(|| "<none>".to_owned());
     let agent_type = routed.agent_type.clone();
     let proxy_owns_metrics = proxy_owns_metrics_for_route(&state.opts, decision.target);
+    // Distinguish "<unresolved>" (agent-id present but meta not found) from
+    // "<none>" (no agent-id header at all) in the decision log.
+    let agent_type_log = if agent_type_unresolved {
+        "<unresolved>".to_owned()
+    } else {
+        agent_type.as_deref().unwrap_or("<none>").to_owned()
+    };
     info!(
         "proxy route decision method={} path={} model={} agent_id={} agent_type={} target={:?} reason={} selective_subagents=[{}] local_available={} local_custom={}",
         parts.method.as_str(),
         path_and_query,
         body_model.as_deref().unwrap_or("<none>"),
         agent_id,
-        agent_type.as_deref().unwrap_or("<none>"),
+        agent_type_log,
         decision.target,
         decision.reason,
         state.opts.selective_subagent_ids.join(","),
@@ -2730,6 +2755,7 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayline_metrics::MetricsSink as _;
 
     fn observe_test_sse_chunk(
         bytes: &[u8],
@@ -3726,5 +3752,44 @@ mod tests {
         write_task.await.unwrap();
 
         assert!(!path.exists(), "stale generation should not write status");
+    }
+
+    /// Golden contract: parse a REAL captured Claude Code agent meta file and
+    /// assert the `agentType` field name and shape. This test FAILS if Claude
+    /// Code renames the field or restructures the JSON — that is the intent.
+    /// The fixture at `tests/fixtures/agent-test.meta.json` was sanitized from
+    /// an actual capture (description scrubbed; agentType value kept verbatim).
+    #[test]
+    fn golden_contract_pins_cc_agent_metadata_shape() {
+        let raw = include_str!("../tests/fixtures/agent-test.meta.json");
+        let value: serde_json::Value =
+            serde_json::from_str(raw).expect("fixture must be valid JSON");
+        // The field name is `agentType` (camelCase). If CC renames it this
+        // assertion fails, making breakage explicit rather than silent.
+        let agent_type = value
+            .get("agentType")
+            .and_then(serde_json::Value::as_str)
+            .expect("fixture must contain a non-null string field `agentType`");
+        assert_eq!(
+            agent_type, "general-purpose",
+            "agentType value in the real capture must match; update fixture if CC changes values"
+        );
+    }
+
+    /// When `RouterMetrics` receives a `RoutingUncertain` event the
+    /// `routing_uncertain` counter must be incremented. This pins the metrics
+    /// plumbing without requiring the full proxy HTTP machinery.
+    #[test]
+    fn routing_uncertain_counter_increments_on_event() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+        metrics.record(MetricsUpdate::RoutingUncertain {
+            agent_id: "abc123".to_owned(),
+        });
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 1);
+        metrics.record(MetricsUpdate::RoutingUncertain {
+            agent_id: "def456".to_owned(),
+        });
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 2);
     }
 }
