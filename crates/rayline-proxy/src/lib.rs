@@ -21,8 +21,13 @@ use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+pub use rayline_authcache::{
+    AuthCache, MAX_AUTH_CACHE_ENTRIES, evict_auth_cache_overflow, new_auth_cache,
+    stash_auth_headers,
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -52,7 +57,6 @@ pub const DEFAULT_PORT: u16 = 20810;
 pub const ANTHROPIC_HOST: &str = "api.anthropic.com";
 pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
-const MAX_AUTH_CACHE_ENTRIES: usize = 512;
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
@@ -63,45 +67,6 @@ const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// and unresolved, so main-thread traffic is never delayed.
 const AGENT_TYPE_RESOLVE_MAX_ATTEMPTS: usize = 6;
 const AGENT_TYPE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(40);
-
-/// Shared map `usage_doc_id -> auth headers`.
-///
-/// In local proxy mode, the cloud router returns a plain HTTP localhost 307.
-/// The proxy consumes that redirect internally, so it must stash router auth
-/// before calling the adapter. The adapter reads the same cache when it reports
-/// usage back to the router.
-pub type AuthCache = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
-
-pub fn new_auth_cache() -> AuthCache {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-fn stash_auth_headers(cache: &AuthCache, doc_id: String, auth_headers: HashMap<String, String>) {
-    if let Ok(mut guard) = cache.lock() {
-        evict_auth_cache_overflow(&mut guard, &doc_id);
-        guard.insert(doc_id, auth_headers);
-    }
-}
-
-fn evict_auth_cache_overflow(
-    cache: &mut HashMap<String, HashMap<String, String>>,
-    incoming_doc_id: &str,
-) {
-    if cache.contains_key(incoming_doc_id) {
-        return;
-    }
-    let overflow = cache
-        .len()
-        .saturating_add(1)
-        .saturating_sub(MAX_AUTH_CACHE_ENTRIES);
-    if overflow == 0 {
-        return;
-    }
-    let keys: Vec<String> = cache.keys().take(overflow).cloned().collect();
-    for key in keys {
-        cache.remove(&key);
-    }
-}
 
 #[derive(Clone)]
 pub struct ProxyOptions {

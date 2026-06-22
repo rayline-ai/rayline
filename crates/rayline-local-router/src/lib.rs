@@ -1011,6 +1011,7 @@ async fn response_from_reqwest(
         let mut sse_buffer = String::new();
         let mut input_tokens = estimated_input_tokens;
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         let mut saw_first_token = false;
         let mut downstream_open = true;
         let mut stream_error = None;
@@ -1041,6 +1042,7 @@ async fn response_from_reqwest(
                         &mut sse_buffer,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut prompt_cache_tokens,
                     );
                     if input_tokens != previous_input_tokens
                         || output_tokens != previous_output_tokens
@@ -1074,6 +1076,7 @@ async fn response_from_reqwest(
             &mut sse_buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
         if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
             record_remote_token_usage(
@@ -1086,7 +1089,11 @@ async fn response_from_reqwest(
         }
         let previous_input_tokens = input_tokens;
         let previous_output_tokens = output_tokens;
-        usage_from_anthropic_body(&body).merge_into(&mut input_tokens, &mut output_tokens);
+        usage_from_anthropic_body(&body).merge_into(
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
         if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
             record_remote_token_usage(
                 metrics.as_ref(),
@@ -1152,6 +1159,7 @@ fn observe_anthropic_sse_chunk(
     buffer: &mut String,
     input_tokens: &mut Option<u64>,
     output_tokens: &mut Option<u64>,
+    prompt_cache_tokens: &mut Option<u64>,
 ) {
     buffer.push_str(&String::from_utf8_lossy(bytes));
     while let Some(event) = drain_sse_event(buffer) {
@@ -1166,7 +1174,7 @@ fn observe_anthropic_sse_chunk(
             let Ok(value) = serde_json::from_str::<Value>(payload) else {
                 continue;
             };
-            usage_from_value(&value).merge_into(input_tokens, output_tokens);
+            usage_from_value(&value).merge_into(input_tokens, output_tokens, prompt_cache_tokens);
         }
     }
 }
@@ -1201,15 +1209,24 @@ fn usage_u64(value: &Value, key: &str) -> Option<u64> {
 struct ObservedUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    prompt_cache_tokens: Option<u64>,
 }
 
 impl ObservedUsage {
-    fn merge_into(self, input_tokens: &mut Option<u64>, output_tokens: &mut Option<u64>) {
+    fn merge_into(
+        self,
+        input_tokens: &mut Option<u64>,
+        output_tokens: &mut Option<u64>,
+        prompt_cache_tokens: &mut Option<u64>,
+    ) {
         if self.input_tokens.is_some() {
             *input_tokens = self.input_tokens;
         }
         if self.output_tokens.is_some() {
             *output_tokens = self.output_tokens;
+        }
+        if self.prompt_cache_tokens.is_some() {
+            *prompt_cache_tokens = self.prompt_cache_tokens;
         }
     }
 }
@@ -1228,7 +1245,11 @@ fn usage_from_anthropic_body(body: &[u8]) -> ObservedUsage {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            usage_from_value(&value).merge_into(&mut usage.input_tokens, &mut usage.output_tokens);
+            usage_from_value(&value).merge_into(
+                &mut usage.input_tokens,
+                &mut usage.output_tokens,
+                &mut usage.prompt_cache_tokens,
+            );
         }
     }
     usage
@@ -1245,6 +1266,9 @@ fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
         Value::Object(map) => {
             if let Some(input) = total_input_tokens_from_object(map) {
                 usage.input_tokens = Some(input);
+                if let Some(cache) = cache_read_tokens_from_object(map) {
+                    usage.prompt_cache_tokens = Some(cache);
+                }
             }
             if let Some(output) = map
                 .get("output_tokens")
@@ -1264,6 +1288,15 @@ fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
         }
         _ => {}
     }
+}
+
+fn cache_read_tokens_from_object(map: &serde_json::Map<String, Value>) -> Option<u64> {
+    if let Some(tokens) = map.get("cache_read_input_tokens").and_then(Value::as_u64) {
+        return Some(tokens);
+    }
+    map.get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn total_input_tokens_from_object(map: &serde_json::Map<String, Value>) -> Option<u64> {
@@ -2107,11 +2140,13 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -2123,11 +2158,13 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -2140,15 +2177,23 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
         assert_eq!(output_tokens, None);
 
-        observe_anthropic_sse_chunk(b"\n\n", &mut buffer, &mut input_tokens, &mut output_tokens);
+        observe_anthropic_sse_chunk(
+            b"\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
         assert_eq!(output_tokens, Some(17));
         assert!(buffer.is_empty());
     }
@@ -2158,15 +2203,18 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
         assert_eq!(output_tokens, Some(17));
+        assert_eq!(prompt_cache_tokens, Some(30));
     }
 
     #[test]
@@ -2266,5 +2314,25 @@ mod tests {
             1,
             "routing_uncertain must increment when is_subagent=true but agent_id is None"
         );
+    }
+
+    /// Regression test: local-router must track cache-read tokens in ObservedUsage.
+    /// Before the fix, `prompt_cache_tokens` was missing from ObservedUsage and
+    /// cache-read tokens were silently dropped.
+    #[test]
+    fn local_router_tracks_prompt_cache_tokens() {
+        let mut buffer = String::new();
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
+        // SSE with cache_read_input_tokens=1234 — the bug was that this field was lost.
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1234,\"output_tokens\":0}}}\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
+        assert_eq!(prompt_cache_tokens, Some(1234)); // was lost before the fix
     }
 }

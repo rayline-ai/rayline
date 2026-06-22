@@ -11,8 +11,10 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
+
+pub use rayline_authcache::AuthCache;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -36,13 +38,7 @@ pub const DEFAULT_UPSTREAM_MODEL: &str = "mlx-community/Qwen3.6-35B-A3B-4bit";
 // `DEFAULT_ROUTER_URL`.
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
 
-/// Shared map `usage_doc_id → auth headers`, populated by the injector with the
-/// user's original pre-redirect headers (including legacy router keys) when the
-/// cloud router 307s. The adapter PREFERS this stash for the
-/// `/v1/usage/update` callback: after the cross-origin hop to 127.0.0.1 the
-/// inbound request carries Claude Code's Max-plan OAuth JWT in `Authorization`
-/// (which the router cannot verify), not the router key the callback needs.
-pub type AuthCache = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
+// AuthCache is re-exported from rayline_authcache above.
 
 #[derive(Clone)]
 pub struct AdapterOptions {

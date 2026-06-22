@@ -1398,6 +1398,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rayline-authcache",
  "rayline-metrics",
  "reqwest",
  "serde",
@@ -1407,6 +1408,10 @@ dependencies = [
  "tokio-stream",
  "tracing",
 ]
+
+[[package]]
+name = "rayline-authcache"
+version = "0.2.0"
 
 [[package]]
 name = "rayline-cli"
@@ -1478,6 +1483,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rayline-authcache",
  "reqwest",
  "serde",
  "serde_json",
@@ -1544,6 +1550,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rayline-adapter",
+ "rayline-authcache",
  "rayline-metrics",
  "rcgen",
  "reqwest",

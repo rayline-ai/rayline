@@ -36,6 +36,7 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-authcache = { path = "../rayline-authcache" }
 x509-parser = "0.18"
 zstd = "0.13"
 
