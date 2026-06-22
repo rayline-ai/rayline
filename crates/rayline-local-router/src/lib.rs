@@ -1017,9 +1017,7 @@ async fn response_from_reqwest(
                             selected_model.clone(),
                         );
                     }
-                    if has_metrics {
-                        body.extend_from_slice(&bytes);
-                    }
+                    retain_for_metrics(has_metrics, &mut body, &bytes);
                     if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         downstream_open = false;
                     }
@@ -1103,6 +1101,14 @@ async fn response_from_reqwest(
         *headers = headers_out;
     }
     Ok(builder.body(body_out).unwrap())
+}
+
+/// Accumulates `chunk` into `buf` only when `has_metrics` is true.
+/// Extracted so tests can verify the gate without driving a full async streaming pipeline.
+fn retain_for_metrics(has_metrics: bool, buf: &mut Vec<u8>, chunk: &[u8]) {
+    if has_metrics {
+        buf.extend_from_slice(chunk);
+    }
 }
 
 fn observe_anthropic_sse_chunk(
@@ -2124,43 +2130,31 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(17));
     }
 
-    /// Verifies that the body-retention gating condition is computed correctly.
+    /// Verifies that `retain_for_metrics` (the helper called inside the streaming loop of
+    /// `response_from_reqwest`) accumulates bytes iff `has_metrics` is true.
     ///
-    /// RED (before fix): `body.extend_from_slice` in response_from_reqwest runs
-    /// unconditionally (line 1017), so body always grows regardless of whether metrics
-    /// is enabled. The fix adds `has_metrics` guard so body is only retained when needed.
-    ///
-    /// We test the condition logic directly since response_from_reqwest's internal
-    /// `body` Vec is not observable from outside the spawned task.
+    /// This test WILL FAIL if the guard is removed (i.e. if `retain_for_metrics` is made
+    /// unconditional), because `buf` would then be non-empty even when `has_metrics=false`.
     #[test]
     fn local_router_body_retention_gated_on_has_metrics() {
-        // has_metrics must be false when metrics sink is absent.
-        let metrics: Option<SharedMetricsSink> = None;
-        let request_id: Option<String> = Some("req_123".to_owned());
-        let has_metrics = metrics.is_some() && request_id.is_some();
+        // When has_metrics is false, the buffer must stay empty regardless of how many
+        // chunks are fed through.
+        let mut buf = Vec::new();
+        retain_for_metrics(false, &mut buf, b"hello");
+        retain_for_metrics(false, &mut buf, b" world");
         assert!(
-            !has_metrics,
-            "has_metrics must be false when metrics sink is absent"
+            buf.is_empty(),
+            "body must not be retained when has_metrics=false (guard is missing or broken)"
         );
 
-        // has_metrics must be false when request_id is absent.
-        let metrics_some: Option<SharedMetricsSink> =
-            Some(rayline_metrics::RouterMetrics::new("test"));
-        let request_id: Option<String> = None;
-        let has_metrics = metrics_some.is_some() && request_id.is_some();
-        assert!(
-            !has_metrics,
-            "has_metrics must be false when request_id is absent"
-        );
-
-        // has_metrics is true only when both are present.
-        let metrics_some: Option<SharedMetricsSink> =
-            Some(rayline_metrics::RouterMetrics::new("test"));
-        let request_id: Option<String> = Some("req_456".to_owned());
-        let has_metrics = metrics_some.is_some() && request_id.is_some();
-        assert!(
-            has_metrics,
-            "has_metrics must be true when both metrics and request_id are present"
+        // When has_metrics is true, all chunks must be accumulated.
+        let mut buf = Vec::new();
+        retain_for_metrics(true, &mut buf, b"hello");
+        retain_for_metrics(true, &mut buf, b" world");
+        assert_eq!(
+            buf,
+            b"hello world",
+            "body must be retained in full when has_metrics=true"
         );
     }
 }
