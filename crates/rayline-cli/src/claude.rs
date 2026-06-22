@@ -315,16 +315,21 @@ async fn run_command_from_home(
         None
     };
 
-    // Engage implicit account-local routing when a `local_model` config exists,
-    // the account toggle is on, and the configured model is usable. This implicit
-    // path stays off under `--isolated` and under env (`Override`) mode, which is
-    // cloud-only by contract — see `implicit_local_engages`. Explicit
-    // `--local-router --isolated` takes the local path below and uses an isolated
+    // Explicit `--local` branch (request.local_router == true): runs first-run
+    // onboarding via `ensure_local_model`, which may download the chosen model.
+    // Returns a hard error (`NotConfigured → Err`) when no model is configured
+    // so the user gets an actionable message instead of silently falling back.
+    //
+    // Implicit account-local branch (else): engages when a `local_model` config
+    // exists, the account toggle is on, and the configured model is usable. This
+    // implicit path stays off under `--isolated` and under env (`Override`) mode,
+    // which is cloud-only by contract — see `implicit_local_engages`. Explicit
+    // `--local-router --isolated` takes the local path above and uses an isolated
     // proxy sidecar. A failed settings fetch defaults the toggle to false (stay
     // cloud). The model always comes from the config (recommended pick, or the
     // user's custom endpoint); when none is picked yet, the best
-    // already-downloaded curated model is adopted as the pick — `claude` itself
-    // never downloads anything, and an unusable config warns + launches with
+    // already-downloaded curated model is adopted as the pick — this implicit
+    // path never downloads anything, and an unusable config warns + launches with
     // cloud routing instead of blocking.
     let enable_local_router = settings
         .as_ref()

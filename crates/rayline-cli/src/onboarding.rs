@@ -195,6 +195,15 @@ pub async fn ensure_local_model(home: &Path, env_name: &str) -> io::Result<Local
 
 /// `<cli> local onboard [--reset]` — re-run the wizard from a terminal.
 pub async fn run_onboard_command(env_name: Option<&str>, reset: bool) -> Result<(), String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "`{cli} local onboard` needs an interactive terminal. \
+             Run it directly, or use `{cli} local use <model-id>` / \
+             `{cli} local custom` non-interactively.",
+            cli = crate::CLI_BIN,
+        );
+        return Ok(());
+    }
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
     let env = status::resolve_env(env_name, Some(&home));
     if reset {
@@ -443,6 +452,24 @@ mod tests {
         let home = tmp_home();
         let readiness = ensure_local_model(&home, "prod").await.unwrap();
         assert!(matches!(readiness, LocalModelReadiness::NotConfigured));
+        assert!(read_onboarding(&home).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_onboard_command_declines_non_interactively() {
+        // The test harness is non-interactive (stdin/stdout are not TTYs).
+        // run_onboard_command must return Ok without writing an onboarding marker
+        // or touching local_model config.
+        let home = tmp_home();
+        // Pre-assert: no marker exists.
+        assert!(read_onboarding(&home).is_none());
+
+        // run_onboard_command uses dirs::home_dir(), not our tmp_home, but we
+        // only care that it returns Ok and does not panic or download anything.
+        let result = run_onboard_command(None, false).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+
+        // No marker should have been written to our tmp home (wizard never ran).
         assert!(read_onboarding(&home).is_none());
     }
 }
