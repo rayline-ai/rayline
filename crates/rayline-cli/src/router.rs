@@ -1876,90 +1876,103 @@ async fn start_proxy_from_home_with_client(
         metrics_url.as_deref(),
         self_hosted_metrics_port,
     );
-    if let Some(existing) = read_pid(&paths.proxy_pid_file) {
-        if process_exists(existing) {
-            let meta = read_meta(&paths.proxy_meta_file);
-            let health_port = parse_optional_port(meta.get("proxy_port")).unwrap_or(proxy_port);
-            let health = healthz(client, health_port).await;
-            let is_rld = is_rld_process(existing, &meta, RldMode::Proxy, client).await;
-            let metadata_matches = metadata_matches_config(&meta, &requested_meta);
-            if health
-                .as_ref()
-                .is_some_and(|health| proxy_health_matches_meta(health, &requested_meta))
-                && is_rld
-                && metadata_matches
-            {
-                output.push_str(&format!(
-                    "{} proxy already running (pid {existing}, proxy :{health_port}).\n",
-                    daemon_name()
-                ));
-                return Ok(output);
-            }
-            if !is_rld {
-                let requested_health = if health_port == proxy_port {
-                    health
-                } else {
-                    healthz(client, proxy_port).await
-                };
-                if requested_health.is_some() {
-                    return Err(io::Error::other(format!(
-                        "proxy :{proxy_port} is responding, but pid {existing} from {} is not this {} proxy. Run `{} router stop` to clean up before starting.",
-                        paths.proxy_pid_file.display(),
+    // ---------- locked window: read-pid → decide → spawn → atomic meta write ----------
+    // Hold the proxy-specific advisory lock across the check-then-spawn sequence
+    // so concurrent `router proxy start` launchers serialize and only one proxy
+    // daemon is ever started.  A SEPARATE lock file from the serve daemon means
+    // a proxy launch never blocks on a serve launch.  Released (by drop) before
+    // the long readiness wait below.
+    let started = {
+        let _lock = acquire_router_lock(&paths.proxy_lock_file)?;
+
+        if let Some(existing) = read_pid(&paths.proxy_pid_file) {
+            if process_exists(existing) {
+                let meta = read_meta(&paths.proxy_meta_file);
+                let health_port = parse_optional_port(meta.get("proxy_port")).unwrap_or(proxy_port);
+                let health = healthz(client, health_port).await;
+                let is_rld = is_rld_process(existing, &meta, RldMode::Proxy, client).await;
+                let metadata_matches = metadata_matches_config(&meta, &requested_meta);
+                if health
+                    .as_ref()
+                    .is_some_and(|health| proxy_health_matches_meta(health, &requested_meta))
+                    && is_rld
+                    && metadata_matches
+                {
+                    output.push_str(&format!(
+                        "{} proxy already running (pid {existing}, proxy :{health_port}).\n",
+                        daemon_name()
+                    ));
+                    return Ok(output); // lock released by drop
+                }
+                if !is_rld {
+                    let requested_health = if health_port == proxy_port {
+                        health
+                    } else {
+                        healthz(client, proxy_port).await
+                    };
+                    if requested_health.is_some() {
+                        return Err(io::Error::other(format!(
+                            "proxy :{proxy_port} is responding, but pid {existing} from {} is not this {} proxy. Run `{} router stop` to clean up before starting.",
+                            paths.proxy_pid_file.display(),
+                            daemon_name(),
+                            cli_name()
+                        )));
+                    }
+                    output.push_str(&format!(
+                        "{} proxy pidfile points at {existing}, but that process is not this {} proxy. Cleaning up.\n",
                         daemon_name(),
+                        daemon_name()
+                    ));
+                    clear_proxy_state(&paths);
+                } else if !metadata_matches || health.is_some() {
+                    output.push_str(&format!(
+                        "{} proxy running with different config (pid {existing}); restarting.\n",
+                        daemon_name()
+                    ));
+                    stop_proxy(&paths, client, &mut output, true).await?;
+                } else {
+                    return Err(io::Error::other(format!(
+                        "pid {existing} from {} is alive but proxy :{health_port} is not responding. Run `{} router stop` first.",
+                        paths.proxy_pid_file.display(),
                         cli_name()
                     )));
                 }
+            } else {
                 output.push_str(&format!(
-                    "{} proxy pidfile points at {existing}, but that process is not this {} proxy. Cleaning up.\n",
-                    daemon_name(),
+                    "{} proxy pidfile points at {existing} but the process is gone. Cleaning up.\n",
                     daemon_name()
                 ));
                 clear_proxy_state(&paths);
-            } else if !metadata_matches || health.is_some() {
-                output.push_str(&format!(
-                    "{} proxy running with different config (pid {existing}); restarting.\n",
-                    daemon_name()
-                ));
-                stop_proxy(&paths, client, &mut output, true).await?;
-            } else {
+            }
+        }
+
+        if let Some(health) = healthz(client, proxy_port).await {
+            if !proxy_health_matches_meta(&health, &requested_meta) {
                 return Err(io::Error::other(format!(
-                    "pid {existing} from {} is alive but proxy :{health_port} is not responding. Run `{} router stop` first.",
-                    paths.proxy_pid_file.display(),
-                    cli_name()
+                    "proxy :{proxy_port} is already responding, but it does not match the requested {} proxy config. Stop the process using that port or set RAYLINE_PROXY_PORT/RAYLINE_ISOLATED_PROXY_PORT to a free port.",
+                    daemon_name()
                 )));
             }
-        } else {
-            output.push_str(&format!(
-                "{} proxy pidfile points at {existing} but the process is gone. Cleaning up.\n",
-                daemon_name()
-            ));
-            clear_proxy_state(&paths);
         }
-    }
 
-    if let Some(health) = healthz(client, proxy_port).await {
-        if !proxy_health_matches_meta(&health, &requested_meta) {
-            return Err(io::Error::other(format!(
-                "proxy :{proxy_port} is already responding, but it does not match the requested {} proxy config. Stop the process using that port or set RAYLINE_PROXY_PORT/RAYLINE_ISOLATED_PROXY_PORT to a free port.",
-                daemon_name()
-            )));
-        }
-    }
+        spawn_proxy(
+            home,
+            router_url,
+            router_api_key,
+            proxy_port,
+            proxy_routing_mode,
+            bin_path,
+            diagnose,
+            upstream_ca_path,
+            isolated,
+            router_config_path,
+            local_config,
+            metrics_url.as_deref(),
+        )?
+        // _lock dropped here → advisory lock released before long readiness wait
+    };
+    // ---------- end of locked window ----------
 
-    let started = spawn_proxy(
-        home,
-        router_url,
-        router_api_key,
-        proxy_port,
-        proxy_routing_mode,
-        bin_path,
-        diagnose,
-        upstream_ca_path,
-        isolated,
-        router_config_path,
-        local_config,
-        metrics_url.as_deref(),
-    )?;
     output.push_str(&started.output);
     wait_for_proxy_ready(
         &paths,
@@ -3397,21 +3410,57 @@ mod tests {
     ///   - second caller detects pid file → reuses (no second spawn)
     #[cfg(unix)]
     async fn start_with_stub(paths: &RouterPaths) -> io::Result<()> {
+        start_with_stub_at(
+            paths,
+            &paths.lock_file,
+            &paths.pid_file,
+            &paths.meta_file,
+            "spawn_count",
+        )
+        .await
+    }
+
+    /// Stub variant for the standalone proxy path: uses the proxy lock/pid/meta
+    /// and a separate counter file.
+    #[cfg(unix)]
+    async fn start_proxy_with_stub(paths: &RouterPaths) -> io::Result<()> {
+        start_with_stub_at(
+            paths,
+            &paths.proxy_lock_file,
+            &paths.proxy_pid_file,
+            &paths.proxy_meta_file,
+            "proxy_spawn_count",
+        )
+        .await
+    }
+
+    /// Shared stub: simulate the locked check-then-spawn logic against the given
+    /// lock/pid/meta paths and counter file, with a fake spawn (counter bump)
+    /// instead of launching a real process.  Exercises `acquire_router_lock` +
+    /// `write_pid_meta_atomic`.
+    #[cfg(unix)]
+    async fn start_with_stub_at(
+        paths: &RouterPaths,
+        lock_file: &Path,
+        pid_file: &Path,
+        meta_file: &Path,
+        counter_name: &str,
+    ) -> io::Result<()> {
         // Small sleep *before* acquiring the lock to encourage interleaving in
         // concurrent callers — this is what makes the race reproducible in the
         // pre-fix (RED) phase.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        let _lock = acquire_router_lock(&paths.lock_file)?;
+        let _lock = acquire_router_lock(lock_file)?;
 
         // Under the lock: check if already started.
-        if let Some(_pid) = read_pid(&paths.pid_file) {
+        if read_pid(pid_file).is_some() {
             // Another launcher got here first — reuse its daemon.
             return Ok(());
         }
 
         // "Spawn": increment counter file and write pid/meta.
-        let counter_path = paths.data_dir().join("spawn_count");
+        let counter_path = paths.data_dir().join(counter_name);
         let count: u32 = std::fs::read_to_string(&counter_path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -3421,13 +3470,13 @@ mod tests {
         let fake_pid: i32 = 1;
         let mut meta = BTreeMap::new();
         meta.insert("injector_port".to_owned(), "20809".to_owned());
-        write_pid_meta_atomic(&paths.pid_file, &paths.meta_file, fake_pid, &meta)?;
+        write_pid_meta_atomic(pid_file, meta_file, fake_pid, &meta)?;
         Ok(())
     }
 
     #[cfg(unix)]
-    fn count_spawned_daemons(paths: &RouterPaths) -> u32 {
-        let counter_path = paths.data_dir().join("spawn_count");
+    fn count_spawned_daemons_at(paths: &RouterPaths, counter_name: &str) -> u32 {
+        let counter_path = paths.data_dir().join(counter_name);
         std::fs::read_to_string(&counter_path)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -3435,34 +3484,54 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn meta_parses(paths: &RouterPaths) -> bool {
-        let meta = read_meta(&paths.meta_file);
+    fn count_spawned_daemons(paths: &RouterPaths) -> u32 {
+        count_spawned_daemons_at(paths, "spawn_count")
+    }
+
+    #[cfg(unix)]
+    fn meta_parses_at(meta_file: &Path) -> bool {
+        let meta = read_meta(meta_file);
         meta.contains_key("injector_port")
     }
 
-    /// Two concurrent starts must spawn exactly one daemon; the second reuses
-    /// the first.  Meta must always parse (no torn writes).
+    #[cfg(unix)]
+    fn meta_parses(paths: &RouterPaths) -> bool {
+        meta_parses_at(&paths.meta_file)
+    }
+
+    /// Run two `f` invocations concurrently against the same paths via blocking
+    /// tasks, returning their results.
+    #[cfg(unix)]
+    async fn join_two_concurrent_starts<Fut>(
+        paths: &std::sync::Arc<RouterPaths>,
+        f: fn(std::sync::Arc<RouterPaths>) -> Fut,
+    ) -> (io::Result<()>, io::Result<()>)
+    where
+        Fut: std::future::Future<Output = io::Result<()>> + Send + 'static,
+    {
+        let p1 = paths.clone();
+        let p2 = paths.clone();
+        let (a, b) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(f(p1))
+            }),
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(f(p2))
+            })
+        );
+        (a.expect("task a panicked"), b.expect("task b panicked"))
+    }
+
+    /// Two concurrent serve starts must spawn exactly one daemon; the second
+    /// reuses the first.  Meta must always parse (no torn writes).
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_starts_spawn_one_daemon() {
         let paths = std::sync::Arc::new(RouterPaths::temp());
-        let p1 = paths.clone();
-        let p2 = paths.clone();
-
-        let (a, b) = tokio::join!(
-            tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current()
-                    .block_on(start_with_stub(&p1))
-            }),
-            tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current()
-                    .block_on(start_with_stub(&p2))
-            })
-        );
-
-        let a = a.expect("task a panicked").expect("start_with_stub a failed");
-        let b = b.expect("task b panicked").expect("start_with_stub b failed");
-        let _ = (a, b);
+        let (a, b) =
+            join_two_concurrent_starts(&paths, |p| async move { start_with_stub(&p).await }).await;
+        a.expect("start_with_stub a failed");
+        b.expect("start_with_stub b failed");
 
         assert_eq!(
             count_spawned_daemons(&paths),
@@ -3472,6 +3541,30 @@ mod tests {
         assert!(
             meta_parses(&paths),
             "meta file must always parse (no torn writes)"
+        );
+        let _ = std::fs::remove_dir_all(paths.data_dir());
+    }
+
+    /// Two concurrent standalone proxy starts must spawn exactly one proxy; the
+    /// second reuses the first.  Proxy meta must always parse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_proxy_starts_spawn_one_proxy() {
+        let paths = std::sync::Arc::new(RouterPaths::temp());
+        let (a, b) =
+            join_two_concurrent_starts(&paths, |p| async move { start_proxy_with_stub(&p).await })
+                .await;
+        a.expect("start_proxy_with_stub a failed");
+        b.expect("start_proxy_with_stub b failed");
+
+        assert_eq!(
+            count_spawned_daemons_at(&paths, "proxy_spawn_count"),
+            1,
+            "exactly one proxy must be spawned; second caller must reuse"
+        );
+        assert!(
+            meta_parses_at(&paths.proxy_meta_file),
+            "proxy meta file must always parse (no torn writes)"
         );
         let _ = std::fs::remove_dir_all(paths.data_dir());
     }
@@ -4350,8 +4443,11 @@ fn write_pid_meta_atomic(
     pid: i32,
     meta: &BTreeMap<String, String>,
 ) -> io::Result<()> {
-    atomic_write(pid_path, format!("{pid}\n").as_bytes())?;
+    // Meta first, pid last: the pid file is the existence/commit marker
+    // (read_pid gates "is a daemon running"), so it only appears once the meta
+    // it describes is already fully on disk — closing the pid-without-meta window.
     atomic_write(meta_path, format_meta(meta).as_bytes())?;
+    atomic_write(pid_path, format!("{pid}\n").as_bytes())?;
     Ok(())
 }
 
@@ -4382,9 +4478,12 @@ struct RouterPaths {
     proxy_log_file: PathBuf,
     proxy_meta_file: PathBuf,
     /// Advisory lock file used by `acquire_router_lock` to serialize the
-    /// read-pid → decide → spawn → liveness window.  The lock is auto-released
-    /// when the returned `File` is dropped.
+    /// serve daemon's read-pid → decide → spawn → liveness window.  The lock is
+    /// auto-released when the returned `File` is dropped.
     lock_file: PathBuf,
+    /// Separate advisory lock for the standalone proxy start path, so a proxy
+    /// launch never serializes against a serve-daemon launch.
+    proxy_lock_file: PathBuf,
 }
 
 impl RouterPaths {
@@ -4417,6 +4516,7 @@ impl RouterPaths {
             proxy_log_file: data_dir.join(format!("{prefix}-proxy.log")),
             proxy_meta_file: data_dir.join(format!("{prefix}-proxy.meta")),
             lock_file: data_dir.join(format!("{prefix}.lock")),
+            proxy_lock_file: data_dir.join(format!("{prefix}-proxy.lock")),
         }
     }
 
