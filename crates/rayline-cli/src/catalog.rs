@@ -402,18 +402,58 @@ pub async fn auto_select_downloaded(env_name: &str) -> Option<CatalogModel> {
     choose_auto_pick(downloaded, hardware)
 }
 
+/// Pure recommendation core: rank by (fit, already-downloaded, quality) and
+/// return the best. `downloaded_ids` lists models already in the cache, which
+/// break a fit tie (prefer not re-downloading). Does NOT filter unfit models —
+/// callers decide whether a Red model is acceptable.
+fn recommend_from(
+    models: Vec<CatalogModel>,
+    downloaded_ids: &[String],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
+    models.into_iter().min_by_key(|model| {
+        let already_downloaded = downloaded_ids.iter().any(|id| id == &model.id);
+        (
+            fit(model, hardware).rank(),
+            u8::from(!already_downloaded), // downloaded (0) sorts before not (1)
+            std::cmp::Reverse(model.quality_score),
+        )
+    })
+}
+
+/// Best curated model to *use* on this machine: the highest-quality model that
+/// fits (Green preferred, then Amber), preferring an already-downloaded one.
+/// Excludes models that won't fit (Red). `None` when nothing fits or the catalog
+/// is empty/unreachable. Never downloads anything.
+pub async fn recommend_for_hardware(
+    env_name: &str,
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
+    let models = fetch_curated(env_name).await;
+    let downloaded_ids = models
+        .iter()
+        .filter(|model| is_downloaded(model))
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let candidates = models
+        .into_iter()
+        .filter(|model| fit(model, hardware) != Fit::Red)
+        .collect::<Vec<_>>();
+    recommend_from(candidates, &downloaded_ids, hardware)
+}
+
 /// Best of the already-downloaded curated models: hardware fit first, quality
-/// second. Pure so the policy is unit-testable.
+/// second. Pure so the policy is unit-testable. All downloaded models remain
+/// eligible even when Red — a downloaded model beats nothing.
 fn choose_auto_pick(
     downloaded: Vec<CatalogModel>,
     hardware: Option<&rayline_llama::HardwareInfo>,
 ) -> Option<CatalogModel> {
-    downloaded.into_iter().min_by_key(|model| {
-        (
-            fit(model, hardware).rank(),
-            std::cmp::Reverse(model.quality_score),
-        )
-    })
+    let ids = downloaded
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    recommend_from(downloaded, &ids, hardware)
 }
 
 fn downloaded_path(model: &CatalogModel) -> Option<PathBuf> {
@@ -1135,5 +1175,51 @@ mod tests {
         let model = fit_model(GIB, 0, 4096, 50);
         assert_eq!(fit(&model, None), Fit::Unknown);
         assert_eq!(fit(&model, Some(&hw(0, "none", 0))), Fit::Unknown);
+    }
+
+    #[test]
+    fn recommend_from_prefers_fit_then_downloaded_then_quality() {
+        let hardware = hw(64 * GIB, "none", 0);
+        let small_hi = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 90);
+            m.id = "small-hi".into();
+            m
+        };
+        let small_lo = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 50);
+            m.id = "small-lo".into();
+            m
+        };
+        let huge = {
+            let mut m = fit_model(100 * GIB, 0, 4096, 99);
+            m.id = "huge".into();
+            m
+        };
+        // Nothing downloaded → among the two green fits, higher quality wins; the
+        // red `huge` ranks last despite top quality.
+        let pick = recommend_from(
+            vec![huge.clone(), small_lo.clone(), small_hi.clone()],
+            &[],
+            Some(&hardware),
+        );
+        assert_eq!(pick.unwrap().id, "small-hi");
+    }
+
+    #[test]
+    fn recommend_from_prefers_already_downloaded_on_a_fit_tie() {
+        let hardware = hw(64 * GIB, "none", 0);
+        let a = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 70);
+            m.id = "a".into();
+            m
+        };
+        let b = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 70);
+            m.id = "b".into();
+            m
+        };
+        // Same fit + quality; `b` is downloaded → preferred (avoids a download).
+        let pick = recommend_from(vec![a, b], &["b".to_owned()], Some(&hardware));
+        assert_eq!(pick.unwrap().id, "b");
     }
 }
