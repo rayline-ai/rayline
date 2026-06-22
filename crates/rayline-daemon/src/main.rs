@@ -303,6 +303,11 @@ struct ProxyArgs {
     /// Local router records routed request metrics; proxy records passthrough only.
     #[arg(long, hide = true)]
     local_router_owns_metrics: bool,
+
+    /// Metrics-control listen port for `rayline router top` when the proxy
+    /// self-hosts metrics (i.e. when --metrics-url is not set).
+    #[arg(long, env = METRICS_PORT_ENV, default_value_t = rayline_metrics::DEFAULT_METRICS_PORT, hide = true)]
+    metrics_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -757,10 +762,32 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
     opts.routing_mode = args.proxy_routing_mode.into();
     opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
     opts.local_router_owns_metrics = args.local_router_owns_metrics;
-    opts.metrics = args
-        .metrics_url
-        .as_deref()
-        .map(|url| Arc::new(HttpMetricsSink::new(url)) as SharedMetricsSink);
+    // Forward to a serve daemon when one owns metrics; otherwise self-host so
+    // `rayline top` works for cloud-only and isolated proxy sessions too.
+    opts.metrics = match proxy_metrics_plan(args.metrics_url.as_deref(), args.metrics_port) {
+        ProxyMetricsPlan::Forward(url) => {
+            Some(Arc::new(HttpMetricsSink::new(&url)) as SharedMetricsSink)
+        }
+        ProxyMetricsPlan::SelfHost(metrics_port) => {
+            let metrics = RouterMetrics::new("rayline-proxy");
+            let sink: SharedMetricsSink = metrics.clone();
+            // Best-effort: a metrics bind failure must not take down the proxy
+            // data path. Degrade to no metrics for this session instead.
+            match bind_metrics_control(metrics_port).await {
+                Ok(listener) => {
+                    spawn_metrics_control(metrics, listener);
+                    Some(sink)
+                }
+                Err(error) => {
+                    warn!(
+                        "proxy metrics disabled: could not bind metrics control on \
+                         127.0.0.1:{metrics_port}: {error}"
+                    );
+                    None
+                }
+            }
+        }
+    };
 
     info!(
         "{} proxy ready target — HTTPS_PROXY=http://127.0.0.1:{} NODE_EXTRA_CA_CERTS={}",
@@ -769,6 +796,22 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
         opts.ca_cert_path.display()
     );
     rayline_proxy::serve(opts).await
+}
+
+/// How a proxy-mode launch wires up metrics. A serve daemon, when present, owns
+/// the metrics server and the proxy forwards to it; otherwise the proxy stands
+/// up its own server so monitoring works for any proxy session.
+#[derive(Debug, Eq, PartialEq)]
+enum ProxyMetricsPlan {
+    Forward(String),
+    SelfHost(u16),
+}
+
+fn proxy_metrics_plan(metrics_url: Option<&str>, metrics_port: u16) -> ProxyMetricsPlan {
+    match metrics_url {
+        Some(url) => ProxyMetricsPlan::Forward(url.to_owned()),
+        None => ProxyMetricsPlan::SelfHost(metrics_port),
+    }
 }
 
 struct HttpMetricsSink {
@@ -1174,6 +1217,43 @@ async fn ensure_llama_binary(manager: &rayline_llama::LlamaServerManager, tag: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_self_hosts_metrics_when_no_forwarding_url() {
+        let plan = proxy_metrics_plan(None, 20814);
+        assert_eq!(plan, ProxyMetricsPlan::SelfHost(20814));
+    }
+
+    #[test]
+    fn proxy_forwards_metrics_when_url_present() {
+        let plan = proxy_metrics_plan(Some("http://127.0.0.1:20813"), 20814);
+        assert_eq!(
+            plan,
+            ProxyMetricsPlan::Forward("http://127.0.0.1:20813".to_owned())
+        );
+    }
+
+    /// End-to-end cut-point for the self-host path: a proxy that is not forwarding
+    /// stands up its own metrics-control server (the exact `bind_metrics_control` +
+    /// `spawn_metrics_control` mechanism `run_proxy`'s `SelfHost` arm uses) and that
+    /// server answers `rayline top`'s snapshot probe with a well-formed payload.
+    #[tokio::test]
+    async fn self_hosted_proxy_metrics_serves_well_formed_snapshot() {
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let listener = bind_metrics_control(0).await.expect("bind metrics control");
+        let port = listener.local_addr().expect("listener addr").port();
+        spawn_metrics_control(metrics, listener);
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+        let response = client.get(&url).send().await.expect("snapshot request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let body: serde_json::Value = response.json().await.expect("json body");
+        for key in ["ok", "totals", "active", "recent"] {
+            assert!(body.get(key).is_some(), "snapshot missing `{key}`: {body}");
+        }
+    }
 
     #[test]
     fn llama_perf_parser_reads_prefill_progress() {
