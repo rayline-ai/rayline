@@ -3847,10 +3847,15 @@ mod tests {
         assert_eq!(metrics.snapshot().totals.routing_uncertain, 2);
     }
 
-    /// Exercises the proxy's own warn+counter branch via the extracted helper
-    /// `emit_if_agent_type_unresolved`.  Because `forward_anthropic_request`
-    /// delegates to this helper, deleting or bypassing the helper in the async
-    /// function causes this test to fail.
+    /// Pins the behavior of the extracted helper `emit_if_agent_type_unresolved`:
+    /// when `agent_id` was present but type resolution exhausted, it warns and
+    /// increments `routing_uncertain`.
+    ///
+    /// Coverage gap (known residual): this test does NOT pin the helper's
+    /// *invocation* from `forward_anthropic_request` — deleting that call site
+    /// in the async path would not fail any unit test here. Pinning it would
+    /// require async/mock-server integration infrastructure, deferred as
+    /// out-of-scope for this observability task.
     ///
     /// Scenario: `agent_id` was present in the request (agent_id_present=true)
     /// but resolution exhausted all retries (agent_type=None).
