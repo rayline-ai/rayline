@@ -192,9 +192,18 @@ Notes:
 ## Provider Endpoints
 
 Provider endpoints go in the same static router config. Use env vars for API
-keys so secrets do not live in JSON. The local router sends `api_key_env` as
-`x-api-key` for `anthropic_messages` endpoints and as bearer auth for
-`openai_chat` endpoints.
+keys so secrets do not live in JSON. By default the local router sends
+`api_key_env` as `x-api-key` for `anthropic_messages` endpoints and as bearer
+auth for `openai_chat` endpoints. Set the optional per-endpoint `auth` field
+(`"bearer"` or `"api_key"`) to override that default — for example OpenRouter's
+Anthropic-native endpoint expects `"bearer"`.
+
+Both protocols stream incrementally: `anthropic_messages` forwards the
+upstream's native Anthropic SSE verbatim, and `openai_chat` translates the
+upstream OpenAI Chat SSE into Anthropic SSE chunk by chunk (one
+`content_block_delta` per fragment) so tokens reach Claude Code as they arrive.
+`openai_chat` also forwards image blocks: Anthropic `image` blocks become OpenAI
+`image_url` content parts (base64 sources become `data:` URLs).
 
 Anthropic-compatible endpoint:
 
@@ -220,32 +229,62 @@ Anthropic-compatible endpoint:
 }
 ```
 
-OpenRouter or OpenAI-compatible endpoint:
+OpenRouter (recommended via its Anthropic-native endpoint). OpenRouter serves
+`POST https://openrouter.ai/api/v1/messages`, a real Anthropic Messages
+endpoint that returns native Anthropic SSE and supports images and tools. Use
+`protocol: anthropic_messages` with `base_url: "https://openrouter.ai/api"` (the
+router appends `/v1/messages`) and `auth: "bearer"` so the key is sent as
+`Authorization: Bearer`. This gives true native streaming for free:
 
 ```json
 {
   "endpoints": [
     {
-      "id": "openrouter-fast",
-      "protocol": "openai_chat",
-      "base_url": "https://openrouter.ai/api/v1",
+      "id": "openrouter",
+      "protocol": "anthropic_messages",
+      "base_url": "https://openrouter.ai/api",
       "api_key_env": "OPENROUTER_API_KEY",
-      "models": ["openai/gpt-5.2"]
+      "auth": "bearer",
+      "models": ["anthropic/claude-sonnet-4.6"]
     }
   ],
   "routes": {
     "subagents": {
       "Explore": {
-        "endpoint": "openrouter-fast",
-        "model": "openai/gpt-5.2"
+        "endpoint": "openrouter",
+        "model": "anthropic/claude-sonnet-4.6"
       }
     }
   }
 }
 ```
 
-For OpenAI itself, use the same `openai_chat` protocol with
-`https://api.openai.com/v1` and `OPENAI_API_KEY`.
+For OpenAI itself (which has no Anthropic-native endpoint), use the `openai_chat`
+protocol with `https://api.openai.com/v1` and `OPENAI_API_KEY`. The router opens
+the upstream with `stream: true` and translates the OpenAI Chat SSE into
+Anthropic SSE in real time, so OpenAI also streams token by token:
+
+```json
+{
+  "endpoints": [
+    {
+      "id": "openai",
+      "protocol": "openai_chat",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "models": ["gpt-4o-mini"]
+    }
+  ],
+  "routes": {
+    "subagents": {
+      "Explore": {
+        "endpoint": "openai",
+        "model": "gpt-4o-mini"
+      }
+    }
+  }
+}
+```
 
 Arbitrary local OpenAI-compatible endpoint, including a separately managed
 llama.cpp server:

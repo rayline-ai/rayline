@@ -84,10 +84,23 @@ pub struct EndpointConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Overrides the protocol-default auth scheme. `None` keeps the historical
+    /// per-protocol behavior (`anthropic_messages` -> `x-api-key`,
+    /// `openai_chat` -> bearer).
+    #[serde(default)]
+    pub auth: Option<AuthMode>,
 }
 
 fn default_endpoint_kind() -> String {
     "provider".to_owned()
+}
+
+/// Optional per-endpoint auth override (serialized as `"bearer"` / `"api_key"`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Bearer,
+    ApiKey,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -317,6 +330,7 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
                 models: vec!["claude-sonnet-4-6".to_owned(), "claude-opus-4-7".to_owned()],
                 headers: HashMap::new(),
+                auth: None,
             },
             EndpointConfig {
                 id: "openai".to_owned(),
@@ -326,18 +340,20 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 api_key_env: Some("OPENAI_API_KEY".to_owned()),
                 models: vec!["gpt-5.2".to_owned(), "gpt-5.2-codex".to_owned()],
                 headers: HashMap::new(),
+                auth: None,
             },
             EndpointConfig {
+                // OpenRouter exposes a native Anthropic Messages endpoint at
+                // /v1/messages that accepts bearer auth and streams native
+                // Anthropic SSE, so prefer it over the openai_chat shim.
                 id: "openrouter".to_owned(),
                 kind: "provider".to_owned(),
-                protocol: EndpointProtocol::OpenAIChat,
-                base_url: "https://openrouter.ai/api/v1".to_owned(),
+                protocol: EndpointProtocol::AnthropicMessages,
+                base_url: "https://openrouter.ai/api".to_owned(),
                 api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
-                models: vec![
-                    "openai/gpt-5.2".to_owned(),
-                    "anthropic/claude-sonnet-4.6".to_owned(),
-                ],
+                models: vec!["anthropic/claude-sonnet-4.6".to_owned()],
                 headers: HashMap::new(),
+                auth: Some(AuthMode::Bearer),
             },
         ],
         routes: RoutesConfig {
@@ -951,10 +967,20 @@ enum AuthStyle {
     Bearer,
 }
 
+/// Resolve the auth scheme actually used for an endpoint: an explicit `auth`
+/// override wins, otherwise the protocol's historical default is kept.
+fn resolve_auth_style(endpoint: &EndpointConfig, protocol_default: AuthStyle) -> AuthStyle {
+    match endpoint.auth {
+        Some(AuthMode::Bearer) => AuthStyle::Bearer,
+        Some(AuthMode::ApiKey) => AuthStyle::Anthropic,
+        None => protocol_default,
+    }
+}
+
 fn apply_endpoint_headers(
     mut request: reqwest::RequestBuilder,
     endpoint: &EndpointConfig,
-    auth_style: AuthStyle,
+    protocol_default: AuthStyle,
 ) -> Result<reqwest::RequestBuilder> {
     for (name, value) in &endpoint.headers {
         request = request.header(name, value);
@@ -966,7 +992,7 @@ fn apply_endpoint_headers(
                 endpoint.id
             )
         })?;
-        request = match auth_style {
+        request = match resolve_auth_style(endpoint, protocol_default) {
             AuthStyle::Anthropic => request.header("x-api-key", key),
             AuthStyle::Bearer => request.bearer_auth(key),
         };
@@ -3025,6 +3051,35 @@ mod tests {
         // Streaming requests must opt in to the trailing usage chunk.
         assert_eq!(request["stream"], true);
         assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn auth_override_resolves_over_protocol_default() {
+        let mut endpoint = EndpointConfig {
+            id: "x".to_owned(),
+            kind: "provider".to_owned(),
+            protocol: EndpointProtocol::AnthropicMessages,
+            base_url: "https://example".to_owned(),
+            api_key_env: None,
+            models: vec![],
+            headers: HashMap::new(),
+            auth: None,
+        };
+        // No override: protocol default is kept.
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Anthropic),
+            AuthStyle::Anthropic
+        ));
+        endpoint.auth = Some(AuthMode::Bearer);
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Anthropic),
+            AuthStyle::Bearer
+        ));
+        endpoint.auth = Some(AuthMode::ApiKey);
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Bearer),
+            AuthStyle::Anthropic
+        ));
     }
 
     /// Feed bytes through the translator one byte at a time to stress the
