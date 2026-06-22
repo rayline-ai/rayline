@@ -139,6 +139,33 @@ differently:
 
 Both directions are overridable via `--route {all|subagents}`.
 
+### Implicit account-local routing (run-time correction)
+
+There is a *third* way the local router engages that the parser cannot see: the
+hosted account toggle `enable_local_router`. When it is on and the machine has a
+usable on-device `local_model` config, a bare `rayline claude` engages local
+routing at run time — even though the user passed no `--local`
+(`claude.rs:355-379`). This decision needs a `/v1/settings` fetch the parser
+does not perform, so it lands *after* `resolve_routing_mode`.
+
+Two invariants must therefore be re-asserted at run time, once engagement is
+known (signalled by `local_start_request.is_some()`):
+
+1. **Scope default follows engagement, not the flag.** A bare cloud
+   `rayline claude` parses to route-`All` (`Proxy`). If account-local then
+   engages and the user did *not* pin `--route`, the scope falls back to
+   `SubagentsOnly` — the same hybrid default as explicit `--local`. Without this,
+   the main agent would be silently sent to the local model. `route_scope_explicit`
+   is carried on `RunRequest` so an explicit `--route all` is still honored.
+2. **Env is cloud-only, always.** `--via env` (`Override`) must never engage
+   local inference, regardless of the account toggle — that is the contract the
+   CLI help and the `--via env` rejection errors state. The implicit-engagement
+   gate excludes `Override` outright.
+
+Both are enforced by two small pure helpers — `implicit_local_engages` (the
+gate) and `effective_routing_mode` (the scope correction) — applied where the
+run-time signal is available.
+
 ## Proposed CLI surface
 
 | Command                                | Router | Mechanism (`--via`)  | Scope          |

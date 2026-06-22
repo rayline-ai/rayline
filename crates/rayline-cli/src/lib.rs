@@ -1004,6 +1004,7 @@ where
         isolated,
         local_injector_port,
         routing_mode,
+        route_scope_explicit: route_scope.is_some(),
         route_statusline_enabled,
         diagnose,
         upstream_ca_path,
