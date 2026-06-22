@@ -3,7 +3,7 @@
 //! default routes.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -133,6 +133,40 @@ pub fn write_onboarding_in_home(home: &Path, marker: &OnboardingMarker) -> io::R
     status::write_settings(home, &settings)
 }
 
+/// Conservative read-only / exploration subagents routed on-device by default
+/// under `--local` (subagents scope). Name-based: the proxy matches the
+/// agent-type header. `Explore` is the only guaranteed-present Claude Code
+/// agent; the others are common read-only helpers and are harmless when absent.
+/// Widen with `--route all` or `--router-config-path`.
+pub const LOCAL_DEFAULT_SUBAGENTS: &[&str] = &[
+    "Explore",
+    "codebase-locator",
+    "codebase-analyzer",
+    "codebase-pattern-finder",
+];
+
+/// The managed default router config: route only the read-only allowlist to the
+/// local endpoint. In `proxy-subagents` mode the proxy intercepts *only* these
+/// agent types, so everything else (main + other subagents) stays on cloud.
+pub fn default_local_routes_json() -> Value {
+    let mut subagents = serde_json::Map::new();
+    for name in LOCAL_DEFAULT_SUBAGENTS {
+        subagents.insert((*name).to_owned(), json!({ "endpoint": "local" }));
+    }
+    json!({ "routes": { "subagents": Value::Object(subagents) } })
+}
+
+/// Write the managed default routes under the router state dir and return its
+/// path. Regenerated idempotently each launch so anchor changes roll forward.
+pub fn write_default_local_routes(home: &Path) -> io::Result<PathBuf> {
+    let dir = home.join(crate::ROUTER_STATE_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("local-default-routes.json");
+    let body = serde_json::to_vec_pretty(&default_local_routes_json()).map_err(io::Error::other)?;
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +262,28 @@ mod tests {
     fn read_onboarding_none_when_absent() {
         let home = tmp_home();
         assert!(read_onboarding(&home).is_none());
+    }
+
+    #[test]
+    fn default_routes_json_lists_read_only_allowlist_as_local() {
+        let value = default_local_routes_json();
+        let subagents = value["routes"]["subagents"].as_object().unwrap();
+        assert_eq!(subagents.len(), LOCAL_DEFAULT_SUBAGENTS.len());
+        for name in LOCAL_DEFAULT_SUBAGENTS {
+            assert_eq!(subagents[*name]["endpoint"], "local");
+        }
+        // Explore is the guaranteed anchor.
+        assert!(subagents.contains_key("Explore"));
+    }
+
+    #[test]
+    fn write_default_local_routes_is_idempotent() {
+        let home = tmp_home();
+        let a = write_default_local_routes(&home).unwrap();
+        let b = write_default_local_routes(&home).unwrap();
+        assert_eq!(a, b);
+        let text = std::fs::read_to_string(&a).unwrap();
+        assert!(text.contains("\"Explore\""));
+        assert!(text.contains("\"endpoint\": \"local\""));
     }
 }
