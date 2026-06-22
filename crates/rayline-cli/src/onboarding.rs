@@ -2,13 +2,13 @@
 //! local model, the persisted completion marker, and the conservative read-only
 //! default routes.
 
-use std::io;
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::status;
+use crate::{catalog, local_model, status};
 
 /// Onboarding-flow schema. Bump when the flow changes materially so existing
 /// users are re-onboarded on their next interactive `--local` launch.
@@ -156,6 +156,155 @@ pub fn default_local_routes_json() -> Value {
     json!({ "routes": { "subagents": Value::Object(subagents) } })
 }
 
+/// Readiness verdict returned to the `--local` launch path.
+pub enum LocalModelReadiness {
+    /// A usable local model exists; proceed with local routing.
+    Ready(local_model::LocalModelConfig),
+    /// No usable model — either the user skipped, the session is
+    /// non-interactive, or the wizard was already completed and the model
+    /// disappeared. Caller should warn and stay on cloud.
+    NotConfigured,
+}
+
+/// Ensure a usable local model exists for a `--local` launch, running the
+/// first-run wizard when appropriate. Returns `NotConfigured` when the user
+/// skips or the session is non-interactive — the caller surfaces guidance.
+pub async fn ensure_local_model(home: &Path, env_name: &str) -> io::Result<LocalModelReadiness> {
+    let cfg = local_model::read_from_home(home);
+    let engageable = cfg.as_ref().is_some_and(|c| c.is_engageable());
+    if engageable {
+        return Ok(LocalModelReadiness::Ready(cfg.expect("engageable")));
+    }
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let marker = read_onboarding(home);
+    match decide(false, interactive, marker.as_ref(), ONBOARDING_SCHEMA) {
+        OnboardingDecision::RunWizard => {
+            run_wizard(home, env_name).await?;
+            let cfg = local_model::read_from_home(home);
+            if cfg.as_ref().is_some_and(|c| c.is_engageable()) {
+                Ok(LocalModelReadiness::Ready(cfg.expect("engageable")))
+            } else {
+                Ok(LocalModelReadiness::NotConfigured) // user skipped
+            }
+        }
+        OnboardingDecision::Decline | OnboardingDecision::UseExisting => {
+            Ok(LocalModelReadiness::NotConfigured)
+        }
+    }
+}
+
+/// `<cli> local onboard [--reset]` — re-run the wizard from a terminal.
+pub async fn run_onboard_command(env_name: Option<&str>, reset: bool) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let env = status::resolve_env(env_name, Some(&home));
+    if reset {
+        let _ = local_model::clear(); // best-effort clean slate
+    }
+    run_wizard(&home, &env)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Interactive wizard: one decision with a hardware-aware default. Writes the
+/// `local_model` selection (via existing setters) and the onboarding marker.
+async fn run_wizard(home: &Path, env_name: &str) -> io::Result<OnboardingOutcome> {
+    let cli = crate::CLI_BIN;
+    let hardware = catalog::detect_hardware();
+    let recommended = catalog::recommend_for_hardware(env_name, hardware).await;
+
+    eprintln!(
+        "Rayline can offload read-only exploration subagents (read / glob / grep) to a\nlocal model so the frontier model stays your manager. This is optional.\n"
+    );
+    if let Some(model) = recommended.as_ref() {
+        eprintln!(
+            "  Recommended: {id} — {size}",
+            id = model.id,
+            size = catalog::format_bytes(model.size_bytes),
+        );
+    } else {
+        eprintln!("  (No recommended model fits this machine automatically.)");
+    }
+    eprintln!(
+        "\n  [Y] Download & use the recommended model   (default)\n  [m] See all models\n  [o] Use my own server (Ollama / LM Studio / llama.cpp URL)\n  [s] Skip — stay on cloud for now\n"
+    );
+    eprint!("> ");
+    io::stderr().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim().to_ascii_lowercase();
+
+    let outcome = match choice.as_str() {
+        "" | "y" => match recommended {
+            Some(model) => {
+                catalog::download(&model, false)
+                    .await
+                    .map_err(io::Error::other)?;
+                local_model::set_recommended(&model).map_err(io::Error::other)?;
+                eprintln!("Local model set to {}.", model.id);
+                OnboardingOutcome::LocalModel
+            }
+            None => {
+                eprintln!("No recommended model available; staying on cloud.");
+                OnboardingOutcome::Skipped
+            }
+        },
+        "m" => {
+            let listing = catalog::models_command(Some(env_name), false)
+                .await
+                .map_err(io::Error::other)?;
+            eprint!("{listing}");
+            eprint!("Model id to use: ");
+            io::stderr().flush().ok();
+            let mut id = String::new();
+            io::stdin().read_line(&mut id)?;
+            let id = id.trim();
+            if id.is_empty() {
+                eprintln!("No model chosen; staying on cloud.");
+                OnboardingOutcome::Skipped
+            } else {
+                catalog::use_command(Some(env_name), id)
+                    .await
+                    .map_err(io::Error::other)?;
+                OnboardingOutcome::LocalModel
+            }
+        }
+        "o" => {
+            eprint!("Server URL (e.g. http://127.0.0.1:11434): ");
+            io::stderr().flush().ok();
+            let mut url = String::new();
+            io::stdin().read_line(&mut url)?;
+            eprint!("Model name it serves: ");
+            io::stderr().flush().ok();
+            let mut model = String::new();
+            io::stdin().read_line(&mut model)?;
+            let request = local_model::LocalCustomRequest {
+                base_url: Some(url.trim().to_owned()),
+                model: Some(model.trim().to_owned()),
+            };
+            local_model::set_custom(&request).map_err(io::Error::other)?;
+            eprintln!("Custom endpoint saved. Test it with `{cli} local test`.");
+            OnboardingOutcome::CustomEndpoint
+        }
+        _ => {
+            eprintln!("Skipping — staying on cloud. Re-run later with `{cli} local onboard`.");
+            OnboardingOutcome::Skipped
+        }
+    };
+
+    write_onboarding_in_home(
+        home,
+        &OnboardingMarker {
+            schema: ONBOARDING_SCHEMA,
+            completed_at: now_unix(),
+            cli_version: crate::RAYLINE_VERSION.to_owned(),
+            outcome,
+        },
+    )?;
+    Ok(outcome)
+}
+
 /// Write the managed default routes under the router state dir and return its
 /// path. Regenerated idempotently each launch so anchor changes roll forward.
 pub fn write_default_local_routes(home: &Path) -> io::Result<PathBuf> {
@@ -285,5 +434,15 @@ mod tests {
         let text = std::fs::read_to_string(&a).unwrap();
         assert!(text.contains("\"Explore\""));
         assert!(text.contains("\"endpoint\": \"local\""));
+    }
+
+    #[tokio::test]
+    async fn ensure_local_model_declines_non_interactively_without_marker() {
+        // Run under a temp HOME with no local_model. In CI/tests stdin is not a
+        // TTY, so `decide` returns Decline → NotConfigured, no marker written.
+        let home = tmp_home();
+        let readiness = ensure_local_model(&home, "prod").await.unwrap();
+        assert!(matches!(readiness, LocalModelReadiness::NotConfigured));
+        assert!(read_onboarding(&home).is_none());
     }
 }
