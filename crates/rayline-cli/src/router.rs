@@ -17,6 +17,10 @@ const DEFAULT_INJECTOR_PORT: u16 = 20809;
 const DEFAULT_ADAPTER_PORT: u16 = 20808;
 const DEFAULT_PROXY_PORT: u16 = 20810;
 pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
+/// Metrics-control port the isolated proxy self-hosts on, distinct from the
+/// shared `rayline_metrics::DEFAULT_METRICS_PORT` (20813) so an isolated and a
+/// non-isolated cloud-only session can both expose metrics at once.
+const DEFAULT_ISOLATED_METRICS_PORT: u16 = 20814;
 pub const DEFAULT_LOCAL_ROUTER_MODEL_ID: &str = "qwen3.6-35b-a3b-q4km";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_TIMEOUT_SECONDS: u64 = 240;
@@ -255,13 +259,15 @@ pub async fn render_top(request: &RouterTopRequest) -> io::Result<String> {
 }
 
 async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Result<String> {
-    let meta = read_meta(&RouterPaths::new(home).meta_file);
-    let metrics_port = parse_optional_port(meta.get("metrics_port"))
-        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT);
+    let serve_meta = read_meta(&RouterPaths::new(home).meta_file);
+    let proxy_meta = read_meta(&RouterPaths::new(home).proxy_meta_file);
+    let isolated_proxy_meta = read_meta(&RouterPaths::new_isolated(home).proxy_meta_file);
+    let candidates = metrics_port_candidates(&serve_meta, &proxy_meta, &isolated_proxy_meta);
     let client = reqwest::Client::builder()
         .timeout(HEALTH_TIMEOUT)
         .build()
         .map_err(io::Error::other)?;
+    let metrics_port = first_reachable_metrics_port(&client, &candidates).await;
     let url = format!("http://127.0.0.1:{metrics_port}/v1/router/top/snapshot");
     let mut trace_cache = ClaudeTraceCache::new(home);
 
@@ -1842,7 +1848,10 @@ async fn start_proxy_from_home_with_client(
         stop_proxy(&paths, client, &mut output, true).await?;
     }
 
-    let metrics_url = metrics_url_from_router_meta(home);
+    let metrics_url = serve_metrics_forward_url(home, client).await;
+    let self_hosted_metrics_port = metrics_url
+        .is_none()
+        .then(|| resolve_metrics_port(isolated));
     let requested_meta = proxy_meta(
         home,
         router_url,
@@ -1854,6 +1863,7 @@ async fn start_proxy_from_home_with_client(
         router_config_path,
         local_config,
         metrics_url.as_deref(),
+        self_hosted_metrics_port,
     );
     if let Some(existing) = read_pid(&paths.proxy_pid_file) {
         if process_exists(existing) {
@@ -1949,6 +1959,7 @@ async fn start_proxy_from_home_with_client(
         &mut output,
     )
     .await?;
+    reconcile_self_hosted_metrics_meta(&paths, self_hosted_metrics_port, client, &mut output).await;
     Ok(output)
 }
 
@@ -2118,6 +2129,8 @@ fn spawn_proxy(
 ) -> io::Result<StartedProxy> {
     let paths = RouterPaths::for_isolation(home, isolated);
     std::fs::create_dir_all(paths.data_dir())?;
+    let metrics_port = resolve_metrics_port(isolated);
+    let self_hosted_metrics_port = metrics_url.is_none().then_some(metrics_port);
     let requested_meta = proxy_meta(
         home,
         router_url,
@@ -2129,12 +2142,14 @@ fn spawn_proxy(
         router_config_path,
         local_config,
         metrics_url,
+        self_hosted_metrics_port,
     );
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.proxy_log_file)?;
     let proxy_port_arg = proxy_port.to_string();
+    let metrics_port_arg = metrics_port.to_string();
     let ca_cert_path = proxy_ca_cert_path(home);
     let ca_key_path = proxy_ca_key_path(home);
     let ca_cert_arg = ca_cert_path.display().to_string();
@@ -2144,6 +2159,8 @@ fn spawn_proxy(
         "proxy",
         "--proxy-port",
         &proxy_port_arg,
+        "--metrics-port",
+        &metrics_port_arg,
         "--router-url",
         router_url,
         "--ca-cert-path",
@@ -2394,14 +2411,63 @@ fn router_meta(
     meta
 }
 
-fn metrics_url_from_router_meta(home: &Path) -> Option<String> {
-    let meta = read_meta(&RouterPaths::new(home).meta_file);
-    if meta.is_empty() {
+/// The serve daemon's metrics-control URL the proxy should forward to, or
+/// `None` when the proxy should self-host its own metrics instead.
+///
+/// Forwarding is chosen only when a serve daemon is actually live. Stale serve
+/// meta left behind by a crashed daemon must not pin a cloud-only proxy to a
+/// dead endpoint — that would leave `rayline top` with no metrics. The empty
+/// fast-path skips the liveness probe entirely for the common cloud-only launch
+/// where no serve daemon has ever published meta.
+async fn serve_metrics_forward_url(home: &Path, client: &reqwest::Client) -> Option<String> {
+    let paths = RouterPaths::new(home);
+    let serve_meta = read_meta(&paths.meta_file);
+    if serve_meta.is_empty() {
         return None;
     }
-    let port = parse_optional_port(meta.get("metrics_port"))
+    let serve_running = is_serve_daemon_running(&paths, client).await;
+    serve_metrics_url(serve_running, &serve_meta)
+}
+
+/// Pure decision: the serve metrics-control URL when a serve daemon is live and
+/// has published meta, else `None` so the proxy self-hosts.
+fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>) -> Option<String> {
+    if !serve_running || serve_meta.is_empty() {
+        return None;
+    }
+    let port = parse_optional_port(serve_meta.get("metrics_port"))
         .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT);
     Some(format!("http://127.0.0.1:{port}"))
+}
+
+/// Once the proxy is healthy, make the advertised `metrics_port` reflect what the
+/// daemon actually bound. The daemon self-hosts metrics best-effort: on a port
+/// collision it runs without metrics rather than failing the proxy. Leaving
+/// `metrics_port` in the proxy meta then points `rayline top` (and future
+/// launches' port discovery) at an endpoint the proxy never owned, so drop it
+/// when the self-hosted server is not answering. Metrics stays best-effort —
+/// this only edits meta and never restarts the proxy.
+async fn reconcile_self_hosted_metrics_meta(
+    paths: &RouterPaths,
+    self_hosted_metrics_port: Option<u16>,
+    client: &reqwest::Client,
+    output: &mut String,
+) {
+    let Some(port) = self_hosted_metrics_port else {
+        return;
+    };
+    if metrics_port_is_serving(client, port).await {
+        return;
+    }
+    let mut meta = read_meta(&paths.proxy_meta_file);
+    if meta.remove("metrics_port").is_some() {
+        let _ = std::fs::write(&paths.proxy_meta_file, format_meta(&meta));
+        output.push_str(&format!(
+            "warning: {} proxy could not self-host metrics on :{port}; `{} top` metrics are disabled for this session.\n",
+            daemon_name(),
+            cli_name(),
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2416,6 +2482,7 @@ fn proxy_meta(
     router_config_path: Option<&Path>,
     local_config: Option<&ProxyLocalConfig>,
     metrics_url: Option<&str>,
+    self_hosted_metrics_port: Option<u16>,
 ) -> BTreeMap<String, String> {
     let mut meta = BTreeMap::new();
     meta.insert("router_url".to_owned(), router_url.to_owned());
@@ -2445,6 +2512,12 @@ fn proxy_meta(
     }
     if let Some(metrics_url) = metrics_url {
         meta.insert("metrics_url".to_owned(), metrics_url.to_owned());
+    }
+    // Only recorded when the proxy self-hosts metrics (i.e. it is not forwarding
+    // to a serve daemon), so `rayline top` only ever discovers a port the proxy
+    // actually owns.
+    if let Some(metrics_port) = self_hosted_metrics_port {
+        meta.insert("metrics_port".to_owned(), metrics_port.to_string());
     }
     meta.insert(
         "ca_cert_path".to_owned(),
@@ -2477,7 +2550,12 @@ fn metadata_matches_config(
     expected: &BTreeMap<String, String>,
 ) -> bool {
     expected.iter().all(|(key, expected_value)| {
-        if key == "bin_path" {
+        // `bin_path` may legitimately differ (PATH vs absolute launcher).
+        // `metrics_port` is a best-effort runtime fact reconciled after the
+        // proxy is ready (see reconcile_self_hosted_metrics_meta), not a config
+        // input — a difference must never churn-restart an otherwise healthy
+        // proxy just because metrics could or could not self-host.
+        if key == "bin_path" || key == "metrics_port" {
             return true;
         }
         let Some(actual) = meta.get(key) else {
@@ -2626,6 +2704,12 @@ fn set_proxy_child_env(command: &mut Command, router_api_key: &str, proxy_port: 
             command.env_remove(name);
         }
     }
+    // The forward-vs-self-host decision is carried solely by the `--metrics-url`
+    // flag, passed only when forwarding to a serve daemon. Clear any inherited
+    // RAYLINE_METRICS_URL so a value in the launcher's environment cannot
+    // override that decision via clap's env fallback and force a self-hosting
+    // proxy to forward to a stale endpoint instead of binding its own server.
+    command.env_remove("RAYLINE_METRICS_URL");
     command.env("RAYLINE_ROUTER_API_KEY", router_api_key);
 }
 
@@ -2766,6 +2850,307 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn first_reachable_metrics_port_skips_unreachable_and_picks_live_server() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A port that is bound then released: probing it gets connection-refused.
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = released.local_addr().unwrap().port();
+        drop(released);
+
+        // A live responder that answers the snapshot probe with 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = b"{\"ok\":true}";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let port = first_reachable_metrics_port(&client, &[closed_port, live_port]).await;
+        assert_eq!(port, live_port);
+    }
+
+    #[tokio::test]
+    async fn first_reachable_metrics_port_falls_back_to_first_when_none_reachable() {
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = released.local_addr().unwrap().port();
+        drop(released);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let port = first_reachable_metrics_port(&client, &[closed_port]).await;
+        assert_eq!(port, closed_port);
+    }
+
+    #[test]
+    fn resolve_metrics_port_defaults_by_isolation() {
+        // Env-driven overrides are exercised elsewhere; these assert the
+        // default ports the proxy self-hosts on per isolation state.
+        unsafe {
+            std::env::remove_var("RAYLINE_METRICS_PORT");
+            std::env::remove_var("RAYLINE_ISOLATED_METRICS_PORT");
+        }
+        assert_eq!(
+            resolve_metrics_port(false),
+            rayline_metrics::DEFAULT_METRICS_PORT
+        );
+        assert_eq!(resolve_metrics_port(true), DEFAULT_ISOLATED_METRICS_PORT);
+        assert_ne!(
+            DEFAULT_ISOLATED_METRICS_PORT,
+            rayline_metrics::DEFAULT_METRICS_PORT
+        );
+    }
+
+    #[test]
+    fn proxy_meta_records_metrics_port_only_when_self_hosting() {
+        let home = Path::new("/tmp/rayline-test-home");
+
+        let self_hosted = proxy_meta(
+            home,
+            "https://r",
+            "key",
+            20812,
+            "selective-subagents",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(20814),
+        );
+        assert_eq!(
+            self_hosted.get("metrics_port").map(String::as_str),
+            Some("20814")
+        );
+
+        let forwarding = proxy_meta(
+            home,
+            "https://r",
+            "key",
+            20810,
+            "selective-subagents",
+            None,
+            None,
+            None,
+            None,
+            Some("http://127.0.0.1:20813"),
+            None,
+        );
+        assert_eq!(forwarding.get("metrics_port"), None);
+    }
+
+    fn meta_with_metrics_port(port: u16) -> BTreeMap<String, String> {
+        let mut meta = BTreeMap::new();
+        meta.insert("metrics_port".to_owned(), port.to_string());
+        meta
+    }
+
+    #[test]
+    fn metrics_port_candidates_order_serve_then_proxy_then_isolated_then_default() {
+        let serve = meta_with_metrics_port(20900);
+        let proxy = meta_with_metrics_port(20901);
+        let isolated = meta_with_metrics_port(20902);
+
+        let ports = metrics_port_candidates(&serve, &proxy, &isolated);
+
+        assert_eq!(
+            ports,
+            vec![20900, 20901, 20902, rayline_metrics::DEFAULT_METRICS_PORT]
+        );
+    }
+
+    #[test]
+    fn metrics_port_candidates_fall_back_to_default_when_all_meta_empty() {
+        let empty = BTreeMap::new();
+
+        let ports = metrics_port_candidates(&empty, &empty, &empty);
+
+        assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
+    }
+
+    #[test]
+    fn serve_metrics_url_none_when_serve_not_running() {
+        // Regression: a crashed serve daemon can leave stale meta behind. The
+        // proxy must not forward metrics to that dead endpoint — it should
+        // self-host instead so `rayline top` still works.
+        let stale = meta_with_metrics_port(20813);
+
+        assert_eq!(serve_metrics_url(false, &stale), None);
+    }
+
+    #[test]
+    fn serve_metrics_url_forwards_when_serve_running() {
+        let serve = meta_with_metrics_port(20990);
+
+        assert_eq!(
+            serve_metrics_url(true, &serve),
+            Some("http://127.0.0.1:20990".to_owned())
+        );
+    }
+
+    #[test]
+    fn serve_metrics_url_none_when_meta_empty() {
+        let empty = BTreeMap::new();
+
+        assert_eq!(serve_metrics_url(true, &empty), None);
+    }
+
+    #[test]
+    fn serve_metrics_url_defaults_port_when_running_without_port() {
+        let mut serve = BTreeMap::new();
+        serve.insert("router_url".to_owned(), "https://api.rayline.ai".to_owned());
+
+        assert_eq!(
+            serve_metrics_url(true, &serve),
+            Some(format!(
+                "http://127.0.0.1:{}",
+                rayline_metrics::DEFAULT_METRICS_PORT
+            ))
+        );
+    }
+
+    #[test]
+    fn proxy_child_env_drops_inherited_metrics_url() {
+        use std::ffi::OsStr;
+
+        // The proxy's forward-vs-self-host decision is carried solely by the
+        // `--metrics-url` flag (present only when forwarding). An inherited
+        // RAYLINE_METRICS_URL in the launcher env must not override it, or a
+        // self-hosting proxy would forward to a stale endpoint and never bind.
+        let mut command = Command::new("true");
+        set_proxy_child_env(&mut command, "router-key", 20810);
+
+        let removed = command
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new("RAYLINE_METRICS_URL") && value.is_none());
+
+        assert!(
+            removed,
+            "RAYLINE_METRICS_URL must be cleared for the spawned proxy"
+        );
+    }
+
+    #[test]
+    fn metadata_matches_config_ignores_metrics_port() {
+        // metrics_port is a best-effort runtime fact reconciled after readiness,
+        // not a config input — a difference must not churn-restart a healthy
+        // proxy.
+        let mut on_disk = BTreeMap::new();
+        on_disk.insert("router_url".to_owned(), "https://api.rayline.ai".to_owned());
+        let mut requested = on_disk.clone();
+        requested.insert("metrics_port".to_owned(), "20814".to_owned());
+
+        assert!(metadata_matches_config(&on_disk, &requested));
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_metrics_port_when_self_host_failed() {
+        let home = unique_test_dir("reconcile-metrics-drop");
+        let paths = RouterPaths::new(&home);
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("proxy_port".to_owned(), "20810".to_owned());
+        meta.insert("metrics_port".to_owned(), "20814".to_owned());
+        std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+
+        // A port bound then released: probing it gets connection-refused.
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = released.local_addr().unwrap().port();
+        drop(released);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut output = String::new();
+        reconcile_self_hosted_metrics_meta(&paths, Some(dead_port), &client, &mut output).await;
+
+        let after = read_meta(&paths.proxy_meta_file);
+        assert!(
+            !after.contains_key("metrics_port"),
+            "a metrics port the proxy never bound must not stay advertised"
+        );
+        assert!(output.contains("disabled"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_metrics_port_when_self_host_serving() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let home = unique_test_dir("reconcile-metrics-keep");
+        let paths = RouterPaths::new(&home);
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("metrics_port".to_owned(), "20814".to_owned());
+        std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = b"{\"ok\":true}";
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut output = String::new();
+        reconcile_self_hosted_metrics_meta(&paths, Some(live_port), &client, &mut output).await;
+
+        let after = read_meta(&paths.proxy_meta_file);
+        assert_eq!(after.get("metrics_port").map(String::as_str), Some("20814"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn metrics_port_candidates_find_isolated_proxy_when_serve_and_proxy_absent() {
+        let empty = BTreeMap::new();
+        let isolated = meta_with_metrics_port(20814);
+
+        let ports = metrics_port_candidates(&empty, &empty, &isolated);
+
+        assert_eq!(ports, vec![20814, rayline_metrics::DEFAULT_METRICS_PORT]);
+    }
+
+    #[test]
+    fn metrics_port_candidates_dedupe_repeated_and_default_ports() {
+        let serve = meta_with_metrics_port(rayline_metrics::DEFAULT_METRICS_PORT);
+        let proxy = meta_with_metrics_port(rayline_metrics::DEFAULT_METRICS_PORT);
+        let empty = BTreeMap::new();
+
+        let ports = metrics_port_candidates(&serve, &proxy, &empty);
+
+        assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
+    }
 
     #[test]
     fn top_numeric_cells_use_compact_suffixes() {
@@ -3549,6 +3934,79 @@ fn parse_port(value: Option<&String>, default: u16) -> u16 {
 
 fn parse_optional_port(value: Option<&String>) -> Option<u16> {
     value?.parse::<u16>().ok()
+}
+
+/// Metrics-control port the proxy self-hosts on, mirroring `resolve_proxy_port`:
+/// an env override (`RAYLINE_METRICS_PORT` / `RAYLINE_ISOLATED_METRICS_PORT`)
+/// wins, otherwise the per-isolation default. A malformed override falls back to
+/// the default — metrics are best-effort and must not block a launch.
+fn resolve_metrics_port(isolated: bool) -> u16 {
+    let (env_var, default_port) = if isolated {
+        (
+            "RAYLINE_ISOLATED_METRICS_PORT",
+            DEFAULT_ISOLATED_METRICS_PORT,
+        )
+    } else {
+        (
+            "RAYLINE_METRICS_PORT",
+            rayline_metrics::DEFAULT_METRICS_PORT,
+        )
+    };
+    match std::env::var(env_var) {
+        Ok(value) if !value.is_empty() => value.parse::<u16>().unwrap_or(default_port),
+        _ => default_port,
+    }
+}
+
+/// Ordered, de-duplicated list of metrics-control ports `rayline top` should try,
+/// most-authoritative first: the local-router `serve` daemon, then the
+/// non-isolated proxy's self-hosted server, then the isolated proxy's, with the
+/// default metrics port as a final fallback. The proxy only records its
+/// `metrics_port` in meta when it self-hosts (i.e. when it is not forwarding to a
+/// serve daemon), so a present entry always names a port the proxy owns.
+fn metrics_port_candidates(
+    serve_meta: &BTreeMap<String, String>,
+    proxy_meta: &BTreeMap<String, String>,
+    isolated_proxy_meta: &BTreeMap<String, String>,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut push = |port: u16| {
+        if !ports.contains(&port) {
+            ports.push(port);
+        }
+    };
+    for meta in [serve_meta, proxy_meta, isolated_proxy_meta] {
+        if let Some(port) = parse_optional_port(meta.get("metrics_port")) {
+            push(port);
+        }
+    }
+    push(rayline_metrics::DEFAULT_METRICS_PORT);
+    ports
+}
+
+/// Probe each candidate metrics port in precedence order and return the first
+/// whose snapshot endpoint answers. A stale meta entry (port recorded but the
+/// proxy gone) is skipped in favour of a live server. If none respond, fall back
+/// to the highest-precedence candidate so the downstream "not available" error
+/// names a sensible port. `candidates` is always non-empty in practice
+/// (`metrics_port_candidates` appends the default), but an empty slice degrades
+/// to the shared default rather than panicking.
+async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u16]) -> u16 {
+    for &port in candidates {
+        if metrics_port_is_serving(client, port).await {
+            return port;
+        }
+    }
+    candidates
+        .first()
+        .copied()
+        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT)
+}
+
+/// Whether a metrics-control server is answering snapshot requests on `port`.
+async fn metrics_port_is_serving(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+    matches!(client.get(&url).send().await, Ok(response) if response.status().is_success())
 }
 
 fn value_display_or_empty(value: Option<&Value>) -> String {
