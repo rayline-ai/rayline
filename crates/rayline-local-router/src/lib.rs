@@ -1128,13 +1128,15 @@ async fn response_from_reqwest(
                         sse_buffer.len()
                     );
                 }
-                metrics.record(MetricsUpdate::RequestCompleted {
-                    request_id: request_id.clone(),
-                    status_code: Some(status.as_u16()),
+                emit_completed_metrics(
+                    metrics,
+                    &request_id,
+                    status.as_u16(),
                     input_tokens,
                     output_tokens,
+                    prompt_cache_tokens,
                     selected_model,
-                });
+                );
             }
         }
     });
@@ -1266,9 +1268,10 @@ fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
         Value::Object(map) => {
             if let Some(input) = total_input_tokens_from_object(map) {
                 usage.input_tokens = Some(input);
-                if let Some(cache) = cache_read_tokens_from_object(map) {
-                    usage.prompt_cache_tokens = Some(cache);
-                }
+            }
+            // Read cache tokens regardless of whether total input tokens are present.
+            if let Some(cache) = cache_read_tokens_from_object(map) {
+                usage.prompt_cache_tokens = Some(cache);
             }
             if let Some(output) = map
                 .get("output_tokens")
@@ -1356,6 +1359,37 @@ fn record_request_error(
         status_code,
         error: error.to_string(),
     });
+}
+
+/// Emit `RequestCompleted` and, when cache tokens are present, `PromptCache`.
+/// Mirrors the proxy's end-of-stream emission pattern.
+fn emit_completed_metrics(
+    metrics: &SharedMetricsSink,
+    request_id: &str,
+    status_code: u16,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    prompt_cache_tokens: Option<u64>,
+    selected_model: Option<String>,
+) {
+    metrics.record(MetricsUpdate::RequestCompleted {
+        request_id: request_id.to_owned(),
+        status_code: Some(status_code),
+        input_tokens,
+        output_tokens,
+        selected_model,
+    });
+    // Mirror the proxy's PromptCache emission so cache-token accounting works.
+    if input_tokens.is_some() || prompt_cache_tokens.is_some() {
+        metrics.record(MetricsUpdate::PromptCache {
+            request_id: request_id.to_owned(),
+            prompt_tokens: input_tokens,
+            cache_tokens: prompt_cache_tokens,
+            processed_tokens: None,
+            prompt_ms: None,
+            prompt_tps: None,
+        });
+    }
 }
 
 fn record_remote_token_usage(
@@ -1808,6 +1842,7 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayline_metrics::MetricsSink as _;
 
     fn state(config: RouterConfig) -> AppState {
         AppState {
@@ -2334,5 +2369,40 @@ mod tests {
             &mut prompt_cache_tokens,
         );
         assert_eq!(prompt_cache_tokens, Some(1234)); // was lost before the fix
+    }
+
+    /// Regression test: `emit_completed_metrics` must emit a `PromptCache` update
+    /// to the metrics sink so cache-token accounting is not silently dropped.
+    /// This test FAILS if the `PromptCache` emission is removed from
+    /// `emit_completed_metrics`.
+    #[test]
+    fn emit_completed_metrics_records_prompt_cache_in_sink() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        // Register the request so RequestCompleted can move it to recent.
+        metrics.record(rayline_metrics::MetricsUpdate::RequestStarted {
+            request_id: "req-cache-1".to_owned(),
+            source: "local-router".to_owned(),
+            requested_model: Some("claude-opus".to_owned()),
+            agent_id: None,
+            agent_type: None,
+        });
+
+        emit_completed_metrics(
+            &(metrics.clone() as SharedMetricsSink),
+            "req-cache-1",
+            200,
+            Some(10),
+            Some(5),
+            Some(1234), // cache tokens — must reach the sink
+            Some("claude-opus-4-5".to_owned()),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.recent.len(), 1, "request must appear in recent");
+        assert_eq!(
+            snapshot.recent[0].prompt_cache_tokens,
+            Some(1234),
+            "PromptCache emission missing: prompt_cache_tokens not recorded in sink"
+        );
     }
 }
