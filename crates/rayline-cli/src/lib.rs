@@ -33,7 +33,9 @@ Options:
   --help       Show this message and exit
 
 Commands:
-  claude     Run Claude Code through local Rayline routing
+  auth       Sign in to hosted Rayline
+  status     Show current CLI auth status
+  claude     Run Claude Code through Rayline routing
   router     Inspect or stop the local Rayline router runtime
   top        Show live router request metrics
   local      Configure local model routing
@@ -50,13 +52,10 @@ const AUTH_HELP: &str = "\
 Usage: rayline auth COMMAND
 
 Commands:
-  login    Sign in to a configured hosted environment
-  logout   Remove stored OAuth credentials and router key
+  login    Sign in to Rayline
+  logout   Revoke the stored Rayline session and router key
   status   Show current auth status
-  token    Print a valid ID token
-
-Built-in Rayline hosted auth is not included in this release. These
-commands require an explicitly configured hosted environment.
+  token    Print a valid account bearer token
 ";
 
 const AUTH_LOGIN_HELP: &str = "\
@@ -64,14 +63,14 @@ Usage: rayline auth login [OPTIONS]
 
 Options:
   -b, --no-browser     Use device-code login instead of a local callback
-  -p, --paste          Paste a browser success URL manually
+  -p, --paste          Paste a browser callback URL manually
   --help               Show this message and exit
 ";
 
 const AUTH_LOGOUT_HELP: &str = "\
 Usage: rayline auth logout
 
-Remove stored OAuth credentials and the stored router key.
+Revoke the stored Rayline session and remove the stored router key.
 ";
 
 const AUTH_STATUS_HELP: &str = "\
@@ -83,16 +82,15 @@ Show current auth status.
 const AUTH_TOKEN_HELP: &str = "\
 Usage: rayline auth token
 
-Print a valid ID token for scripts and integrations.
+Print a valid account bearer token for scripts and integrations.
 ";
 
 const CLAUDE_HELP: &str = "\
 Usage: rayline claude [OPTIONS] [--] [CLAUDE_ARGS]...
        rayline claude run [OPTIONS] [--] [CLAUDE_ARGS]...
 
-Run Claude Code through Rayline local static routing. Hosted cloud-router mode
-is deferred in this release unless a custom hosted environment is
-explicitly configured.
+Run Claude Code through Rayline hosted routing. Use --local-router for the
+local static router path.
 
 Options:
   -m, --model <model>               Route through a specific model
@@ -284,21 +282,26 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::AuthToken(request) => match status::resolve_auth_token(&request).await {
-            Ok(status::AuthTokenOutcome::Token(token)) => {
-                println!("{token}");
-                ExitCode::SUCCESS
+        RaylineDispatch::AuthToken(request) => {
+            let env_name =
+                status::resolve_env(request.env_name.as_deref(), dirs::home_dir().as_deref());
+            match status::resolve_auth_token(&request).await {
+                Ok(status::AuthTokenOutcome::Available(value)) => {
+                    let output = terminal_output_text(&value);
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Ok(status::AuthTokenOutcome::NotLoggedIn) => {
+                    eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
+                    ExitCode::from(1)
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(1)
+                }
             }
-            Ok(status::AuthTokenOutcome::NotLoggedIn(env_name)) => {
-                eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
-                ExitCode::from(1)
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::AuthLogout(request) => match status::logout(&request) {
+        }
+        RaylineDispatch::AuthLogout(request) => match status::logout(&request).await {
             Ok(message) => match status::write_auth_message(&message) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -505,6 +508,10 @@ fn local_error(error: String, json: bool) -> ExitCode {
         eprintln!("Error: {error}");
     }
     ExitCode::from(1)
+}
+
+fn terminal_output_text(value: &str) -> String {
+    value.chars().collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1568,13 +1575,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_help_documents_local_router_and_deferred_hosted_mode() {
+    fn claude_help_documents_hosted_and_local_router_modes() {
         let help =
             rayline_help_for_argv(&argv(&["rayline", "claude", "--help"])).expect("claude help");
 
-        assert!(help.contains("local static routing"));
-        assert!(help.contains("Hosted cloud-router mode"));
-        assert!(help.contains("deferred in this release"));
+        assert!(help.contains("hosted routing"));
+        assert!(help.contains("local static router"));
         assert!(help.contains("--local-router"));
     }
 

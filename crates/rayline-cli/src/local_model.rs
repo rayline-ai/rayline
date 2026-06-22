@@ -493,8 +493,8 @@ pub async fn read_server_enable_local_router(
 
 /// Flip the account `enable_local_router` toggle via `PATCH /v1/settings`.
 ///
-/// Auth is the Firebase ID token (a settings write rejects API keys), the same
-/// JWT the menu bar's `updateLocalRouter` uses. The body matches
+/// Auth is an account bearer token (a settings write rejects API keys), the same
+/// credential class the menu bar's `updateLocalRouter` uses. The body matches
 /// `applyRouterSettingsUpdate`: `{"enable_local_router": <bool>}`.
 pub async fn set_router_enabled(
     enabled: bool,
@@ -521,12 +521,12 @@ async fn set_router_enabled_in_home(
         auth_token: auth_token.map(ToOwned::to_owned),
         root_env_explicit: false,
     };
-    let id_token = match crate::status::resolve_auth_token(&token_request)
+    let bearer_token = match crate::status::resolve_auth_token(&token_request)
         .await
         .map_err(|error| format!("Not signed in: {error}. Run: {} auth login", crate::CLI_BIN))?
     {
-        crate::status::AuthTokenOutcome::Token(token) => token,
-        crate::status::AuthTokenOutcome::NotLoggedIn(_) => {
+        crate::status::AuthTokenOutcome::Available(token) => token,
+        crate::status::AuthTokenOutcome::NotLoggedIn => {
             return Err(format!("Not signed in. Run: {} auth login", crate::CLI_BIN));
         }
     };
@@ -536,7 +536,7 @@ async fn set_router_enabled_in_home(
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?
         .patch(&url)
-        .bearer_auth(id_token)
+        .bearer_auth(bearer_token)
         .json(&json!({ "enable_local_router": enabled }))
         .send()
         .await
@@ -571,12 +571,12 @@ async fn fetch_router_settings(
         auth_token: auth_token.map(ToOwned::to_owned),
         root_env_explicit: false,
     };
-    let id_token = match crate::status::resolve_auth_token(&token_request)
+    let bearer_token = match crate::status::resolve_auth_token(&token_request)
         .await
         .ok()?
     {
-        crate::status::AuthTokenOutcome::Token(token) => token,
-        crate::status::AuthTokenOutcome::NotLoggedIn(_) => return None,
+        crate::status::AuthTokenOutcome::Available(token) => token,
+        crate::status::AuthTokenOutcome::NotLoggedIn => return None,
     };
     let url = format!("{}/v1/settings", hosted.router_url);
     let response = reqwest::Client::builder()
@@ -584,7 +584,7 @@ async fn fetch_router_settings(
         .build()
         .ok()?
         .get(url)
-        .bearer_auth(id_token)
+        .bearer_auth(bearer_token)
         .send()
         .await
         .ok()?;

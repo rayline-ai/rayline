@@ -4,8 +4,9 @@ Rayline Local can run Claude Code through an explicit local static router.
 
 - `rayline claude --local-router` starts the local static router path. It does
   not require hosted Rayline auth for routing decisions.
-- Built-in hosted Rayline auth and hosted cloud-router launch are intentionally
-  deferred in this release.
+- Built-in hosted Rayline auth uses Rayline-scoped CLI sessions. The CLI stores
+  opaque `rls_`/`rlr_` session tokens and mints a separate `rlk-` router key for
+  hosted data-plane requests.
 
 ## Quick Start
 
@@ -40,13 +41,18 @@ rayline router stop
 
 ## Hosted Auth and Proxy
 
-This release does not include built-in production Rayline hosted auth or
-hosted cloud-router launch credentials. A future milestone will add hosted auth
-through a reviewed public-client boundary.
+Run `rayline auth login` to sign in to hosted Rayline. Browser login redeems a
+PKCE code through `https://api.rayline.ai/v1/auth/cli/token`; device login uses
+the Rayline-native `/v1/auth/cli/device/*` endpoints. The CLI stores
+Rayline-scoped opaque session credentials, not Firebase or Google OAuth tokens.
 
-If you explicitly configure a custom hosted environment in
-`~/.config/rayline/settings.json`, the CLI can use that environment. The public
-local-router path does not require this.
+Hosted Claude launches mint and store an `rlk-` router key separately from the
+CLI session. Logging out calls `/v1/auth/cli/revoke` best-effort, clears the
+local session, and drops the stored router key. The public local-router path
+does not require hosted auth.
+
+Custom hosted environments can still be configured in
+`~/.config/rayline/settings.json` for internal/dev routing.
 
 ## Override-only Config
 

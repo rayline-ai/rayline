@@ -6,8 +6,9 @@ to, deciding where each request should go. It provides the `rayline` CLI and
 `rld` daemon for local passthrough, selective subagent routing, local model
 support, and update checks.
 
-This repository contains the Rayline Local router. Local-router-only use does
-not require a hosted account and does not connect to any remote hosted service.
+This repository contains the Rayline Local router. Local-router-only use through
+`rayline claude --local-router` does not require a hosted account and does not
+connect to any remote hosted service.
 
 ## Demo
 
@@ -24,16 +25,17 @@ single session.
 
 ## How It Works
 
-Run `rayline claude` to start a Claude Code session with smart routing layered
-on top. Your conversation works as it normally would, but Rayline Local can route
-cheaper, high-volume work such as background subagent tasks to a fast model
-running locally on your machine.
+Run `rayline claude` to start a Claude Code session with hosted Rayline routing
+layered on top, or `rayline claude --local-router` for the auth-free local
+static router. Your conversation works as it normally would, but Rayline Local
+can route cheaper, high-volume work such as background subagent tasks to a fast
+model running locally on your machine.
 
-By default, your main conversation still goes straight to Claude on your own
-account, and only configured local-router traffic is routed to local or
-alternative endpoints. Hosted client features are separate, opt-in, and
-not required for local-router workflows. Run `rayline --help` to see the
-available commands and configuration options.
+By default, your main conversation stays on Claude, and only configured
+local-router traffic is routed to local or alternative endpoints. Hosted client
+features use Rayline CLI session auth and are not required for local-router
+workflows. Run `rayline --help` to see the available commands and configuration
+options.
 
 Rayline Local operates on your machine and with your provider credentials. It is
 not affiliated with any model provider.

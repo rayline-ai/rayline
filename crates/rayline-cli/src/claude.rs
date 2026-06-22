@@ -567,7 +567,7 @@ async fn ensure_router_key(
         .map_err(|error| RunError::KeyProvision(error.to_string()))
 }
 
-/// Return the Firebase ID token for `env_name`, launching the interactive
+/// Return an account bearer token for `env_name`, launching the interactive
 /// sign-in flow when no usable credentials are stored. Returns `Ok(None)` when
 /// no token is available and we cannot prompt (non-interactive session), so the
 /// caller can fall back to the existing "not logged in" error.
@@ -588,12 +588,14 @@ async fn resolve_auth_token_or_login(
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
 
     match crate::status::resolve_auth_token(&token_request).await {
-        Ok(crate::status::AuthTokenOutcome::Token(token)) => return Ok(Some(token)),
+        Ok(crate::status::AuthTokenOutcome::Available(token)) => return Ok(Some(token)),
         // Credentials are missing or stale (expired/revoked refresh token). On a
         // terminal, re-running sign-in repairs both; otherwise preserve the prior
         // behavior (missing-key error, or surfacing the refresh failure).
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn(_)) if !interactive => return Ok(None),
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn(_)) => {}
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) if !interactive => {
+            return Ok(None);
+        }
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => {}
         Err(error) if !interactive => return Err(error.into()),
         Err(_) => {}
     }
@@ -612,8 +614,8 @@ async fn resolve_auth_token_or_login(
         .map_err(|error| RunError::Login(format!("failed to write login output: {error}")))?;
 
     match crate::status::resolve_auth_token(&token_request).await? {
-        crate::status::AuthTokenOutcome::Token(token) => Ok(Some(token)),
-        crate::status::AuthTokenOutcome::NotLoggedIn(_) => Ok(None),
+        crate::status::AuthTokenOutcome::Available(token) => Ok(Some(token)),
+        crate::status::AuthTokenOutcome::NotLoggedIn => Ok(None),
     }
 }
 
@@ -899,7 +901,7 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the caller's router settings once per launch. Prefer OAuth credentials
+/// Fetch the caller's router settings once per launch. Prefer account credentials
 /// when available, but fall back to the already-provisioned router key because
 /// the router accepts either bearer form. `None` on request failure or an error
 /// payload, so callers fall back to safe defaults.
@@ -911,14 +913,14 @@ async fn fetch_router_settings(
 ) -> Option<Value> {
     let token_request = crate::status::AuthTokenRequest {
         env_name: Some(env_name.to_owned()),
-        // Honor an explicit `--auth-token` first; when OAuth credentials are
+        // Honor an explicit `--auth-token` first; when account credentials are
         // absent or expired, the stored router key below can still read settings.
         auth_token: auth_token.map(ToOwned::to_owned),
         root_env_explicit: false,
     };
     let bearer_token = match crate::status::resolve_auth_token(&token_request).await {
-        Ok(crate::status::AuthTokenOutcome::Token(token)) => token,
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn(_)) => router_key.to_owned(),
+        Ok(crate::status::AuthTokenOutcome::Available(token)) => token,
+        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => router_key.to_owned(),
         Err(_) => router_key.to_owned(),
     };
     let url = format!("{router_base}/v1/settings");
