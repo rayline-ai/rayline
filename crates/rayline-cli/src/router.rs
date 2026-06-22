@@ -1959,6 +1959,7 @@ async fn start_proxy_from_home_with_client(
         &mut output,
     )
     .await?;
+    reconcile_self_hosted_metrics_meta(&paths, self_hosted_metrics_port, client, &mut output).await;
     Ok(output)
 }
 
@@ -2439,6 +2440,36 @@ fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>)
     Some(format!("http://127.0.0.1:{port}"))
 }
 
+/// Once the proxy is healthy, make the advertised `metrics_port` reflect what the
+/// daemon actually bound. The daemon self-hosts metrics best-effort: on a port
+/// collision it runs without metrics rather than failing the proxy. Leaving
+/// `metrics_port` in the proxy meta then points `rayline top` (and future
+/// launches' port discovery) at an endpoint the proxy never owned, so drop it
+/// when the self-hosted server is not answering. Metrics stays best-effort —
+/// this only edits meta and never restarts the proxy.
+async fn reconcile_self_hosted_metrics_meta(
+    paths: &RouterPaths,
+    self_hosted_metrics_port: Option<u16>,
+    client: &reqwest::Client,
+    output: &mut String,
+) {
+    let Some(port) = self_hosted_metrics_port else {
+        return;
+    };
+    if metrics_port_is_serving(client, port).await {
+        return;
+    }
+    let mut meta = read_meta(&paths.proxy_meta_file);
+    if meta.remove("metrics_port").is_some() {
+        let _ = std::fs::write(&paths.proxy_meta_file, format_meta(&meta));
+        output.push_str(&format!(
+            "warning: {} proxy could not self-host metrics on :{port}; `{} top` metrics are disabled for this session.\n",
+            daemon_name(),
+            cli_name(),
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn proxy_meta(
     home: &Path,
@@ -2519,7 +2550,12 @@ fn metadata_matches_config(
     expected: &BTreeMap<String, String>,
 ) -> bool {
     expected.iter().all(|(key, expected_value)| {
-        if key == "bin_path" {
+        // `bin_path` may legitimately differ (PATH vs absolute launcher).
+        // `metrics_port` is a best-effort runtime fact reconciled after the
+        // proxy is ready (see reconcile_self_hosted_metrics_meta), not a config
+        // input — a difference must never churn-restart an otherwise healthy
+        // proxy just because metrics could or could not self-host.
+        if key == "bin_path" || key == "metrics_port" {
             return true;
         }
         let Some(actual) = meta.get(key) else {
@@ -2668,6 +2704,12 @@ fn set_proxy_child_env(command: &mut Command, router_api_key: &str, proxy_port: 
             command.env_remove(name);
         }
     }
+    // The forward-vs-self-host decision is carried solely by the `--metrics-url`
+    // flag, passed only when forwarding to a serve daemon. Clear any inherited
+    // RAYLINE_METRICS_URL so a value in the launcher's environment cannot
+    // override that decision via clap's env fallback and force a self-hosting
+    // proxy to forward to a stale endpoint instead of binding its own server.
+    command.env_remove("RAYLINE_METRICS_URL");
     command.env("RAYLINE_ROUTER_API_KEY", router_api_key);
 }
 
@@ -2985,6 +3027,108 @@ mod tests {
                 rayline_metrics::DEFAULT_METRICS_PORT
             ))
         );
+    }
+
+    #[test]
+    fn proxy_child_env_drops_inherited_metrics_url() {
+        use std::ffi::OsStr;
+
+        // The proxy's forward-vs-self-host decision is carried solely by the
+        // `--metrics-url` flag (present only when forwarding). An inherited
+        // RAYLINE_METRICS_URL in the launcher env must not override it, or a
+        // self-hosting proxy would forward to a stale endpoint and never bind.
+        let mut command = Command::new("true");
+        set_proxy_child_env(&mut command, "router-key", 20810);
+
+        let removed = command
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new("RAYLINE_METRICS_URL") && value.is_none());
+
+        assert!(
+            removed,
+            "RAYLINE_METRICS_URL must be cleared for the spawned proxy"
+        );
+    }
+
+    #[test]
+    fn metadata_matches_config_ignores_metrics_port() {
+        // metrics_port is a best-effort runtime fact reconciled after readiness,
+        // not a config input — a difference must not churn-restart a healthy
+        // proxy.
+        let mut on_disk = BTreeMap::new();
+        on_disk.insert("router_url".to_owned(), "https://api.rayline.ai".to_owned());
+        let mut requested = on_disk.clone();
+        requested.insert("metrics_port".to_owned(), "20814".to_owned());
+
+        assert!(metadata_matches_config(&on_disk, &requested));
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_metrics_port_when_self_host_failed() {
+        let home = unique_test_dir("reconcile-metrics-drop");
+        let paths = RouterPaths::new(&home);
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("proxy_port".to_owned(), "20810".to_owned());
+        meta.insert("metrics_port".to_owned(), "20814".to_owned());
+        std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+
+        // A port bound then released: probing it gets connection-refused.
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = released.local_addr().unwrap().port();
+        drop(released);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut output = String::new();
+        reconcile_self_hosted_metrics_meta(&paths, Some(dead_port), &client, &mut output).await;
+
+        let after = read_meta(&paths.proxy_meta_file);
+        assert!(
+            !after.contains_key("metrics_port"),
+            "a metrics port the proxy never bound must not stay advertised"
+        );
+        assert!(output.contains("disabled"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_metrics_port_when_self_host_serving() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let home = unique_test_dir("reconcile-metrics-keep");
+        let paths = RouterPaths::new(&home);
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("metrics_port".to_owned(), "20814".to_owned());
+        std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = b"{\"ok\":true}";
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut output = String::new();
+        reconcile_self_hosted_metrics_meta(&paths, Some(live_port), &client, &mut output).await;
+
+        let after = read_meta(&paths.proxy_meta_file);
+        assert_eq!(after.get("metrics_port").map(String::as_str), Some("20814"));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
@@ -3849,10 +3993,7 @@ fn metrics_port_candidates(
 /// to the shared default rather than panicking.
 async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u16]) -> u16 {
     for &port in candidates {
-        let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
-        if let Ok(response) = client.get(&url).send().await
-            && response.status().is_success()
-        {
+        if metrics_port_is_serving(client, port).await {
             return port;
         }
     }
@@ -3860,6 +4001,12 @@ async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u1
         .first()
         .copied()
         .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT)
+}
+
+/// Whether a metrics-control server is answering snapshot requests on `port`.
+async fn metrics_port_is_serving(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+    matches!(client.get(&url).send().await, Ok(response) if response.status().is_success())
 }
 
 fn value_display_or_empty(value: Option<&Value>) -> String {
