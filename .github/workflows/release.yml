@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, for example v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.88.0"
+  RAYLINE_CHANNEL: "prod"
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform_tag }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_tag: linux_x86_64
+            os: ubuntu-latest
+            exe_suffix: ""
+            archive_ext: tar.gz
+          - platform_tag: linux_aarch64
+            os: ubuntu-24.04-arm
+            exe_suffix: ""
+            archive_ext: tar.gz
+          - platform_tag: macosx_10_12_x86_64
+            os: macos-13
+            exe_suffix: ""
+            archive_ext: tar.gz
+          - platform_tag: macosx_11_0_arm64
+            os: macos-15
+            exe_suffix: ""
+            archive_ext: tar.gz
+          - platform_tag: windows_x86_64
+            os: windows-latest
+            exe_suffix: ".exe"
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
+            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          RAYLINE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo build --release -p rayline-cli -p rayline-daemon --locked
+
+      - name: Package release assets
+        shell: bash
+        env:
+          EXE_SUFFIX: ${{ matrix.exe_suffix }}
+          PLATFORM_TAG: ${{ matrix.platform_tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist package
+
+          rayline_asset="rayline-${PLATFORM_TAG}"
+          daemon_asset="rld-${PLATFORM_TAG}"
+          cp "target/release/rayline${EXE_SUFFIX}" "dist/${rayline_asset}"
+          cp "target/release/rld${EXE_SUFFIX}" "dist/${daemon_asset}"
+
+          package_dir="rayline-${VERSION}-${PLATFORM_TAG}"
+          mkdir -p "package/${package_dir}"
+          cp "target/release/rayline${EXE_SUFFIX}" "package/${package_dir}/rayline${EXE_SUFFIX}"
+          cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
+          cp README.md LICENSE "package/${package_dir}/"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            pwsh -NoProfile -Command \
+              "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
+          else
+            chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}"
+            chmod 0755 "package/${package_dir}/rayline" "package/${package_dir}/rld"
+            tar -C package -czf "dist/${package_dir}.${ARCHIVE_EXT}" "${package_dir}"
+          fi
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.platform_tag }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
+            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+
+          (
+            cd dist
+            rm -f SHA256SUMS
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
+              | sort \
+              | xargs sha256sum > SHA256SUMS
+          )
+
+          cat > release-notes.md <<EOF
+          Rayline ${version}
+
+          Assets:
+          - \`rayline-<platform>\` and \`rld-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
+          - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain both binaries plus license/readme files.
+          - \`SHA256SUMS\` covers every uploaded binary and archive.
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            args=(release create "$RELEASE_TAG" dist/* --title "Rayline ${version}" --notes-file release-notes.md)
+            if [[ "$version" == *"-"* ]]; then
+              args+=(--prerelease)
+            fi
+            gh "${args[@]}"
+          fi

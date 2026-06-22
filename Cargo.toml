@@ -18,6 +18,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Atlas Futures, Inc."]
+homepage = "https://rayline.ai"
+repository = "https://github.com/rayline-ai/rayline"
+publish = false
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
