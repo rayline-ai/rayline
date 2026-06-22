@@ -2557,10 +2557,20 @@ impl LocalCa {
         if let Some(parent) = cert_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create CA cert dir {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
         if let Some(parent) = key_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create CA key dir {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
 
         let ca = Self::generate()?;
@@ -2572,6 +2582,8 @@ impl LocalCa {
     }
 
     fn generate() -> Result<Self> {
+        use time::{Duration, OffsetDateTime};
+
         let mut params = CertificateParams::new(vec!["Rayline Local Proxy CA".to_string()])?;
         params.subject_alt_names.clear();
         let mut dn = DistinguishedName::new();
@@ -2584,6 +2596,12 @@ impl LocalCa {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
+        // Backdate not_before by 5 minutes to absorb clock-skew across machines.
+        // Cap not_after at 180 days so a leaked or forgotten CA key has a bounded
+        // lifetime; load_or_generate regenerates automatically on expiry.
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::minutes(5);
+        params.not_after = now + Duration::days(180);
         let key_pair = KeyPair::generate()?;
         let cert = params.self_signed(&key_pair)?;
         Ok(Self {
@@ -2635,8 +2653,36 @@ impl LocalCa {
 
     fn validate_existing_pair(&self) -> Result<()> {
         self.validate_key_matches_cert()?;
+        self.validate_not_expired()?;
         self.server_config_for_host(ANTHROPIC_HOST)
             .context("generate leaf server config from CA")?;
+        Ok(())
+    }
+
+    /// Return an error if the CA cert is already expired or will expire within 7 days.
+    fn validate_not_expired(&self) -> Result<()> {
+        let certs = certs_from_pem(&self.cert_pem)?;
+        let der = certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("CA PEM did not contain a certificate"))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|error| anyhow!("parse CA certificate for expiry check: {error}"))?;
+        let validity = &cert.tbs_certificate.validity;
+        if !validity.is_valid() {
+            return Err(anyhow!("CA certificate is expired"));
+        }
+        // Also regenerate when the CA expires within 7 days so clients aren't
+        // surprised by a sudden TLS failure.
+        let secs_remaining = validity
+            .time_to_expiration()
+            .map(|d| d.whole_seconds())
+            .unwrap_or(0);
+        if secs_remaining < 7 * 24 * 3600 {
+            return Err(anyhow!(
+                "CA certificate expires in less than 7 days ({secs_remaining}s remaining)"
+            ));
+        }
         Ok(())
     }
 
@@ -3904,6 +3950,105 @@ mod tests {
             metrics.snapshot().totals.routing_uncertain,
             1,
             "counter must not increment when agent_id is absent"
+        );
+    }
+
+    /// CA validity window must be ≤ 180 days.  rcgen's default is ~2100 years;
+    /// we need to see a bounded window so TLS interception doesn't silently
+    /// "work forever" after the CA is compromised or forgotten.
+    #[test]
+    fn ca_has_bounded_validity() {
+        use x509_parser::parse_x509_certificate;
+
+        let ca = LocalCa::generate().unwrap();
+        let certs = certs_from_pem(&ca.cert_pem).unwrap();
+        let der = certs.into_iter().next().unwrap();
+        let (_, cert) = parse_x509_certificate(&der).unwrap();
+        let validity = cert.tbs_certificate.validity;
+
+        let not_before = validity.not_before.timestamp();
+        let not_after = validity.not_after.timestamp();
+        let window_secs = not_after - not_before;
+
+        // Window must be positive and at most 180 days + 10 min (5 min skew each side).
+        let max_secs: i64 = 180 * 24 * 3600 + 600;
+        assert!(
+            window_secs > 0,
+            "CA validity window must be positive, got {window_secs}s"
+        );
+        assert!(
+            window_secs <= max_secs,
+            "CA validity window {window_secs}s exceeds 180 days + 10 min ({max_secs}s); \
+             rcgen default is unbounded — set params.not_after"
+        );
+    }
+
+    /// `load_or_generate` must regenerate the CA when the cert on disk is expired.
+    /// This prevents the 180-day time-bomb: after expiry TLS interception would
+    /// silently break without this check.
+    #[test]
+    fn load_or_generate_regenerates_expired_ca() {
+        use time::{Duration, OffsetDateTime};
+        use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa,
+                    KeyPair, KeyUsagePurpose};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("ca.pem");
+        let key_path = dir.path().join("ca-key.pem");
+
+        // Generate a CA that expired 1 second ago.
+        let mut params = CertificateParams::new(vec!["Expired Test CA".to_string()]).unwrap();
+        params.subject_alt_names.clear();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Expired Test CA");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::hours(1);
+        params.not_after = now - Duration::seconds(1); // already expired
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        // load_or_generate must detect the expiry and regenerate a valid CA.
+        let ca = LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+        let certs = certs_from_pem(&ca.cert_pem).unwrap();
+        let der = certs.into_iter().next().unwrap();
+        let (_, cert_parsed) =
+            x509_parser::parse_x509_certificate(&der).unwrap();
+        assert!(
+            cert_parsed.tbs_certificate.validity.is_valid(),
+            "regenerated CA must be currently valid"
+        );
+    }
+
+    /// `load_or_generate` must create the CA directory with mode 0700 so that
+    /// other users on a shared machine cannot read the local CA private key.
+    #[cfg(unix)]
+    #[test]
+    fn ca_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+        let cert_path = ca_dir.join("proxy-ca.pem");
+        let key_path = ca_dir.join("proxy-ca-key.pem");
+
+        // Directory doesn't exist yet; load_or_generate must create it with 0700.
+        LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+
+        let mode = std::fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "CA dir must be 0700, got 0o{:o}",
+            mode & 0o777
         );
     }
 }
