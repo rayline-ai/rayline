@@ -98,6 +98,12 @@ pub struct RunRequest {
     pub isolated: bool,
     pub local_injector_port: Option<u16>,
     pub routing_mode: RoutingMode,
+    /// Whether the user pinned the proxy scope with `--route`. When false and
+    /// local routing engages (explicit `--local` or implicit account-local), the
+    /// scope falls back to the router-dependent subagents-only default. Carried
+    /// here because implicit local engagement is only known at run time, after a
+    /// `/v1/settings` fetch the parser cannot perform.
+    pub route_scope_explicit: bool,
     pub route_statusline_enabled: bool,
     pub diagnose: bool,
     pub upstream_ca_path: Option<PathBuf>,
@@ -120,6 +126,37 @@ fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
     match mode {
         RoutingMode::ProxySubagents => DEFAULT_PROXY_SUBAGENTS_MODEL,
         RoutingMode::Override | RoutingMode::Proxy => DEFAULT_MODEL,
+    }
+}
+
+/// Whether *implicit* account-local routing (the hosted `enable_local_router`
+/// toggle + an on-device config) should engage for this run.
+///
+/// Env (`Override`) mode is cloud-only by contract — it sets `ANTHROPIC_BASE_URL`
+/// directly and the CLI documents it as unable to reach local inference — so it
+/// never engages local even when the account toggle is on. `--isolated` also
+/// opts out; an isolated local session must be requested explicitly with
+/// `--local`. This gate does not apply to explicit `--local` (handled upstream).
+fn implicit_local_engages(mode: RoutingMode, isolated: bool, toggle_on: bool) -> bool {
+    !matches!(mode, RoutingMode::Override) && !isolated && toggle_on
+}
+
+/// The routing mode after accounting for local engagement.
+///
+/// When local routing is engaged (explicit `--local` or implicit account-local)
+/// and the user did not pin `--route`, the scope defaults to subagents-only —
+/// the hybrid default where the main agent stays on cloud Claude and only
+/// subagents are offloaded on-device. An explicit `--route` (which makes parse
+/// time resolve to `Proxy` for route-all) is always respected.
+fn effective_routing_mode(
+    parsed: RoutingMode,
+    local_engaged: bool,
+    route_scope_explicit: bool,
+) -> RoutingMode {
+    if local_engaged && !route_scope_explicit && parsed == RoutingMode::Proxy {
+        RoutingMode::ProxySubagents
+    } else {
+        parsed
     }
 }
 
@@ -275,18 +312,6 @@ async fn run_command_from_home(
         .await?
     };
 
-    let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
-    let model = request
-        .model
-        .clone()
-        .or_else(|| env::var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| default_model_for_routing_mode(request.routing_mode).to_owned());
-    let set_model_env = should_set_model_env(
-        request.routing_mode,
-        request.model.is_some(),
-        inherited_anthropic_model,
-    );
-
     // Single `/v1/settings` fetch per launch, feeding BOTH the pinned-main-model
     // auto-compact window and the account `enable_local_router` toggle. Skip it
     // entirely when neither is needed: the window is already pinned by flag/env
@@ -300,17 +325,18 @@ async fn run_command_from_home(
     } else {
         None
     };
-    let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
 
     // Engage implicit account-local routing when a `local_model` config exists,
     // the account toggle is on, and the configured model is usable. This implicit
-    // path stays off under `--isolated`; explicit `--local-router --isolated`
-    // takes the local path below and uses an isolated proxy sidecar. A failed
-    // settings fetch defaults the toggle to false (stay cloud). The model always
-    // comes from the config (recommended pick, or the user's custom endpoint);
-    // when none is picked yet, the best already-downloaded curated model is
-    // adopted as the pick — `claude` itself never downloads anything, and an
-    // unusable config warns + launches with cloud routing instead of blocking.
+    // path stays off under `--isolated` and under env (`Override`) mode, which is
+    // cloud-only by contract — see `implicit_local_engages`. Explicit
+    // `--local-router --isolated` takes the local path below and uses an isolated
+    // proxy sidecar. A failed settings fetch defaults the toggle to false (stay
+    // cloud). The model always comes from the config (recommended pick, or the
+    // user's custom endpoint); when none is picked yet, the best
+    // already-downloaded curated model is adopted as the pick — `claude` itself
+    // never downloads anything, and an unusable config warns + launches with
+    // cloud routing instead of blocking.
     let enable_local_router = settings
         .as_ref()
         .map(enable_local_router_from_router_settings)
@@ -319,7 +345,13 @@ async fn run_command_from_home(
         Some(explicit_local_router_start_request(&env_name, request, local_cfg.as_ref()).await?)
     } else {
         match local_cfg {
-            Some(cfg) if !request.isolated && enable_local_router => {
+            Some(cfg)
+                if implicit_local_engages(
+                    request.routing_mode,
+                    request.isolated,
+                    enable_local_router,
+                ) =>
+            {
                 match resolve_engageable_local_config(home, &env_name, cfg).await {
                     Some(cfg) => {
                         let injector_port = resolve_injector_port(request.local_injector_port)?;
@@ -343,6 +375,36 @@ async fn run_command_from_home(
     let requested_local_port = local_start_request
         .as_ref()
         .map(|start_request| start_request.injector_port);
+
+    // Correct the parse-time routing mode now that local engagement is known.
+    // The parser resolves bare cloud `rayline claude` to route-all `Proxy`, but
+    // when account-local routing engages without an explicit `--route` the scope
+    // must fall back to the hybrid subagents-only default (main agent on cloud
+    // Claude, subagents on-device) — the same default as explicit `--local`.
+    // Shadow `request` with the corrected mode so every downstream consumer
+    // (model default, proxy wiring, status line) sees a single coherent value.
+    let local_engaged = local_start_request.is_some();
+    let request = &RunRequest {
+        routing_mode: effective_routing_mode(
+            request.routing_mode,
+            local_engaged,
+            request.route_scope_explicit,
+        ),
+        ..request.clone()
+    };
+
+    let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
+    let model = request
+        .model
+        .clone()
+        .or_else(|| env::var("ANTHROPIC_MODEL").ok())
+        .unwrap_or_else(|| default_model_for_routing_mode(request.routing_mode).to_owned());
+    let set_model_env = should_set_model_env(
+        request.routing_mode,
+        request.model.is_some(),
+        inherited_anthropic_model,
+    );
+    let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
     // config dir and, in proxy mode, a private proxy port. Resolve both per the
@@ -2146,8 +2208,12 @@ fn routing_mode_name(mode: RoutingMode) -> &'static str {
 
 fn proxy_routing_mode_name(mode: RoutingMode) -> &'static str {
     match mode {
+        RoutingMode::Proxy => crate::router::PROXY_ROUTING_MODE_ALL,
         RoutingMode::ProxySubagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
-        RoutingMode::Proxy | RoutingMode::Override => crate::router::PROXY_ROUTING_MODE_ALL,
+        // `Override` starts no proxy at all (it sets ANTHROPIC_BASE_URL directly),
+        // so it never reaches this proxy-only translation — see the dispatch match
+        // in `run` where `Override` takes the `configure_override_env` branch.
+        RoutingMode::Override => unreachable!("override mode does not start a proxy"),
     }
 }
 
@@ -2688,4 +2754,90 @@ fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
         return home.map_or(path.clone(), |home| home.join(rest));
     }
     path
+}
+
+#[cfg(test)]
+mod proxy_routing_mode_name_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_maps_to_all() {
+        assert_eq!(
+            proxy_routing_mode_name(RoutingMode::Proxy),
+            crate::router::PROXY_ROUTING_MODE_ALL
+        );
+    }
+
+    #[test]
+    fn proxy_subagents_maps_to_selective_subagents() {
+        assert_eq!(
+            proxy_routing_mode_name(RoutingMode::ProxySubagents),
+            crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+        );
+    }
+}
+
+#[cfg(test)]
+mod implicit_local_routing_tests {
+    use super::*;
+
+    // ── Finding 2: env (Override) is cloud-only and never engages local ──
+
+    #[test]
+    fn env_mode_never_engages_implicit_local() {
+        // Even with the account toggle on and no isolation, env mode stays cloud.
+        assert!(!implicit_local_engages(RoutingMode::Override, false, true));
+    }
+
+    #[test]
+    fn proxy_mode_engages_implicit_local_when_toggle_on() {
+        assert!(implicit_local_engages(RoutingMode::Proxy, false, true));
+    }
+
+    #[test]
+    fn isolation_blocks_implicit_local() {
+        assert!(!implicit_local_engages(RoutingMode::Proxy, true, true));
+    }
+
+    #[test]
+    fn toggle_off_blocks_implicit_local() {
+        assert!(!implicit_local_engages(RoutingMode::Proxy, false, false));
+    }
+
+    // ── Finding 1: local engagement defaults to subagents-only ──
+
+    #[test]
+    fn implicit_local_without_explicit_route_becomes_subagents() {
+        // Parse time resolved cloud + route-all to Proxy; engaging local without
+        // an explicit --route must mirror the explicit --local subagents default.
+        assert_eq!(
+            effective_routing_mode(RoutingMode::Proxy, true, false),
+            RoutingMode::ProxySubagents
+        );
+    }
+
+    #[test]
+    fn implicit_local_with_explicit_route_all_is_respected() {
+        assert_eq!(
+            effective_routing_mode(RoutingMode::Proxy, true, true),
+            RoutingMode::Proxy
+        );
+    }
+
+    #[test]
+    fn cloud_proxy_is_unchanged_without_local() {
+        assert_eq!(
+            effective_routing_mode(RoutingMode::Proxy, false, false),
+            RoutingMode::Proxy
+        );
+    }
+
+    #[test]
+    fn explicit_local_subagents_is_unchanged() {
+        // Explicit --local already resolved to ProxySubagents at parse time.
+        assert_eq!(
+            effective_routing_mode(RoutingMode::ProxySubagents, true, false),
+            RoutingMode::ProxySubagents
+        );
+    }
 }

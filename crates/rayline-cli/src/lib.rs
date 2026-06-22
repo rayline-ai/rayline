@@ -89,19 +89,22 @@ const CLAUDE_HELP: &str = "\
 Usage: rayline claude [OPTIONS] [--] [CLAUDE_ARGS]...
        rayline claude run [OPTIONS] [--] [CLAUDE_ARGS]...
 
-Run Claude Code through Rayline hosted routing. Use --local-router for the
+Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
 
 Options:
   -m, --model <model>               Route through a specific model
   --auto-compact-window <tokens>    Override Claude auto-compact threshold
-  --local-router                    Use local static routing without hosted auth
+  --local                           Use local static routing without hosted auth
+                                    (no login; forces the proxy)
   --isolated                        Use a separate Claude config dir so this
                                     session can run beside other Claude Code
                                     background agents
-  --routing-mode <override|proxy|proxy-subagents>
-                                    Select routing mode (default: proxy-subagents)
-  --no-proxy                        Use direct router env override
+  --route <all|subagents>           What the proxy routes through the router
+                                    (default: all for cloud, subagents for local)
+  --via <proxy|env>                 How Claude Code connects to the router
+                                    (default: proxy; env is lightweight,
+                                    cloud-only, no background process)
   --local-injector-port <port>      Local injector port
   --statusline/--no-statusline      Show proxy picked model in status line
   --diagnose                        Print routing diagnostics before exec
@@ -314,12 +317,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::ClaudeRun(mut request) => {
-            if !routing_mode_explicit(original_argv) {
-                request.routing_mode = claude::RoutingMode::ProxySubagents;
-            }
-            exec_claude(request).await
-        }
+        RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
         RaylineDispatch::RouterStatus(request) => {
             match crate::router::render_status(&request).await {
                 Ok(message) => {
@@ -840,7 +838,11 @@ where
     let mut local_router = false;
     let mut isolated = false;
     let mut local_injector_port = None;
-    let mut routing_mode = crate::claude::RoutingMode::Proxy;
+    // Two-axis routing intent, resolved into a RoutingMode at the end. `via`
+    // selects the connection mechanism (proxy is the default; env is opt-in);
+    // `route_scope` selects what the proxy routes (all vs subagents-only).
+    let mut via: Option<ViaArg> = None;
+    let mut route_scope: Option<RouteScope> = None;
     let mut route_statusline_enabled = true;
     let mut diagnose = false;
     let mut upstream_ca_path = None;
@@ -888,8 +890,16 @@ where
                     auto_compact_window = Some(value.parse().ok()?);
                     continue;
                 }
+                "--via" => {
+                    via = Some(parse_via(value)?);
+                    continue;
+                }
+                "--route" => {
+                    route_scope = Some(parse_route_scope(value)?);
+                    continue;
+                }
                 "--routing-mode" => {
-                    routing_mode = parse_routing_mode(value)?;
+                    apply_deprecated_routing_mode(value, &mut via, &mut route_scope)?;
                     continue;
                 }
                 "--local-injector-port" => {
@@ -920,17 +930,19 @@ where
                 auto_compact_window = Some(args.next()?.to_str()?.parse().ok()?);
                 continue;
             }
+            "--via" => {
+                via = Some(parse_via(args.next()?.to_str()?)?);
+                continue;
+            }
+            "--route" => {
+                route_scope = Some(parse_route_scope(args.next()?.to_str()?)?);
+                continue;
+            }
             "--routing-mode" => {
-                routing_mode = parse_routing_mode(args.next()?.to_str()?)?;
+                apply_deprecated_routing_mode(args.next()?.to_str()?, &mut via, &mut route_scope)?;
                 continue;
             }
-            "--local" => {
-                eprintln!(
-                    "Warning: `--local` has been removed and is ignored. Use `{CLI_BIN} claude --local-router` for public Rayline local routing."
-                );
-                continue;
-            }
-            "--local-router" => {
+            "--local" | "--local-router" => {
                 local_router = true;
                 continue;
             }
@@ -939,7 +951,9 @@ where
                 continue;
             }
             "--no-proxy" => {
-                routing_mode = crate::claude::RoutingMode::Override;
+                // Deprecated alias for `--via env`.
+                eprintln!("Warning: `--no-proxy` is deprecated; use `{CLI_BIN} claude --via env`.");
+                via = Some(ViaArg::Env);
                 continue;
             }
             "--diagnose" => {
@@ -978,6 +992,8 @@ where
         claude_args.push(arg.clone());
     }
 
+    let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
+
     Some(crate::claude::RunRequest {
         env_name,
         auth_token: root_auth_token,
@@ -988,6 +1004,7 @@ where
         isolated,
         local_injector_port,
         routing_mode,
+        route_scope_explicit: route_scope.is_some(),
         route_statusline_enabled,
         diagnose,
         upstream_ca_path,
@@ -996,12 +1013,114 @@ where
     })
 }
 
-fn parse_routing_mode(value: &str) -> Option<crate::claude::RoutingMode> {
+/// Connection mechanism wiring Claude Code to the router (the `--via` axis).
+/// `proxy` is the default; `env` is the lightweight, cloud-only opt-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViaArg {
+    Env,
+    Proxy,
+}
+
+/// What the proxy routes (the `--route` axis).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteScope {
+    All,
+    Subagents,
+}
+
+fn parse_via(value: &str) -> Option<ViaArg> {
     match value {
-        "override" => Some(crate::claude::RoutingMode::Override),
-        "proxy" => Some(crate::claude::RoutingMode::Proxy),
-        "proxy-subagents" => Some(crate::claude::RoutingMode::ProxySubagents),
+        "env" => Some(ViaArg::Env),
+        "proxy" => Some(ViaArg::Proxy),
         _ => None,
+    }
+}
+
+fn parse_route_scope(value: &str) -> Option<RouteScope> {
+    match value {
+        "all" => Some(RouteScope::All),
+        "subagents" => Some(RouteScope::Subagents),
+        _ => None,
+    }
+}
+
+/// Map the deprecated `--routing-mode <value>` onto the two new axes, emitting a
+/// one-line deprecation warning that names the replacement.
+fn apply_deprecated_routing_mode(
+    value: &str,
+    via: &mut Option<ViaArg>,
+    route_scope: &mut Option<RouteScope>,
+) -> Option<()> {
+    match value {
+        "override" => {
+            eprintln!(
+                "Warning: `--routing-mode override` is deprecated; use `{CLI_BIN} claude --via env`."
+            );
+            *via = Some(ViaArg::Env);
+        }
+        "proxy" => {
+            eprintln!(
+                "Warning: `--routing-mode proxy` is deprecated; use `{CLI_BIN} claude --route all`."
+            );
+            // Full-mode alias: restore the proxy mechanism so it overrides an
+            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
+            *via = Some(ViaArg::Proxy);
+            *route_scope = Some(RouteScope::All);
+        }
+        "proxy-subagents" => {
+            eprintln!(
+                "Warning: `--routing-mode proxy-subagents` is deprecated; use `{CLI_BIN} claude --route subagents`."
+            );
+            // Full-mode alias: restore the proxy mechanism so it overrides an
+            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
+            *via = Some(ViaArg::Proxy);
+            *route_scope = Some(RouteScope::Subagents);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Resolve the two-axis routing intent into the internal [`RoutingMode`].
+///
+/// The connection mechanism defaults to the proxy; `--via env` is the only way
+/// to reach the env-override path, and it is rejected when the session needs
+/// the proxy (local inference or selective routing). The proxy scope default is
+/// router-dependent: cloud routes everything, local routes subagents only.
+fn resolve_routing_mode(
+    local_router: bool,
+    via: Option<ViaArg>,
+    route_scope: Option<RouteScope>,
+) -> Option<crate::claude::RoutingMode> {
+    use crate::claude::RoutingMode;
+
+    let scope = route_scope.unwrap_or(if local_router {
+        RouteScope::Subagents
+    } else {
+        RouteScope::All
+    });
+
+    match via {
+        Some(ViaArg::Env) => {
+            // The env mechanism is cloud-only and cannot route selectively.
+            if local_router {
+                eprintln!(
+                    "Error: `--via env` cannot reach local inference; drop `--local` or `--via env`."
+                );
+                return None;
+            }
+            if matches!(route_scope, Some(RouteScope::Subagents)) {
+                eprintln!(
+                    "Error: `--via env` cannot route selectively; selective routing needs the proxy."
+                );
+                return None;
+            }
+            Some(RoutingMode::Override)
+        }
+        Some(ViaArg::Proxy) | None => Some(match scope {
+            RouteScope::All => RoutingMode::Proxy,
+            RouteScope::Subagents => RoutingMode::ProxySubagents,
+        }),
     }
 }
 
@@ -1370,18 +1489,6 @@ fn unavailable(original_argv: &[OsString]) -> ExitCode {
     ExitCode::from(127)
 }
 
-fn routing_mode_explicit(original_argv: &[OsString]) -> bool {
-    original_argv
-        .iter()
-        .skip(1)
-        .take_while(|arg| *arg != "--")
-        .any(|arg| {
-            arg.to_str().is_some_and(|arg| {
-                arg == "--no-proxy" || arg == "--routing-mode" || arg.starts_with("--routing-mode=")
-            })
-        })
-}
-
 fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
     let command = command_path_before_help(original_argv)?;
     match command.as_slice() {
@@ -1484,6 +1591,8 @@ fn is_value_option(arg: &str) -> bool {
             | "--model"
             | "--auto-compact-window"
             | "--routing-mode"
+            | "--via"
+            | "--route"
             | "--local-injector-port"
             | "--upstream-ca-path"
             | "--router-config-path"
@@ -1502,35 +1611,149 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    use crate::claude::RoutingMode;
+
+    fn claude_run(args: &[&str]) -> crate::claude::RunRequest {
+        let RaylineDispatch::ClaudeRun(request) = rayline_dispatch_for_argv(&argv(args)) else {
+            panic!("expected ClaudeRun for {args:?}");
+        };
+        request
+    }
+
+    // ── Connection mechanism resolution (the two-axis model) ──────────────
+
     #[test]
-    fn routing_mode_before_separator_is_explicit() {
-        assert!(routing_mode_explicit(&argv(&[
-            "rayline",
-            "claude",
-            "--routing-mode=proxy"
-        ])));
+    fn resolve_cloud_default_is_proxy_all() {
+        assert_eq!(
+            resolve_routing_mode(false, None, None),
+            Some(RoutingMode::Proxy)
+        );
     }
 
     #[test]
-    fn no_proxy_before_separator_is_explicit() {
-        assert!(routing_mode_explicit(&argv(&[
-            "rayline",
-            "claude",
-            "--no-proxy",
-            "--",
-            "--routing-mode"
-        ])));
+    fn resolve_cloud_route_subagents_is_proxy_subagents() {
+        assert_eq!(
+            resolve_routing_mode(false, None, Some(RouteScope::Subagents)),
+            Some(RoutingMode::ProxySubagents)
+        );
     }
 
     #[test]
-    fn forwarded_routing_mode_after_separator_is_not_explicit() {
-        assert!(!routing_mode_explicit(&argv(&[
-            "rayline",
-            "claude",
-            "--",
-            "--routing-mode",
-            "proxy"
-        ])));
+    fn resolve_local_default_is_proxy_subagents() {
+        assert_eq!(
+            resolve_routing_mode(true, None, None),
+            Some(RoutingMode::ProxySubagents)
+        );
+    }
+
+    #[test]
+    fn resolve_local_route_all_is_proxy_all() {
+        assert_eq!(
+            resolve_routing_mode(true, None, Some(RouteScope::All)),
+            Some(RoutingMode::Proxy)
+        );
+    }
+
+    #[test]
+    fn resolve_via_env_cloud_is_override() {
+        assert_eq!(
+            resolve_routing_mode(false, Some(ViaArg::Env), None),
+            Some(RoutingMode::Override)
+        );
+    }
+
+    #[test]
+    fn resolve_via_proxy_cloud_is_proxy_all() {
+        assert_eq!(
+            resolve_routing_mode(false, Some(ViaArg::Proxy), None),
+            Some(RoutingMode::Proxy)
+        );
+    }
+
+    #[test]
+    fn resolve_via_env_with_local_is_rejected() {
+        // Local inference is unreachable via the env mechanism.
+        assert_eq!(resolve_routing_mode(true, Some(ViaArg::Env), None), None);
+    }
+
+    #[test]
+    fn resolve_via_env_with_route_subagents_is_rejected() {
+        // Selective routing needs the proxy.
+        assert_eq!(
+            resolve_routing_mode(false, Some(ViaArg::Env), Some(RouteScope::Subagents)),
+            None
+        );
+    }
+
+    // ── Parser surface ────────────────────────────────────────────────────
+
+    #[test]
+    fn bare_claude_defaults_to_proxy_all() {
+        assert_eq!(
+            claude_run(&["rayline", "claude"]).routing_mode,
+            RoutingMode::Proxy
+        );
+    }
+
+    #[test]
+    fn via_env_flag_selects_override() {
+        assert_eq!(
+            claude_run(&["rayline", "claude", "--via", "env"]).routing_mode,
+            RoutingMode::Override
+        );
+    }
+
+    #[test]
+    fn local_flag_forces_proxy_subagents() {
+        let request = claude_run(&["rayline", "claude", "--local"]);
+        assert!(request.local_router);
+        assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
+    }
+
+    #[test]
+    fn route_subagents_flag_selects_proxy_subagents() {
+        assert_eq!(
+            claude_run(&["rayline", "claude", "--route", "subagents"]).routing_mode,
+            RoutingMode::ProxySubagents
+        );
+    }
+
+    #[test]
+    fn deprecated_no_proxy_maps_to_override() {
+        assert_eq!(
+            claude_run(&["rayline", "claude", "--no-proxy"]).routing_mode,
+            RoutingMode::Override
+        );
+    }
+
+    #[test]
+    fn deprecated_no_proxy_then_routing_mode_proxy_restores_proxy() {
+        // Last-value-wins: a later deprecated full-mode alias must override an
+        // earlier `--no-proxy`, restoring the proxy mechanism (not stay Override).
+        assert_eq!(
+            claude_run(&["rayline", "claude", "--no-proxy", "--routing-mode", "proxy"])
+                .routing_mode,
+            RoutingMode::Proxy
+        );
+        assert_eq!(
+            claude_run(&[
+                "rayline",
+                "claude",
+                "--no-proxy",
+                "--routing-mode",
+                "proxy-subagents"
+            ])
+            .routing_mode,
+            RoutingMode::ProxySubagents
+        );
+    }
+
+    #[test]
+    fn via_env_with_local_is_unavailable() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--via", "env", "--local"])),
+            RaylineDispatch::Unavailable
+        ));
     }
 
     #[test]
@@ -1581,7 +1804,9 @@ mod tests {
 
         assert!(help.contains("hosted routing"));
         assert!(help.contains("local static router"));
-        assert!(help.contains("--local-router"));
+        assert!(help.contains("--local"));
+        assert!(help.contains("--via"));
+        assert!(help.contains("--route"));
     }
 
     #[test]

@@ -70,9 +70,9 @@ rayline router stop || true
 
 ```bash
 rayline claude \
-  --local-router \
+  --local \
   --isolated \
-  --routing-mode proxy-subagents \
+  --route subagents \
   --router-config-path ~/.config/rayline/local-router-explore-local.json \
   -- \
   -p 'Use the Explore subagent for this task. Ask the Explore subagent to reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK. After the Explore subagent returns, reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK.'
@@ -123,8 +123,8 @@ CLAUDE_CONFIG_DIR="$HOME/.rayline/cc" claude daemon stop --any || true
 ```
 
 If `Explore` does not route locally, confirm the command used
-`--routing-mode proxy-subagents` and `--router-config-path`. Main-thread Claude
-traffic should remain passthrough in this mode.
+`--route subagents` (the default for `--local`) and `--router-config-path`.
+Main-thread Claude traffic should remain passthrough in this mode.
 
 If the model is slow or missing, watch:
 

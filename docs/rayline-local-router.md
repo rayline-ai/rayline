@@ -2,8 +2,9 @@
 
 Rayline Local can run Claude Code through an explicit local static router.
 
-- `rayline claude --local-router` starts the local static router path. It does
-  not require hosted Rayline auth for routing decisions.
+- `rayline claude --local` starts the local static router path. It does
+  not require hosted Rayline auth for routing decisions. (`--local-router` is a
+  deprecated alias.)
 - Built-in hosted Rayline auth uses Rayline-scoped CLI sessions. The CLI stores
   opaque `rls_`/`rlr_` session tokens and mints a separate `rlk-` router key for
   hosted data-plane requests.
@@ -13,14 +14,14 @@ Rayline Local can run Claude Code through an explicit local static router.
 Run the local static router:
 
 ```bash
-rayline claude --local-router
+rayline claude --local
 ```
 
 Run the local static router beside a normal Claude Code background daemon with
 an isolated Claude config dir:
 
 ```bash
-rayline claude --local-router --isolated
+rayline claude --local --isolated
 ```
 
 Check for CLI updates:
@@ -38,6 +39,79 @@ rayline router logs --lines 120
 rayline router top
 rayline router stop
 ```
+
+## Routing Arguments
+
+Routing is controlled by three orthogonal flags on `rayline claude`. You rarely
+need more than `--local`; the other two are advanced overrides.
+
+| Flag | Axis | Values | Default |
+| --- | --- | --- | --- |
+| `--local` | **Router** — where routing decisions are made | flag (cloud when absent) | cloud (hosted) |
+| `--via` | **Connection** — how Claude Code reaches the router | `proxy`, `env` | `proxy` |
+| `--route` | **Scope** — what the proxy routes through the router | `all`, `subagents` | router-dependent (see below) |
+
+### `--local` — router axis
+
+- Absent: the **hosted cloud router** at `api.rayline.ai` makes routing and model
+  decisions (requires `rayline auth login`).
+- Present: the **on-device static router** decides locally. No login, nothing
+  leaves your machine. `--local` forces the proxy (local inference is only
+  reachable through it).
+
+### `--via` — connection mechanism
+
+How Rayline wires Claude Code to the router. Both are first-class Claude Code
+injection points:
+
+- `proxy` (default): a local proxy intercepts and forwards each request.
+  **Required** to reach local inference or to route selectively. Enables
+  `rayline top` and per-request metrics.
+- `env`: points `ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` at the router for the
+  whole session — lightest weight, no background process. **Cloud-only**: it
+  cannot reach local inference and cannot route selectively, so it is rejected
+  when combined with `--local` or `--route subagents`.
+
+### `--route` — proxy scope
+
+What flows through the router versus passing straight through to Anthropic:
+
+- `all`: route every request (main agent + subagents).
+- `subagents`: route only subagent traffic; the main agent stays on cloud
+  Claude. (The hybrid path — quality main agent, offloaded subagents.)
+
+The default depends on the router, because the two are used differently:
+
+- **Cloud router → `all`.** The hosted router does model selection; applying it
+  universally is the intended behavior.
+- **Local router → `subagents`.** Local sessions are hybrid by default; pass
+  `--route all` for a fully-local session.
+
+### Common combinations
+
+| Command | Router | Connection | Scope |
+| --- | --- | --- | --- |
+| `rayline claude` | cloud | proxy | all |
+| `rayline claude --via env` | cloud | env | all |
+| `rayline claude --local` | local | proxy | subagents |
+| `rayline claude --local --route all` | local | proxy | all |
+| `rayline claude --route subagents` | cloud | proxy | subagents |
+
+`rayline claude --via env --local` and `rayline claude --via env --route subagents`
+are rejected: the env mechanism is cloud-only and cannot route selectively.
+
+### Deprecated flags
+
+These older flags still work for one release and print a one-line warning naming
+the replacement:
+
+| Deprecated | Use instead |
+| --- | --- |
+| `--local-router` | `--local` |
+| `--no-proxy` | `--via env` |
+| `--routing-mode override` | `--via env` |
+| `--routing-mode proxy` | `--route all` |
+| `--routing-mode proxy-subagents` | `--route subagents` |
 
 ## Hosted Auth and Proxy
 
@@ -83,7 +157,7 @@ Launch with that config:
 
 ```bash
 rayline claude \
-  --local-router \
+  --local \
   --isolated \
   --router-config-path ~/.config/rayline/local-router.json
 ```
@@ -188,7 +262,7 @@ If that local server does not require auth, omit `api_key_env`.
 
 Direct endpoints in the router JSON only control where the local router sends
 matching requests. They do not control the daemon's managed local adapter. An
-explicit `rayline claude --local-router` launch still starts the managed local
+explicit `rayline claude --local` launch still starts the managed local
 adapter with the active local-model config; without a custom local-model config,
 that is the bundled llama.cpp path.
 
@@ -260,8 +334,7 @@ from starting. Configure `rayline local custom` to make the daemon use
 
    Confirm the native Rayline Local CLI exposes `claude`, `router`, `local`, and
    `update`. Confirm `rayline claude --help` describes local routing and includes
-   `--local-router`, `--isolated`,
-   `--routing-mode`, and `--router-config-path`.
+   `--local`, `--isolated`, `--via`, `--route`, and `--router-config-path`.
 
 2. Update check:
 
@@ -277,7 +350,7 @@ from starting. Configure `rayline local custom` to make the daemon use
 
    ```bash
    rayline claude \
-     --local-router \
+     --local \
      --isolated \
      --router-config-path ~/.config/rayline/local-router.json
    ```
@@ -342,5 +415,5 @@ To force a clean restart:
 
 ```bash
 rayline router stop
-rayline claude --local-router --isolated --router-config-path ~/.config/rayline/local-router.json
+rayline claude --local --isolated --router-config-path ~/.config/rayline/local-router.json
 ```
