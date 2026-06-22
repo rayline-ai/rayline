@@ -27,6 +27,72 @@ const SMALL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CONTEXT_SMALL: u64 = 65_536;
 const CONTEXT_LARGE: u64 = 131_072;
 
+/// Leave ~10% of a budget for the OS / driver / runtime allocator. Applied to
+/// discrete-VRAM and CPU-RAM ceilings; the Apple ⅔ figure already bakes in the
+/// OS reserve, so it is used as-is.
+// consumed by Task 3/4 call sites; allow until wired up
+#[allow(dead_code)]
+const MEMORY_HEADROOM_NUM: u64 = 9;
+#[allow(dead_code)]
+const MEMORY_HEADROOM_DEN: u64 = 10;
+/// Apple Silicon caps GPU-wired memory at ~⅔ of unified RAM (the figure the old
+/// `fit()` comment cited). Conservative by default; advanced users can raise
+/// `iogpu.wired_limit_pct`.
+#[allow(dead_code)]
+const APPLE_UNIFIED_GPU_NUM: u64 = 2;
+#[allow(dead_code)]
+const APPLE_UNIFIED_GPU_DEN: u64 = 3;
+
+/// Two derived memory budgets for a machine.
+// consumed by Task 3/4 call sites; allow until wired up
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct Budgets {
+    /// Accelerator memory the model's working set must fit in.
+    ceiling_bytes: u64,
+    /// All memory the resident weights can occupy (host + device).
+    total_bytes: u64,
+}
+
+/// Derive the hot ceiling and total resident budget from detected hardware.
+/// `None` when no memory could be detected (no verdict possible).
+// consumed by Task 3/4 call sites; allow until wired up
+#[allow(dead_code)]
+fn budgets(hw: &rayline_llama::HardwareInfo) -> Option<Budgets> {
+    let ram = hw.total_ram_bytes;
+    let vram = hw.gpu_vram_bytes;
+    if ram == 0 && vram == 0 {
+        return None;
+    }
+    let budgets = match hw.gpu_type.as_str() {
+        // Discrete GPU: the binding constraint is VRAM; weights may also spill
+        // to host RAM, so total = RAM + VRAM guards loadability.
+        "nvidia" if vram > 0 => Budgets {
+            ceiling_bytes: vram * MEMORY_HEADROOM_NUM / MEMORY_HEADROOM_DEN,
+            total_bytes: ram.saturating_add(vram),
+        },
+        // Apple Silicon: one unified pool; GPU-wired cap ~⅔ of RAM.
+        "apple-silicon" => Budgets {
+            ceiling_bytes: ram * APPLE_UNIFIED_GPU_NUM / APPLE_UNIFIED_GPU_DEN,
+            total_bytes: ram,
+        },
+        // CPU-only or an accelerator detection missed: budget against RAM.
+        _ => Budgets {
+            ceiling_bytes: ram * MEMORY_HEADROOM_NUM / MEMORY_HEADROOM_DEN,
+            total_bytes: ram,
+        },
+    };
+    Some(budgets)
+}
+
+/// Detect this machine's hardware once per process (cached), mirroring
+/// `detect_total_ram`'s `OnceLock`. Returns `None` only if a future detector
+/// signals total failure; today `detect_hardware` always returns a value.
+pub fn detect_hardware() -> Option<&'static rayline_llama::HardwareInfo> {
+    static HARDWARE: std::sync::OnceLock<rayline_llama::HardwareInfo> = std::sync::OnceLock::new();
+    Some(HARDWARE.get_or_init(rayline_llama::detect_hardware))
+}
+
 /// One curated registry entry (the subset of `ModelEntry` fields this CLI
 /// needs; unknown fields are ignored).
 #[derive(Clone, Debug, PartialEq)]
@@ -775,6 +841,49 @@ fn render_progress_bar(progress: &rayline_hf::DownloadProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hw(
+        total_ram_bytes: u64,
+        gpu_type: &str,
+        gpu_vram_bytes: u64,
+    ) -> rayline_llama::HardwareInfo {
+        rayline_llama::HardwareInfo {
+            total_ram_bytes,
+            gpu_type: gpu_type.to_owned(),
+            gpu_model: String::new(),
+            gpu_vram_bytes,
+            os: "test".to_owned(),
+            arch: "test".to_owned(),
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn budgets_apple_unified_caps_at_two_thirds_of_ram() {
+        let b = budgets(&hw(24 * GIB, "apple-silicon", 0)).unwrap();
+        assert_eq!(b.ceiling_bytes, 24 * GIB * 2 / 3);
+        assert_eq!(b.total_bytes, 24 * GIB);
+    }
+
+    #[test]
+    fn budgets_discrete_gpu_uses_vram_ceiling_and_summed_total() {
+        let b = budgets(&hw(32 * GIB, "nvidia", 8 * GIB)).unwrap();
+        assert_eq!(b.ceiling_bytes, 8 * GIB * 9 / 10); // 10% headroom
+        assert_eq!(b.total_bytes, 32 * GIB + 8 * GIB);
+    }
+
+    #[test]
+    fn budgets_cpu_only_uses_ram_with_headroom() {
+        let b = budgets(&hw(32 * GIB, "none", 0)).unwrap();
+        assert_eq!(b.ceiling_bytes, 32 * GIB * 9 / 10);
+        assert_eq!(b.total_bytes, 32 * GIB);
+    }
+
+    #[test]
+    fn budgets_unknown_when_no_memory_detected() {
+        assert!(budgets(&hw(0, "none", 0)).is_none());
+    }
 
     fn registry_model(id: &str, base_ram_bytes: u64) -> Value {
         json!({

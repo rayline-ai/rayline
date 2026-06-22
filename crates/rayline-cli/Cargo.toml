@@ -30,6 +30,7 @@ tar = "0.4"
 tokio.workspace = true
 url = "2"
 rayline-hf = { path = "../rayline-hf" }
+rayline-llama = { path = "../rayline-llama" }
 rayline-metrics = { path = "../rayline-metrics" }
 zstd = "0.13"
 
