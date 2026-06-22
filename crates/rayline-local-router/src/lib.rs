@@ -892,7 +892,7 @@ async fn forward_openai_chat_endpoint(
 ) -> Result<Response<BoxBody>> {
     let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let estimated_input_tokens = approximate_input_tokens(&body);
-    let request_body = build_openai_chat_request(&body, &decision.selected_model);
+    let request_body = build_openai_chat_request(&body, &decision.selected_model, want_stream);
     let url = format!(
         "{}/chat/completions",
         endpoint.base_url.trim_end_matches('/')
@@ -915,6 +915,16 @@ async fn forward_openai_chat_endpoint(
             Some(estimated_input_tokens),
         )
         .await;
+    }
+    if want_stream {
+        // True streaming: translate OpenAI Chat SSE -> Anthropic SSE chunk by chunk.
+        return Ok(openai_chat_stream_to_anthropic(
+            resp,
+            decision,
+            state.opts.metrics.clone(),
+            request_id.to_owned(),
+            estimated_input_tokens,
+        ));
     }
     let value = resp.json::<Value>().await?;
     let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
@@ -1428,7 +1438,7 @@ fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
     headers.insert("x-rayline-route-id", route_id);
 }
 
-fn build_openai_chat_request(body: &Value, model: &str) -> Value {
+fn build_openai_chat_request(body: &Value, model: &str, want_stream: bool) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = body.get("system") {
         let content = content_to_text(system);
@@ -1444,7 +1454,11 @@ fn build_openai_chat_request(body: &Value, model: &str) -> Value {
     let mut out = Map::new();
     out.insert("model".to_owned(), Value::String(model.to_owned()));
     out.insert("messages".to_owned(), Value::Array(messages));
-    out.insert("stream".to_owned(), Value::Bool(false));
+    out.insert("stream".to_owned(), Value::Bool(want_stream));
+    if want_stream {
+        // Ask the upstream for a trailing usage chunk so we can report real token counts.
+        out.insert("stream_options".to_owned(), json!({"include_usage": true}));
+    }
     for key in ["max_tokens", "temperature", "top_p", "stop"] {
         if let Some(value) = body.get(key) {
             out.insert(key.to_owned(), value.clone());
@@ -1523,6 +1537,50 @@ fn append_openai_messages(out: &mut Vec<Value>, message: &Value) {
         return;
     }
 
+    // When the user message carries image blocks we must emit OpenAI multimodal
+    // content PARTS instead of a flat string; otherwise we keep the plain-string
+    // shape to avoid churning behavior for the common text-only path.
+    let has_image = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"));
+    if has_image {
+        let mut parts = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(value) = block.get("text").and_then(Value::as_str) {
+                        if !value.is_empty() {
+                            parts.push(json!({"type": "text", "text": value}));
+                        }
+                    }
+                }
+                Some("image") => {
+                    if let Some(url) = anthropic_image_to_openai_url(block) {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                }
+                Some("tool_result") => {
+                    if !parts.is_empty() {
+                        out.push(json!({"role": "user", "content": Value::Array(parts)}));
+                        parts = Vec::new();
+                    }
+                    let tool_call_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_local");
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": content_to_text(block.get("content").unwrap_or(&Value::Null)),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        out.push(json!({"role": role, "content": Value::Array(parts)}));
+        return;
+    }
+
     let mut user_text = String::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -1546,13 +1604,32 @@ fn append_openai_messages(out: &mut Vec<Value>, message: &Value) {
                     "content": content_to_text(block.get("content").unwrap_or(&Value::Null)),
                 }));
             }
-            Some("image") => {
-                user_text.push_str("\n[image omitted by local router MVP]\n");
-            }
             _ => {}
         }
     }
     out.push(json!({"role": role, "content": user_text}));
+}
+
+/// Convert an Anthropic image block into an OpenAI `image_url` value string.
+/// `base64` sources become `data:<media_type>;base64,<data>` URLs; `url`
+/// sources pass through. Returns `None` if the block is malformed.
+fn anthropic_image_to_openai_url(block: &Value) -> Option<String> {
+    let source = block.get("source")?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str)?;
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 fn tool_to_openai(tool: &Value) -> Option<Value> {
@@ -1636,6 +1713,378 @@ fn openai_chat_response_to_anthropic(value: &Value, model: &str) -> Value {
             "output_tokens": value.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
         }
     })
+}
+
+/// Streaming translator state: OpenAI Chat `chat.completion.chunk` SSE in,
+/// Anthropic Messages SSE out.
+///
+/// State machine (one Anthropic block index per text run and per OpenAI tool
+/// index):
+///   - lazily emit `message_start` on the first chunk (real `id` if present,
+///     else generated; input_tokens = estimate, corrected later);
+///   - on a text fragment: open a text block if none is open
+///     (`content_block_start`), emit one `content_block_delta`/`text_delta` per
+///     fragment, and `content_block_stop` when the run ends;
+///   - on a tool_call delta: close any open text block, on the first delta for
+///     an OpenAI index open a `tool_use` block and remember name/id, then emit
+///     one `input_json_delta` per `function.arguments` fragment;
+///   - terminal chunk (`finish_reason` set) flushes open blocks, then on stream
+///     end emit `message_delta` (mapped stop_reason + output_tokens) and
+///     `message_stop`.
+///
+/// `output_tokens` prefers the trailing usage chunk's `completion_tokens`,
+/// otherwise falls back to a rough running estimate.
+#[derive(Default)]
+struct OpenAiSseTranslator {
+    selected_model: String,
+    estimated_input_tokens: u64,
+    line_buffer: String,
+    message_started: bool,
+    message_id: Option<String>,
+    next_block_index: usize,
+    open_text_block: Option<usize>,
+    /// OpenAI tool index -> Anthropic block index (once the block is opened).
+    tool_blocks: HashMap<u64, usize>,
+    saw_tool: bool,
+    finish_reason: Option<String>,
+    output_tokens: Option<u64>,
+    running_output_chars: usize,
+    saw_content: bool,
+    finished: bool,
+}
+
+impl OpenAiSseTranslator {
+    fn new(selected_model: &str, estimated_input_tokens: u64) -> Self {
+        Self {
+            selected_model: selected_model.to_owned(),
+            estimated_input_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Feed a raw byte chunk; returns Anthropic SSE text to forward downstream.
+    /// Partial trailing lines are buffered until completed by a later chunk.
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.line_buffer.push_str(&String::from_utf8_lossy(bytes));
+        let mut out = String::new();
+        while let Some(line) = self.next_line() {
+            self.handle_line(&line, &mut out);
+        }
+        out
+    }
+
+    /// Pop one complete line (terminated by `\n`), trimming a trailing `\r`.
+    fn next_line(&mut self) -> Option<String> {
+        let idx = self.line_buffer.find('\n')?;
+        let mut line = self.line_buffer[..idx].to_owned();
+        self.line_buffer.drain(..idx + 1);
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        Some(line)
+    }
+
+    fn handle_line(&mut self, line: &str, out: &mut String) {
+        let Some(payload) = line.strip_prefix("data:") else {
+            // Blank lines, comments (`:`), and event: lines carry no JSON.
+            return;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        self.handle_chunk(&value, out);
+    }
+
+    fn handle_chunk(&mut self, chunk: &Value, out: &mut String) {
+        if !self.message_started {
+            if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                self.message_id = Some(id.to_owned());
+            }
+            self.emit_message_start(out);
+        }
+
+        // Trailing usage chunk: `choices` empty, populated `usage`.
+        if let Some(usage) = chunk.get("usage") {
+            if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                self.output_tokens = Some(completion);
+            }
+        }
+
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            return;
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.emit_text_fragment(text, out);
+                }
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in tool_calls {
+                    self.emit_tool_fragment(call, out);
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+    }
+
+    fn emit_message_start(&mut self, out: &mut String) {
+        self.message_started = true;
+        let id = self
+            .message_id
+            .clone()
+            .unwrap_or_else(|| "msg_rayline_local".to_owned());
+        push_sse(
+            out,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.selected_model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": self.estimated_input_tokens, "output_tokens": 0},
+                }
+            }),
+        );
+    }
+
+    fn emit_text_fragment(&mut self, text: &str, out: &mut String) {
+        self.saw_content = true;
+        self.running_output_chars += text.chars().count();
+        let index = match self.open_text_block {
+            Some(index) => index,
+            None => {
+                let index = self.next_block_index;
+                self.next_block_index += 1;
+                self.open_text_block = Some(index);
+                push_sse(
+                    out,
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                );
+                index
+            }
+        };
+        push_sse(
+            out,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+        );
+    }
+
+    fn close_text_block(&mut self, out: &mut String) {
+        if let Some(index) = self.open_text_block.take() {
+            push_sse(
+                out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            );
+        }
+    }
+
+    fn emit_tool_fragment(&mut self, call: &Value, out: &mut String) {
+        let openai_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        // A new tool index means a new tool block; close any open text run first.
+        if !self.tool_blocks.contains_key(&openai_index) {
+            self.close_text_block(out);
+            self.saw_tool = true;
+            self.saw_content = true;
+            let block_index = self.next_block_index;
+            self.next_block_index += 1;
+            self.tool_blocks.insert(openai_index, block_index);
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("toolu_local");
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            push_sse(
+                out,
+                "content_block_start",
+                json!({"type":"content_block_start","index":block_index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            );
+        }
+        let block_index = self.tool_blocks[&openai_index];
+        if let Some(fragment) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            if !fragment.is_empty() {
+                push_sse(
+                    out,
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":block_index,"delta":{"type":"input_json_delta","partial_json":fragment}}),
+                );
+            }
+        }
+    }
+
+    /// Close all open blocks and emit `message_delta` + `message_stop`.
+    fn finish(&mut self) -> String {
+        let mut out = String::new();
+        if self.finished {
+            return out;
+        }
+        self.finished = true;
+        if !self.message_started {
+            self.emit_message_start(&mut out);
+        }
+        self.close_text_block(&mut out);
+        let mut tool_indices = self.tool_blocks.values().copied().collect::<Vec<_>>();
+        tool_indices.sort_unstable();
+        for index in tool_indices {
+            push_sse(
+                &mut out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            );
+        }
+        let stop_reason = self.mapped_stop_reason();
+        let output_tokens = self
+            .output_tokens
+            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1));
+        push_sse(
+            &mut out,
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":output_tokens}}),
+        );
+        push_sse(&mut out, "message_stop", json!({"type":"message_stop"}));
+        out
+    }
+
+    fn mapped_stop_reason(&self) -> &'static str {
+        if self.saw_tool {
+            return "tool_use";
+        }
+        match self.finish_reason.as_deref() {
+            Some("tool_calls") => "tool_use",
+            Some("length") => "max_tokens",
+            _ => "end_turn",
+        }
+    }
+
+    fn output_tokens_estimate(&self) -> u64 {
+        self.output_tokens
+            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1))
+    }
+}
+
+/// Stream OpenAI Chat SSE upstream, translating to Anthropic SSE as bytes
+/// arrive. Mirrors the side-effects of `response_from_reqwest`:
+/// `add_decision_headers`, `FirstToken` on the first content/tool delta,
+/// incremental + terminal token usage, `RequestCompleted`/`RequestErrored`.
+fn openai_chat_stream_to_anthropic(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    request_id: String,
+    estimated_input_tokens: u64,
+) -> Response<BoxBody> {
+    let selected_model = decision.selected_model.clone();
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut translator = OpenAiSseTranslator::new(&selected_model, estimated_input_tokens);
+        let mut stream = resp.bytes_stream();
+        let mut downstream_open = true;
+        let mut saw_first_token = false;
+        let mut stream_error = None;
+        record_remote_token_usage(
+            metrics.as_ref(),
+            Some(&request_id),
+            Some(estimated_input_tokens),
+            None,
+            Some(selected_model.clone()),
+        );
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let emitted = translator.push_bytes(&bytes);
+                    if !emitted.is_empty() {
+                        if !saw_first_token && translator.saw_content {
+                            saw_first_token = true;
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record(MetricsUpdate::FirstToken {
+                                    request_id: request_id.clone(),
+                                });
+                            }
+                        }
+                        if downstream_open
+                            && tx
+                                .send(Ok(Frame::data(Bytes::from(emitted))))
+                                .await
+                                .is_err()
+                        {
+                            downstream_open = false;
+                        }
+                        record_remote_token_usage(
+                            metrics.as_ref(),
+                            Some(&request_id),
+                            Some(estimated_input_tokens),
+                            Some(translator.output_tokens_estimate()),
+                            Some(selected_model.clone()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    if downstream_open {
+                        let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let tail = translator.finish();
+        if downstream_open && !tail.is_empty() && stream_error.is_none() {
+            let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+        }
+        let output_tokens = translator.output_tokens;
+        if let Some(metrics) = metrics.as_ref() {
+            if let Some(error) = stream_error {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    error,
+                });
+            } else {
+                if !saw_first_token {
+                    metrics.record(MetricsUpdate::FirstToken {
+                        request_id: request_id.clone(),
+                    });
+                }
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    input_tokens: Some(estimated_input_tokens),
+                    output_tokens: output_tokens.or(Some(translator.output_tokens_estimate())),
+                    selected_model: Some(selected_model.clone()),
+                });
+            }
+        }
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body_out)
+        .unwrap();
+    add_decision_headers(response.headers_mut(), decision);
+    response
 }
 
 fn synthetic_anthropic_sse(decision: &RouteDecision, message: &Value) -> Response<BoxBody> {
@@ -2405,5 +2854,264 @@ mod tests {
             Some(1234),
             "PromptCache emission missing: prompt_cache_tokens not recorded in sink"
         );
+    }
+
+    /// Collect the `data:` JSON payloads of emitted Anthropic SSE, in order.
+    fn sse_events(emitted: &str) -> Vec<Value> {
+        emitted
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|payload| serde_json::from_str::<Value>(payload).expect("valid sse json"))
+            .collect()
+    }
+
+    #[test]
+    fn openai_stream_emits_many_text_deltas() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 7);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(b"data: [DONE]\n\n"));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(types.first(), Some(&"message_start"));
+        // One content_block_start, then one delta PER fragment (two), then stop.
+        let text_deltas = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+            })
+            .count();
+        assert_eq!(text_deltas, 2, "expected one text_delta per fragment");
+        let concatenated: String = events
+            .iter()
+            .filter(|event| event["delta"]["type"] == "text_delta")
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(concatenated, "Hello world");
+        // message_start input estimate, message_delta carries real output tokens.
+        let start = events
+            .iter()
+            .find(|e| e["type"] == "message_start")
+            .unwrap();
+        assert_eq!(start["message"]["usage"]["input_tokens"], 7);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(delta["usage"]["output_tokens"], 2);
+        assert_eq!(types.last(), Some(&"message_stop"));
+    }
+
+    #[test]
+    fn openai_stream_reconstructs_single_tool_call_args() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"id\":\"chatcmpl-t\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\"\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        let start = events
+            .iter()
+            .find(|e| e["type"] == "content_block_start")
+            .expect("tool block start");
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(start["content_block"]["name"], "Read");
+        assert_eq!(start["content_block"]["id"], "call_1");
+        let args: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(args, "{\"file\":\"a.rs\"}");
+        let parsed: Value = serde_json::from_str(&args).expect("reconstructed json args");
+        assert_eq!(parsed["file"], "a.rs");
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn openai_stream_handles_event_split_across_chunks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 3);
+        // First chunk ends mid-JSON-object (no trailing newline): nothing parses yet.
+        let first = t.push_bytes(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"con");
+        assert!(
+            sse_events(&first)
+                .iter()
+                .all(|e| e["type"] != "content_block_delta"),
+            "partial line must not emit a text delta yet"
+        );
+        // Second chunk completes the object and terminates the line.
+        let second = t.push_bytes(b"tent\":\"split\"}}]}\n\n");
+        let events = sse_events(&second);
+        let concatenated: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(concatenated, "split");
+    }
+
+    #[test]
+    fn image_block_becomes_openai_image_url_part() {
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what color is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+                ]
+            }]
+        });
+
+        let request = build_openai_chat_request(&body, "gpt-4o-mini", false);
+        let content = &request["messages"][0]["content"];
+        assert!(content.is_array(), "image message must use content parts");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what color is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn url_image_source_passes_through() {
+        let block = json!({"type":"image","source":{"type":"url","url":"https://x/y.png"}});
+        assert_eq!(
+            anthropic_image_to_openai_url(&block).as_deref(),
+            Some("https://x/y.png")
+        );
+    }
+
+    #[test]
+    fn text_only_user_message_keeps_string_content() {
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            }]
+        });
+        let request = build_openai_chat_request(&body, "gpt-4o-mini", true);
+        assert_eq!(request["messages"][0]["content"], "hi");
+        // Streaming requests must opt in to the trailing usage chunk.
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    /// Feed bytes through the translator one byte at a time to stress the
+    /// cross-chunk line buffering, then flush. Returns the concatenated
+    /// Anthropic SSE output.
+    fn translate_byte_by_byte(translator: &mut OpenAiSseTranslator, raw: &[u8]) -> String {
+        let mut out = String::new();
+        for byte in raw {
+            out.push_str(&translator.push_bytes(&[*byte]));
+        }
+        out.push_str(&translator.finish());
+        out
+    }
+
+    // These fixtures are REAL `gpt-4o-mini` streaming responses captured from the
+    // live OpenAI API (see crates/rayline-local-router/tests/fixtures), so the
+    // translator is exercised against actual provider wire bytes — including the
+    // trailing `usage` chunk and `data: [DONE]` sentinel — fed one byte at a time.
+    #[test]
+    fn translates_real_openai_text_stream_fixture() {
+        let raw = include_bytes!("../tests/fixtures/openai_text_stream.sse");
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 18);
+        let emitted = translate_byte_by_byte(&mut t, raw);
+        let events = sse_events(&emitted);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(types.first(), Some(&"message_start"));
+        assert_eq!(types.last(), Some(&"message_stop"));
+        let text_deltas = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta")
+            .count();
+        assert!(
+            text_deltas > 1,
+            "real stream must yield many text deltas, got {text_deltas}"
+        );
+        let text: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        // The model was asked to count 1..8 space separated.
+        assert!(
+            text.contains('1') && text.contains('8'),
+            "unexpected reply text: {text:?}"
+        );
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        // Output tokens come from the real trailing usage chunk (completion_tokens=15).
+        assert_eq!(delta["usage"]["output_tokens"], 15);
+    }
+
+    #[test]
+    fn translates_real_openai_tool_stream_fixture() {
+        let raw = include_bytes!("../tests/fixtures/openai_tool_stream.sse");
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 52);
+        let emitted = translate_byte_by_byte(&mut t, raw);
+        let events = sse_events(&emitted);
+        let tool_start = events
+            .iter()
+            .find(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .expect("a tool_use content_block_start");
+        assert_eq!(tool_start["content_block"]["name"], "get_weather");
+        let args: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        let parsed: Value =
+            serde_json::from_str(&args).unwrap_or_else(|_| panic!("reconstructed args: {args:?}"));
+        assert!(
+            parsed["city"].as_str().is_some(),
+            "expected a city argument, got {parsed:?}"
+        );
+        // Provider sent finish_reason="stop", but a tool block was emitted, so we
+        // must still map to tool_use.
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
     }
 }
