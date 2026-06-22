@@ -325,3 +325,12 @@ zmij                               1.0.21       MIT
 zstd                               0.13.3       MIT
 zstd-safe                          7.2.4        MIT OR Apache-2.0
 zstd-sys                           2.0.16+zstd.1.5.7 MIT/Apache-2.0
+
+--------------------------------------------------------------------------------
+Design Attributions
+--------------------------------------------------------------------------------
+
+This project's local-model hardware-fit logic (GPU/VRAM and Apple unified-memory
+ceiling selection, MoE active-parameter sizing) was informed by the design of
+llmfit (https://github.com/AlexsJones/llmfit), MIT License. No llmfit code is
+included or linked; only the approach was reused.
