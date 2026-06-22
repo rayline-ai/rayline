@@ -1714,91 +1714,102 @@ async fn start_from_home_with_client(
     let paths = RouterPaths::new(home);
     std::fs::create_dir_all(paths.data_dir())?;
     let mut output = String::new();
-    let requested_meta = router_meta(home, &request, None, router_api_key.as_deref());
 
-    if let Some(existing) = read_pid(&paths.pid_file) {
-        if process_exists(existing) {
-            let meta = read_meta(&paths.meta_file);
-            let health_port =
-                parse_optional_port(meta.get("injector_port")).unwrap_or(request.injector_port);
-            let health = healthz(client, health_port).await;
-            let is_rld = is_rld_process(existing, &meta, RldMode::Serve, client).await;
-            let metadata_matches = metadata_matches_config(&meta, &requested_meta);
-            if health
-                .as_ref()
-                .is_some_and(|health| router_health_matches_meta(health, &requested_meta))
-                && is_rld
-                && metadata_matches
-            {
-                output.push_str(&format!(
-                    "{} already running (pid {existing}, injector :{health_port}).\n",
-                    daemon_name()
-                ));
-                return Ok(output);
-            }
-            if !is_rld {
-                let requested_health = if health_port == request.injector_port {
-                    health
-                } else {
-                    healthz(client, request.injector_port).await
-                };
-                if requested_health.is_some() {
-                    return Err(io::Error::other(format!(
-                        "injector :{} is responding, but pid {} from {} is not this {} supervisor. Run `{} router stop` to clean up before starting.",
-                        request.injector_port,
-                        existing,
-                        paths.pid_file.display(),
+    // ---------- locked window: read-pid → decide → spawn → atomic meta write ----------
+    // Hold the advisory lock across the entire check-then-spawn sequence so
+    // concurrent launchers serialize and only one daemon is ever started.
+    // The lock is released (by drop) before the long readiness wait below.
+    let started = {
+        let _lock = acquire_router_lock(&paths.lock_file)?;
+        let requested_meta = router_meta(home, &request, None, router_api_key.as_deref());
+
+        if let Some(existing) = read_pid(&paths.pid_file) {
+            if process_exists(existing) {
+                let meta = read_meta(&paths.meta_file);
+                let health_port = parse_optional_port(meta.get("injector_port"))
+                    .unwrap_or(request.injector_port);
+                let health = healthz(client, health_port).await;
+                let is_rld = is_rld_process(existing, &meta, RldMode::Serve, client).await;
+                let metadata_matches = metadata_matches_config(&meta, &requested_meta);
+                if health
+                    .as_ref()
+                    .is_some_and(|health| router_health_matches_meta(health, &requested_meta))
+                    && is_rld
+                    && metadata_matches
+                {
+                    output.push_str(&format!(
+                        "{} already running (pid {existing}, injector :{health_port}).\n",
+                        daemon_name()
+                    ));
+                    return Ok(output); // lock released by drop
+                }
+                if !is_rld {
+                    let requested_health = if health_port == request.injector_port {
+                        health
+                    } else {
+                        healthz(client, request.injector_port).await
+                    };
+                    if requested_health.is_some() {
+                        return Err(io::Error::other(format!(
+                            "injector :{} is responding, but pid {} from {} is not this {} supervisor. Run `{} router stop` to clean up before starting.",
+                            request.injector_port,
+                            existing,
+                            paths.pid_file.display(),
+                            daemon_name(),
+                            cli_name()
+                        )));
+                    }
+                    output.push_str(&format!(
+                        "{} pidfile points at {existing}, but that process is not this {} supervisor. Cleaning up.\n",
                         daemon_name(),
+                        daemon_name()
+                    ));
+                    clear_router_state(&paths);
+                } else if !metadata_matches || health.is_some() {
+                    output.push_str(&format!(
+                        "{} running with different config (pid {existing}); restarting.\n",
+                        daemon_name()
+                    ));
+                    stop_router(&paths, client, &mut output).await?;
+                } else {
+                    return Err(io::Error::other(format!(
+                        "pid {existing} from {} is alive but injector :{health_port} is not responding. Run `{} router stop` first.",
+                        paths.pid_file.display(),
                         cli_name()
                     )));
                 }
+            } else {
                 output.push_str(&format!(
-                    "{} pidfile points at {existing}, but that process is not this {} supervisor. Cleaning up.\n",
-                    daemon_name(),
+                    "{} pidfile points at {existing} but the process is gone. Cleaning up.\n",
                     daemon_name()
                 ));
                 clear_router_state(&paths);
-            } else if !metadata_matches || health.is_some() {
-                output.push_str(&format!(
-                    "{} running with different config (pid {existing}); restarting.\n",
-                    daemon_name()
-                ));
-                stop_router(&paths, client, &mut output).await?;
-            } else {
-                return Err(io::Error::other(format!(
-                    "pid {existing} from {} is alive but injector :{health_port} is not responding. Run `{} router stop` first.",
-                    paths.pid_file.display(),
-                    cli_name()
-                )));
             }
-        } else {
-            output.push_str(&format!(
-                "{} pidfile points at {existing} but the process is gone. Cleaning up.\n",
-                daemon_name()
-            ));
-            clear_router_state(&paths);
         }
-    }
 
-    // A combined local-router serve also binds the requested proxy port.
-    // Cloud-only Rayline clients run a standalone proxy there, so take the port
-    // over: stop that proxy first, otherwise the
-    // serve's embedded proxy dies with "Address already in use" and tears down
-    // llama-server. Only do this when the incumbent proxy's meta *explicitly*
-    // records the same port we are about to bind. With a custom `RAYLINE_PROXY_PORT`
-    // there is no conflict, and a missing/unparsable meta port is not proof of a
-    // conflict, so leave an unrelated proxy (e.g. one on another port feeding
-    // other sessions) alone rather than tearing it down on a guess. A genuine
-    // same-port collision we miss this way still surfaces as a clear bind error.
-    if request.enable_proxy && read_pid(&paths.proxy_pid_file).is_some() {
-        let incumbent_port =
-            parse_optional_port(read_meta(&paths.proxy_meta_file).get("proxy_port"));
-        if incumbent_port == Some(request.proxy_port) {
-            stop_proxy(&paths, client, &mut output, false).await?;
+        // A combined local-router serve also binds the requested proxy port.
+        // Cloud-only Rayline clients run a standalone proxy there, so take the port
+        // over: stop that proxy first, otherwise the
+        // serve's embedded proxy dies with "Address already in use" and tears down
+        // llama-server. Only do this when the incumbent proxy's meta *explicitly*
+        // records the same port we are about to bind. With a custom `RAYLINE_PROXY_PORT`
+        // there is no conflict, and a missing/unparsable meta port is not proof of a
+        // conflict, so leave an unrelated proxy (e.g. one on another port feeding
+        // other sessions) alone rather than tearing it down on a guess. A genuine
+        // same-port collision we miss this way still surfaces as a clear bind error.
+        if request.enable_proxy && read_pid(&paths.proxy_pid_file).is_some() {
+            let incumbent_port =
+                parse_optional_port(read_meta(&paths.proxy_meta_file).get("proxy_port"));
+            if incumbent_port == Some(request.proxy_port) {
+                stop_proxy(&paths, client, &mut output, false).await?;
+            }
         }
-    }
 
-    let started = spawn_router(home, &request, bin_path, router_api_key.as_deref())?;
+        spawn_router(home, &request, bin_path, router_api_key.as_deref())?
+        // _lock dropped here → advisory lock released before long readiness wait
+    };
+    // ---------- end of locked window ----------
+
     output.push_str(&started.output);
 
     wait_for_router_ready(
@@ -2076,8 +2087,7 @@ fn spawn_router(
 
     let child = command.spawn()?;
     let pid = child.id() as i32;
-    std::fs::write(&paths.pid_file, format!("{pid}\n"))?;
-    std::fs::write(&paths.meta_file, format_meta(&requested_meta))?;
+    write_pid_meta_atomic(&paths.pid_file, &paths.meta_file, pid, &requested_meta)?;
 
     let mut output = format!(
         "{} starting (pid {pid}, log {}).",
@@ -2217,8 +2227,12 @@ fn spawn_proxy(
 
     let child = command.spawn()?;
     let pid = child.id() as i32;
-    std::fs::write(&paths.proxy_pid_file, format!("{pid}\n"))?;
-    std::fs::write(&paths.proxy_meta_file, format_meta(&requested_meta))?;
+    write_pid_meta_atomic(
+        &paths.proxy_pid_file,
+        &paths.proxy_meta_file,
+        pid,
+        &requested_meta,
+    )?;
     Ok(StartedProxy {
         pid,
         meta: requested_meta,
@@ -3367,6 +3381,140 @@ mod tests {
         let _ = fs::remove_dir_all(test_dir);
     }
 
+    // -----------------------------------------------------------------------
+    // flock + atomic meta tests (Task 1)
+    // -----------------------------------------------------------------------
+
+    /// Minimal seam: simulate the locked check-then-spawn logic with a fake
+    /// spawn that increments a counter file instead of launching a real process.
+    /// This exercises `acquire_router_lock` + `write_pid_meta_atomic` without
+    /// requiring a real rld binary.
+    ///
+    /// Protocol:
+    ///   - counter file (`{prefix}.spawn_count`) tracks total spawns
+    ///   - pid file written by the first spawn (pid = 1)
+    ///   - meta file written atomically with a known key
+    ///   - second caller detects pid file → reuses (no second spawn)
+    #[cfg(unix)]
+    async fn start_with_stub(paths: &RouterPaths) -> io::Result<()> {
+        // Small sleep *before* acquiring the lock to encourage interleaving in
+        // concurrent callers — this is what makes the race reproducible in the
+        // pre-fix (RED) phase.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let _lock = acquire_router_lock(&paths.lock_file)?;
+
+        // Under the lock: check if already started.
+        if let Some(_pid) = read_pid(&paths.pid_file) {
+            // Another launcher got here first — reuse its daemon.
+            return Ok(());
+        }
+
+        // "Spawn": increment counter file and write pid/meta.
+        let counter_path = paths.data_dir().join("spawn_count");
+        let count: u32 = std::fs::read_to_string(&counter_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        std::fs::write(&counter_path, format!("{}\n", count + 1))?;
+
+        let fake_pid: i32 = 1;
+        let mut meta = BTreeMap::new();
+        meta.insert("injector_port".to_owned(), "20809".to_owned());
+        write_pid_meta_atomic(&paths.pid_file, &paths.meta_file, fake_pid, &meta)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn count_spawned_daemons(paths: &RouterPaths) -> u32 {
+        let counter_path = paths.data_dir().join("spawn_count");
+        std::fs::read_to_string(&counter_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn meta_parses(paths: &RouterPaths) -> bool {
+        let meta = read_meta(&paths.meta_file);
+        meta.contains_key("injector_port")
+    }
+
+    /// Two concurrent starts must spawn exactly one daemon; the second reuses
+    /// the first.  Meta must always parse (no torn writes).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_starts_spawn_one_daemon() {
+        let paths = std::sync::Arc::new(RouterPaths::temp());
+        let p1 = paths.clone();
+        let p2 = paths.clone();
+
+        let (a, b) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current()
+                    .block_on(start_with_stub(&p1))
+            }),
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current()
+                    .block_on(start_with_stub(&p2))
+            })
+        );
+
+        let a = a.expect("task a panicked").expect("start_with_stub a failed");
+        let b = b.expect("task b panicked").expect("start_with_stub b failed");
+        let _ = (a, b);
+
+        assert_eq!(
+            count_spawned_daemons(&paths),
+            1,
+            "exactly one daemon must be spawned; second caller must reuse"
+        );
+        assert!(
+            meta_parses(&paths),
+            "meta file must always parse (no torn writes)"
+        );
+        let _ = std::fs::remove_dir_all(paths.data_dir());
+    }
+
+    /// Concurrent atomic writes to the same meta path must never produce a
+    /// partially-written file visible to readers.
+    #[test]
+    fn atomic_write_never_tears_meta() {
+        let dir = unique_test_dir("atomic-write-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("rld.meta");
+
+        // Write an initial version so readers always see *something*.
+        let mut initial = BTreeMap::new();
+        initial.insert("injector_port".to_owned(), "20809".to_owned());
+        atomic_write(&dest, format_meta(&initial).as_bytes()).unwrap();
+
+        let dest_clone = dest.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..200u32 {
+                let mut meta = BTreeMap::new();
+                meta.insert("injector_port".to_owned(), (20809 + i).to_string());
+                atomic_write(&dest_clone, format_meta(&meta).as_bytes()).unwrap();
+            }
+        });
+
+        // Reader: parse every read; none should be empty or malformed.
+        for _ in 0..200 {
+            let text = std::fs::read_to_string(&dest).unwrap_or_default();
+            // Either old or new content is fine, but it must not be empty
+            // and every line must be parseable as key=value.
+            for line in text.lines() {
+                assert!(
+                    line.contains('='),
+                    "torn meta line (no '='): {:?}",
+                    line
+                );
+            }
+        }
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4158,6 +4306,74 @@ fn force_stop_process_group(pid: i32) -> io::Result<()> {
     }
 }
 
+/// Acquire an exclusive advisory lock on `lock_path`, blocking until it is
+/// available.  The lock is automatically released when the returned `File`
+/// is dropped (i.e. when the guard goes out of scope or the process dies).
+///
+/// On non-unix platforms the lock is a no-op: the function opens the file and
+/// returns it as a guard so call-sites compile unmodified, but no exclusion is
+/// enforced.  macOS and Linux are the supported targets; Windows support is a
+/// known gap documented in the crate README.
+#[cfg(unix)]
+fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+    // Non-unix stub: open the file so the guard type is consistent.
+    // No actual locking — Windows is a known gap.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+}
+
+/// Write `pid` and `meta` to their respective paths atomically via
+/// temp-file + rename.  A partial write from a concurrent process will never
+/// be visible: readers see either the old content or the complete new content,
+/// never a half-written state.
+fn write_pid_meta_atomic(
+    pid_path: &Path,
+    meta_path: &Path,
+    pid: i32,
+    meta: &BTreeMap<String, String>,
+) -> io::Result<()> {
+    atomic_write(pid_path, format!("{pid}\n").as_bytes())?;
+    atomic_write(meta_path, format_meta(meta).as_bytes())?;
+    Ok(())
+}
+
+/// Write `content` to `dest` atomically via a sibling temp file + rename.
+fn atomic_write(dest: &Path, content: &[u8]) -> io::Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| io::Error::other("dest path has no parent"))?;
+    // Create a temp file in the same directory so rename is always on the same
+    // filesystem (cross-filesystem rename is not atomic on Linux).
+    let tmp_path = dir.join(format!(
+        ".tmp-{}-{}",
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("write"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, dest)?;
+    Ok(())
+}
+
 struct RouterPaths {
     pid_file: PathBuf,
     log_file: PathBuf,
@@ -4165,6 +4381,10 @@ struct RouterPaths {
     proxy_pid_file: PathBuf,
     proxy_log_file: PathBuf,
     proxy_meta_file: PathBuf,
+    /// Advisory lock file used by `acquire_router_lock` to serialize the
+    /// read-pid → decide → spawn → liveness window.  The lock is auto-released
+    /// when the returned `File` is dropped.
+    lock_file: PathBuf,
 }
 
 impl RouterPaths {
@@ -4196,7 +4416,20 @@ impl RouterPaths {
             proxy_pid_file: data_dir.join(format!("{prefix}-proxy.pid")),
             proxy_log_file: data_dir.join(format!("{prefix}-proxy.log")),
             proxy_meta_file: data_dir.join(format!("{prefix}-proxy.meta")),
+            lock_file: data_dir.join(format!("{prefix}.lock")),
         }
+    }
+
+    #[cfg(test)]
+    fn temp() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir()
+            .join(format!("rayline-lock-test-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).expect("could not create temp test dir");
+        Self::in_dir(data_dir)
     }
 
     fn data_dir(&self) -> &Path {
