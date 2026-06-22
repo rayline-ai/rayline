@@ -2146,8 +2146,12 @@ fn routing_mode_name(mode: RoutingMode) -> &'static str {
 
 fn proxy_routing_mode_name(mode: RoutingMode) -> &'static str {
     match mode {
+        RoutingMode::Proxy => crate::router::PROXY_ROUTING_MODE_ALL,
         RoutingMode::ProxySubagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
-        RoutingMode::Proxy | RoutingMode::Override => crate::router::PROXY_ROUTING_MODE_ALL,
+        // `Override` starts no proxy at all (it sets ANTHROPIC_BASE_URL directly),
+        // so it never reaches this proxy-only translation — see the dispatch match
+        // in `run` where `Override` takes the `configure_override_env` branch.
+        RoutingMode::Override => unreachable!("override mode does not start a proxy"),
     }
 }
 
@@ -2688,4 +2692,25 @@ fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
         return home.map_or(path.clone(), |home| home.join(rest));
     }
     path
+}
+
+#[cfg(test)]
+mod proxy_routing_mode_name_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_maps_to_all() {
+        assert_eq!(
+            proxy_routing_mode_name(RoutingMode::Proxy),
+            crate::router::PROXY_ROUTING_MODE_ALL
+        );
+    }
+
+    #[test]
+    fn proxy_subagents_maps_to_selective_subagents() {
+        assert_eq!(
+            proxy_routing_mode_name(RoutingMode::ProxySubagents),
+            crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+        );
+    }
 }
