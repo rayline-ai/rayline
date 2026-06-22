@@ -30,23 +30,16 @@ const CONTEXT_LARGE: u64 = 131_072;
 /// Leave ~10% of a budget for the OS / driver / runtime allocator. Applied to
 /// discrete-VRAM and CPU-RAM ceilings; the Apple ⅔ figure already bakes in the
 /// OS reserve, so it is used as-is.
-// consumed by Task 3/4 call sites; allow until wired up
-#[allow(dead_code)]
 const MEMORY_HEADROOM_NUM: u64 = 9;
-#[allow(dead_code)]
 const MEMORY_HEADROOM_DEN: u64 = 10;
 /// Apple Silicon caps GPU-wired memory at ~⅔ of unified RAM (the figure the old
 /// `fit()` comment cited). Conservative by default; advanced users can raise
 /// `iogpu.wired_limit_pct`.
-#[allow(dead_code)]
 const APPLE_UNIFIED_GPU_NUM: u64 = 2;
-#[allow(dead_code)]
 const APPLE_UNIFIED_GPU_DEN: u64 = 3;
 
 /// Two derived memory budgets for a machine.
-// consumed by Task 3/4 call sites; allow until wired up
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 struct Budgets {
     /// Accelerator memory the model's working set must fit in.
     ceiling_bytes: u64,
@@ -56,8 +49,6 @@ struct Budgets {
 
 /// Derive the hot ceiling and total resident budget from detected hardware.
 /// `None` when no memory could be detected (no verdict possible).
-// consumed by Task 3/4 call sites; allow until wired up
-#[allow(dead_code)]
 fn budgets(hw: &rayline_llama::HardwareInfo) -> Option<Budgets> {
     let ram = hw.total_ram_bytes;
     let vram = hw.gpu_vram_bytes;
@@ -274,35 +265,46 @@ fn parse_sha256(entry: &Value) -> Option<String> {
     rayline_hf::normalize_sha256(digest).ok()
 }
 
-/// RAM the model needs at the context length this machine would run it with.
-pub fn required_ram_bytes(model: &CatalogModel, total_ram_bytes: u64) -> u64 {
-    let context = if total_ram_bytes <= SMALL_RAM_BYTES {
+/// RAM the full (dense) weight set + KV cache needs at `context`.
+fn required_bytes(model: &CatalogModel, context: u64) -> u64 {
+    model
+        .base_ram_bytes
+        .saturating_add(model.kv_cache_bytes_per_token.saturating_mul(context))
+}
+
+/// Context tier for this machine, capped to the model's max window.
+fn context_for(budgets: Budgets, model: &CatalogModel) -> u64 {
+    let tier = if budgets.total_bytes <= SMALL_RAM_BYTES {
         CONTEXT_SMALL
     } else {
         CONTEXT_LARGE
-    }
-    .min(model.max_context_window);
-    model.base_ram_bytes + model.kv_cache_bytes_per_token * context
+    };
+    tier.min(model.max_context_window)
 }
 
-/// Coarse fit verdict against **total physical RAM**.
+/// Hardware-aware fit verdict. Budgets the model against this machine's
+/// accelerator ceiling (discrete VRAM / Apple unified ~⅔ cap / system RAM) with
+/// a hard loadability gate against total host+device memory. `Unknown` when
+/// hardware is absent or no memory could be detected.
 ///
-/// KNOWN LIMITATION (follow-up: GPU-aware fit + context autosizing): this
-/// compares against total RAM, but the real ceiling for the local model is
-/// the GPU memory budget, which is smaller — on Apple Silicon the OS caps
-/// GPU-wired memory at ~⅔ of RAM, and on discrete GPUs it is VRAM, not system
-/// RAM. It also assumes a fixed context tier that may not match the context
-/// the daemon actually loads. As a result a `green`/`amber` verdict can still
-/// OOM at llama-server warmup on memory-constrained machines (e.g. a 27B model
-/// on a 24GB Mac). `rayline_llama::detect_hardware()` already exposes gpu_type /
-/// gpu_vram_bytes; a future revision should budget against those and size the
-/// context to fit, passing the same value to the daemon as `RAYLINE_CTX_SIZE`.
-pub fn fit(model: &CatalogModel, total_ram_bytes: Option<u64>) -> Fit {
-    let Some(total) = total_ram_bytes.filter(|total| *total > 0) else {
+/// v1 budgets the full `base_ram_bytes` footprint (the daemon launches with no
+/// expert offload, so MoE active-param savings cannot be realized yet — phase 2).
+pub fn fit(model: &CatalogModel, hardware: Option<&rayline_llama::HardwareInfo>) -> Fit {
+    let Some(hw) = hardware else {
         return Fit::Unknown;
     };
-    let required = required_ram_bytes(model, total) as f64;
-    let ratio = required / total as f64;
+    let Some(budgets) = budgets(hw) else {
+        return Fit::Unknown;
+    };
+    if budgets.ceiling_bytes == 0 {
+        return Fit::Red;
+    }
+    let context = context_for(budgets, model);
+    let required = required_bytes(model, context);
+    if required > budgets.total_bytes {
+        return Fit::Red; // cannot even load into host+device memory
+    }
+    let ratio = required as f64 / budgets.ceiling_bytes as f64;
     if ratio <= 0.70 {
         Fit::Green
     } else if ratio <= 0.90 {
@@ -395,17 +397,20 @@ pub fn is_downloaded(model: &CatalogModel) -> bool {
 /// nothing is downloaded. Never downloads anything.
 pub async fn auto_select_downloaded(env_name: &str) -> Option<CatalogModel> {
     let models = fetch_curated(env_name).await;
-    let total_ram = detect_total_ram();
+    let hardware = detect_hardware();
     let downloaded = models.into_iter().filter(is_downloaded).collect::<Vec<_>>();
-    choose_auto_pick(downloaded, total_ram)
+    choose_auto_pick(downloaded, hardware)
 }
 
 /// Best of the already-downloaded curated models: hardware fit first, quality
 /// second. Pure so the policy is unit-testable.
-fn choose_auto_pick(downloaded: Vec<CatalogModel>, total_ram: Option<u64>) -> Option<CatalogModel> {
+fn choose_auto_pick(
+    downloaded: Vec<CatalogModel>,
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
     downloaded.into_iter().min_by_key(|model| {
         (
-            fit(model, total_ram).rank(),
+            fit(model, hardware).rank(),
             std::cmp::Reverse(model.quality_score),
         )
     })
@@ -432,13 +437,13 @@ pub struct ModelListing {
 
 pub fn listings(
     models: Vec<CatalogModel>,
-    total_ram_bytes: Option<u64>,
+    hardware: Option<&rayline_llama::HardwareInfo>,
     selected_id: Option<&str>,
 ) -> Vec<ModelListing> {
     models
         .into_iter()
         .map(|model| ModelListing {
-            fit: fit(&model, total_ram_bytes),
+            fit: fit(&model, hardware),
             downloaded: is_downloaded(&model),
             selected: selected_id == Some(model.id.as_str()),
             model,
@@ -448,7 +453,11 @@ pub fn listings(
 
 /// Machine-readable `local models --json` payload (consumed by the menu bar
 /// app). One JSON object on stdout.
-pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+pub fn render_listings_json(
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> String {
+    let total_ram_bytes = hardware.map(|hw| hw.total_ram_bytes);
     let models = listings
         .iter()
         .map(|listing| {
@@ -460,8 +469,9 @@ pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u
                 "size_bytes": listing.model.size_bytes,
                 "quality_score": listing.model.quality_score,
                 "description": listing.model.description,
-                "required_ram_bytes": total_ram_bytes
-                    .map(|total| required_ram_bytes(&listing.model, total)),
+                "required_ram_bytes": hardware
+                    .and_then(budgets)
+                    .map(|b| required_bytes(&listing.model, context_for(b, &listing.model))),
                 "fit": listing.fit.as_str(),
                 "downloaded": listing.downloaded,
                 "selected": listing.selected,
@@ -480,10 +490,13 @@ pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u
 /// Two sections: installed models (selectable, whatever their fit — they are
 /// already on disk) and suitable downloads (red-fit entries hidden as noise,
 /// with a count so the omission is visible).
-pub fn render_listings_human(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+pub fn render_listings_human(
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> String {
     let cli = crate::CLI_BIN;
     let mut output = String::new();
-    match total_ram_bytes {
+    match hardware.map(|hw| hw.total_ram_bytes) {
         Some(total) => output.push_str(&format!(
             "Recommended local models (this machine: {} RAM):\n",
             format_bytes(total)
@@ -650,7 +663,7 @@ pub async fn models_command(env_name: Option<&str>, json: bool) -> Result<String
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
     let env_name = crate::status::resolve_env(env_name, Some(&home));
     let models = fetch_curated(&env_name).await;
-    let total_ram = detect_total_ram();
+    let hardware = detect_hardware();
     // Only a Recommended-mode pick counts as the selected catalog model. In
     // Custom mode `model_id` is still populated (preserved for switching back),
     // but the active selection is the custom endpoint, not this row.
@@ -659,11 +672,11 @@ pub async fn models_command(env_name: Option<&str>, json: bool) -> Result<String
             .then_some(config.model_id)
             .flatten()
     });
-    let listings = listings(models, total_ram, selected_id.as_deref());
+    let listings = listings(models, hardware, selected_id.as_deref());
     Ok(if json {
-        render_listings_json(&listings, total_ram)
+        render_listings_json(&listings, hardware)
     } else {
-        render_listings_human(&listings, total_ram)
+        render_listings_human(&listings, hardware)
     })
 }
 
@@ -1059,5 +1072,68 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert!(models[0].is_moe);
         assert_eq!(models[0].active_ram_bytes, 3);
+    }
+
+    fn fit_model(
+        base_ram_bytes: u64,
+        kv_per_token: u64,
+        max_ctx: u64,
+        quality: u64,
+    ) -> CatalogModel {
+        CatalogModel {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            repo: "r".to_owned(),
+            filename: "f.gguf".to_owned(),
+            revision: "f".repeat(40),
+            sha256: "b".repeat(64),
+            size_bytes: base_ram_bytes,
+            base_ram_bytes,
+            kv_cache_bytes_per_token: kv_per_token,
+            max_context_window: max_ctx,
+            quality_score: quality,
+            description: "d".to_owned(),
+            is_moe: false,
+            active_ram_bytes: base_ram_bytes,
+        }
+    }
+
+    #[test]
+    fn fit_apple_unified_red_when_over_two_thirds_even_if_under_total_ram() {
+        // 20 GB model on a 24 GiB Mac: ~78% of total RAM (old verdict = Green),
+        // but > the ~16 GiB GPU-wired ceiling → Red. Regression for the false-green OOM.
+        let model = fit_model(20 * GIB, 0, 4096, 50);
+        assert_eq!(
+            fit(&model, Some(&hw(24 * GIB, "apple-silicon", 0))),
+            Fit::Red
+        );
+    }
+
+    #[test]
+    fn fit_discrete_gpu_red_when_over_vram_despite_ample_ram() {
+        let model = fit_model(12 * GIB, 0, 4096, 50);
+        assert_eq!(
+            fit(&model, Some(&hw(64 * GIB, "nvidia", 8 * GIB))),
+            Fit::Red
+        );
+    }
+
+    #[test]
+    fn fit_cpu_only_green_when_comfortably_under_ram() {
+        let model = fit_model(10 * GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, Some(&hw(64 * GIB, "none", 0))), Fit::Green);
+    }
+
+    #[test]
+    fn fit_red_when_total_footprint_exceeds_total_memory() {
+        let model = fit_model(100 * GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, Some(&hw(16 * GIB, "none", 0))), Fit::Red);
+    }
+
+    #[test]
+    fn fit_unknown_without_hardware() {
+        let model = fit_model(GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, None), Fit::Unknown);
+        assert_eq!(fit(&model, Some(&hw(0, "none", 0))), Fit::Unknown);
     }
 }
