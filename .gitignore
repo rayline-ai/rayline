@@ -5,3 +5,6 @@
 *.pem
 *.key
 credentials.json
+
+# Local design notes / superpowers specs — kept on disk, never committed
+/docs/superpowers/
