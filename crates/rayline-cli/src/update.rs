@@ -1109,4 +1109,53 @@ mod tests {
             "must succeed when any pinned key matches"
         );
     }
+
+    // ── Integration tests for download_and_verify ─────────────────────────────
+
+    /// download_and_verify returns Err when SHA256SUMS.minisig is absent from
+    /// the release directory. The pipeline must fail closed: no signature means
+    /// no installation, even if SHA256SUMS itself is present.
+    ///
+    /// Setup: a `file://` release server with SHA256SUMS but no .minisig.
+    /// The `file://` short-circuit in `download_to` makes this a pure I/O test
+    /// with no network dependency.
+    #[tokio::test]
+    async fn self_update_fails_closed_without_minisig() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let test_root = std::env::temp_dir().join(format!("rayline-test-no-minisig-{unique}"));
+        let dest_dir = std::env::temp_dir().join(format!("rayline-test-dest-{unique}"));
+
+        // Create the release directory structure that download_and_verify expects.
+        // checksums_url_for("1.0.0") → "<base>/cli/v1.0.0/SHA256SUMS"
+        let release_dir = test_root.join("cli").join("v1.0.0");
+        fs::create_dir_all(&release_dir).expect("create release dir");
+        fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        // SHA256SUMS is present — intentionally NO SHA256SUMS.minisig.
+        fs::write(
+            release_dir.join("SHA256SUMS"),
+            b"abc123  rayline-macosx_11_0_arm64\ndef456  rld-macosx_11_0_arm64\n",
+        )
+        .expect("write SHA256SUMS");
+
+        // Point download_and_verify at the local file tree.
+        let base_url = format!("file://{}", test_root.display());
+        // SAFETY: test binary is single-threaded (tokio::test with default
+        // worker count 1); no other test reads RAYLINE_UPDATE_BASE_URL.
+        unsafe { std::env::set_var(UPDATE_BASE_URL_ENV, &base_url) };
+        let result = download_and_verify("1.0.0", "macosx_11_0_arm64", &dest_dir).await;
+        unsafe { std::env::remove_var(UPDATE_BASE_URL_ENV) };
+
+        // Cleanup best-effort (test trees are small)
+        let _ = fs::remove_dir_all(&test_root);
+        let _ = fs::remove_dir_all(&dest_dir);
+
+        assert!(
+            result.is_err(),
+            "download_and_verify must return Err when SHA256SUMS.minisig is absent"
+        );
+    }
 }
