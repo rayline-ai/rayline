@@ -298,6 +298,36 @@ async fn explicit_provider_config(
     Ok(Some((cfg, routes)))
 }
 
+async fn explicit_llamacpp_config(
+    home: &Path,
+    env_name: &str,
+) -> Result<crate::local_model::LocalModelConfig, RunError> {
+    if let Some(cfg) = crate::local_model::read_from_home(home).and_then(coerce_llamacpp_config) {
+        return Ok(cfg);
+    }
+    if let Some(model) = crate::catalog::auto_select_downloaded(env_name).await {
+        return crate::local_model::set_recommended_in_home(home, &model).map_err(|error| {
+            RunError::Router(format!("failed to save built-in llama.cpp model: {error}"))
+        });
+    }
+    Err(RunError::Router(format!(
+        "No built-in llama.cpp model configured for `{cli} claude --local-provider llamacpp`. Run `{cli} local use <model-id>` first, or use `{cli} local models` to pick one.",
+        cli = crate::CLI_BIN,
+    )))
+}
+
+fn coerce_llamacpp_config(
+    mut cfg: crate::local_model::LocalModelConfig,
+) -> Option<crate::local_model::LocalModelConfig> {
+    if !cfg.has_recommended_pick() {
+        return None;
+    }
+    cfg.mode = crate::local_model::LocalModelMode::Recommended;
+    cfg.provider = Some("llamacpp".to_owned());
+    cfg.protocol = Some("anthropic_messages".to_owned());
+    Some(cfg)
+}
+
 async fn provider_routes_for_config(
     home: &Path,
     cfg: &crate::local_model::LocalModelConfig,
@@ -518,6 +548,8 @@ async fn run_command_from_home(
         let provider_config = explicit_provider_config(request, home).await?;
         let (cfg, provider_routes_path) = if let Some((cfg, routes)) = provider_config {
             (cfg, Some(routes))
+        } else if request.local_provider == Some(crate::providers::ProviderId::LlamaCpp) {
+            (explicit_llamacpp_config(home, &env_name).await?, None)
         } else {
             let cfg = match crate::onboarding::ensure_local_model(home, &env_name)
                 .await
@@ -2336,6 +2368,53 @@ mod proxy_routing_mode_name_tests {
             proxy_routing_mode_name(RoutingMode::ProxySubagents),
             crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
         );
+    }
+}
+
+#[cfg(test)]
+mod local_provider_tests {
+    use super::*;
+
+    fn config_with_recommended_pick(
+        mode: crate::local_model::LocalModelMode,
+    ) -> crate::local_model::LocalModelConfig {
+        crate::local_model::LocalModelConfig {
+            mode,
+            provider: Some("ollama".to_owned()),
+            protocol: Some("openai_chat".to_owned()),
+            base_url: Some("http://localhost:11434".to_owned()),
+            model: Some("qwen3-coder:30b".to_owned()),
+            model_id: Some("managed-model".to_owned()),
+            model_repo: Some("rayline/managed".to_owned()),
+            model_file: Some("model.gguf".to_owned()),
+            model_revision: Some("abc123".to_owned()),
+            model_sha256: Some("0".repeat(64)),
+            custom_endpoints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn llamacpp_provider_coerces_custom_config_with_managed_pick() {
+        let cfg = config_with_recommended_pick(crate::local_model::LocalModelMode::Custom);
+
+        let cfg = coerce_llamacpp_config(cfg).unwrap();
+
+        assert_eq!(cfg.mode, crate::local_model::LocalModelMode::Recommended);
+        assert_eq!(cfg.provider.as_deref(), Some("llamacpp"));
+        assert_eq!(cfg.protocol.as_deref(), Some("anthropic_messages"));
+        assert_eq!(cfg.model_id.as_deref(), Some("managed-model"));
+    }
+
+    #[test]
+    fn llamacpp_provider_rejects_custom_only_config() {
+        let mut cfg = config_with_recommended_pick(crate::local_model::LocalModelMode::Custom);
+        cfg.model_id = None;
+        cfg.model_repo = None;
+        cfg.model_file = None;
+        cfg.model_revision = None;
+        cfg.model_sha256 = None;
+
+        assert!(coerce_llamacpp_config(cfg).is_none());
     }
 }
 
