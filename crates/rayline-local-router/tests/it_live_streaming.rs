@@ -1,10 +1,14 @@
 //! Live integration tests for the local router's true streaming + image paths.
 //!
-//! Each test is gated on the presence of its provider API key, so a keyless CI
-//! run is a no-op. Run locally with the keys exported:
+//! These hit real providers, so they require an EXPLICIT opt-in — `RAYLINE_LIVE_TESTS=1`
+//! AND the relevant provider key. A provider key alone is not enough: that keeps
+//! the default `cargo test` run (and CI) hermetic even when a developer shell or
+//! CI environment happens to have `OPENAI_API_KEY`/`OPENROUTER_API_KEY` set.
+//! Run locally with:
 //!
 //! ```
-//! cargo +1.88.0 test -p rayline-local-router --test it_live_streaming \
+//! RAYLINE_LIVE_TESTS=1 OPENAI_API_KEY=... OPENROUTER_API_KEY=... \
+//!   cargo +1.88.0 test -p rayline-local-router --test it_live_streaming \
 //!     -- --nocapture --test-threads=1
 //! ```
 //!
@@ -19,6 +23,21 @@ use std::time::Duration;
 use futures::StreamExt;
 use rayline_local_router::{LocalRouterOptions, serve};
 use serde_json::{Value, json};
+
+/// Returns true (and prints why) when a live test should be skipped. Requires an
+/// explicit `RAYLINE_LIVE_TESTS` opt-in in addition to the provider key, so keys
+/// lingering in a shell or CI never trigger external calls by default.
+fn skip_live(test: &str, key_env: &str) -> bool {
+    if std::env::var("RAYLINE_LIVE_TESTS").is_err() {
+        eprintln!("SKIP {test}: set RAYLINE_LIVE_TESTS=1 to run live provider tests");
+        return true;
+    }
+    if std::env::var(key_env).is_err() {
+        eprintln!("SKIP {test}: {key_env} not set");
+        return true;
+    }
+    false
+}
 
 /// Pick a free TCP port by binding to :0 and immediately dropping the listener.
 fn free_port() -> u16 {
@@ -146,8 +165,7 @@ fn shapes_png_b64() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_true_streaming_text() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("SKIP openai_chat_true_streaming_text: OPENAI_API_KEY not set");
+    if skip_live("openai_chat_true_streaming_text", "OPENAI_API_KEY") {
         return;
     }
     let port = free_port();
@@ -204,8 +222,7 @@ async fn openai_chat_true_streaming_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_tool_use_streaming() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("SKIP openai_chat_tool_use_streaming: OPENAI_API_KEY not set");
+    if skip_live("openai_chat_tool_use_streaming", "OPENAI_API_KEY") {
         return;
     }
     let port = free_port();
@@ -272,8 +289,7 @@ async fn openai_chat_tool_use_streaming() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_image_shape_detection() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("SKIP openai_chat_image_shape_detection: OPENAI_API_KEY not set");
+    if skip_live("openai_chat_image_shape_detection", "OPENAI_API_KEY") {
         return;
     }
     let port = free_port();
@@ -345,8 +361,7 @@ async fn openai_chat_image_shape_detection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openrouter_anthropic_streaming() {
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("SKIP openrouter_anthropic_streaming: OPENROUTER_API_KEY not set");
+    if skip_live("openrouter_anthropic_streaming", "OPENROUTER_API_KEY") {
         return;
     }
     let port = free_port();
@@ -418,8 +433,10 @@ async fn openrouter_anthropic_streaming() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openrouter_anthropic_image_shape_detection() {
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("SKIP openrouter_anthropic_image_shape_detection: OPENROUTER_API_KEY not set");
+    if skip_live(
+        "openrouter_anthropic_image_shape_detection",
+        "OPENROUTER_API_KEY",
+    ) {
         return;
     }
     let port = free_port();
@@ -496,8 +513,10 @@ async fn openrouter_anthropic_image_shape_detection() {
 /// Proven against OpenRouter's Anthropic endpoint, which accepts x-api-key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openrouter_anthropic_default_xapikey_auth() {
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("SKIP openrouter_anthropic_default_xapikey_auth: OPENROUTER_API_KEY not set");
+    if skip_live(
+        "openrouter_anthropic_default_xapikey_auth",
+        "OPENROUTER_API_KEY",
+    ) {
         return;
     }
     let port = free_port();

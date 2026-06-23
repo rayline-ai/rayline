@@ -1758,6 +1758,15 @@ fn openai_chat_response_to_anthropic(value: &Value, model: &str) -> Value {
 ///     end emit `message_delta` (mapped stop_reason + output_tokens) and
 ///     `message_stop`.
 ///
+/// One OpenAI streamed tool call, accumulated across delta fragments.
+#[derive(Default)]
+struct ToolCallAcc {
+    index: u64,
+    id: String,
+    name: String,
+    args: String,
+}
+
 /// `output_tokens` prefers the trailing usage chunk's `completion_tokens`,
 /// otherwise falls back to a rough running estimate.
 #[derive(Default)]
@@ -1772,13 +1781,16 @@ struct OpenAiSseTranslator {
     message_id: Option<String>,
     next_block_index: usize,
     open_text_block: Option<usize>,
-    /// The currently-open `tool_use` block, if any, so a new tool call closes the
-    /// previous one and Anthropic blocks never overlap.
-    open_tool_block: Option<usize>,
-    /// OpenAI tool index -> Anthropic block index (once the block is opened).
-    tool_blocks: HashMap<u64, usize>,
+    /// Tool calls accumulated by OpenAI `tool_calls[].index`, in first-seen order.
+    /// OpenAI may interleave argument fragments across indices, which a strictly
+    /// sequential Anthropic block stream cannot express incrementally, so we
+    /// buffer here and emit complete, non-overlapping `tool_use` blocks in
+    /// `finish`.
+    tool_calls: Vec<ToolCallAcc>,
     saw_tool: bool,
     finish_reason: Option<String>,
+    /// Real prompt token count from the trailing usage chunk, when present.
+    prompt_tokens: Option<u64>,
     output_tokens: Option<u64>,
     running_output_chars: usize,
     saw_content: bool,
@@ -1842,8 +1854,13 @@ impl OpenAiSseTranslator {
             self.emit_message_start(out);
         }
 
-        // Trailing usage chunk: `choices` empty, populated `usage`.
+        // Trailing usage chunk: `choices` empty, populated `usage`. With
+        // `stream_options.include_usage` this carries the REAL prompt + completion
+        // counts, which we prefer over the pre-request estimate for metrics.
         if let Some(usage) = chunk.get("usage") {
+            if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                self.prompt_tokens = Some(prompt);
+            }
             if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
                 self.output_tokens = Some(completion);
             }
@@ -1859,8 +1876,12 @@ impl OpenAiSseTranslator {
                 }
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                if !tool_calls.is_empty() {
+                    // Text (if any) is complete once tool calls begin.
+                    self.close_text_block(out);
+                }
                 for call in tool_calls {
-                    self.emit_tool_fragment(call, out);
+                    self.accumulate_tool_fragment(call);
                 }
             }
         }
@@ -1900,8 +1921,6 @@ impl OpenAiSseTranslator {
         let index = match self.open_text_block {
             Some(index) => index,
             None => {
-                // A text run after a tool call would otherwise overlap its block.
-                self.close_tool_block(out);
                 let index = self.next_block_index;
                 self.next_block_index += 1;
                 self.open_text_block = Some(index);
@@ -1930,52 +1949,35 @@ impl OpenAiSseTranslator {
         }
     }
 
-    fn close_tool_block(&mut self, out: &mut String) {
-        if let Some(index) = self.open_tool_block.take() {
-            push_sse(
-                out,
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            );
-        }
-    }
-
-    fn emit_tool_fragment(&mut self, call: &Value, out: &mut String) {
-        let openai_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-        // A new tool index means a new tool block; close the open text run and the
-        // previous tool block first so Anthropic blocks stay strictly sequential.
-        if !self.tool_blocks.contains_key(&openai_index) {
-            self.close_text_block(out);
-            self.close_tool_block(out);
-            self.saw_tool = true;
-            self.saw_content = true;
-            let block_index = self.next_block_index;
-            self.next_block_index += 1;
-            self.tool_blocks.insert(openai_index, block_index);
-            self.open_tool_block = Some(block_index);
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("toolu_local");
-            let name = call
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
-            push_sse(
-                out,
-                "content_block_start",
-                json!({"type":"content_block_start","index":block_index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
-            );
-        }
-        let block_index = self.tool_blocks[&openai_index];
-        if let Some(fragment) = call.pointer("/function/arguments").and_then(Value::as_str) {
-            if !fragment.is_empty() {
-                push_sse(
-                    out,
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":block_index,"delta":{"type":"input_json_delta","partial_json":fragment}}),
-                );
+    /// Accumulate one streamed `tool_calls[]` fragment. Nothing is emitted here;
+    /// complete, non-overlapping tool blocks are written in `finish`, because
+    /// OpenAI may interleave argument fragments across tool indices.
+    fn accumulate_tool_fragment(&mut self, call: &Value) {
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        self.saw_tool = true;
+        self.saw_content = true;
+        let entry = match self.tool_calls.iter().position(|tool| tool.index == index) {
+            Some(pos) => &mut self.tool_calls[pos],
+            None => {
+                self.tool_calls.push(ToolCallAcc {
+                    index,
+                    ..Default::default()
+                });
+                self.tool_calls.last_mut().unwrap()
             }
+        };
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                entry.id = id.to_owned();
+            }
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                entry.name = name.to_owned();
+            }
+        }
+        if let Some(fragment) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            entry.args.push_str(fragment);
         }
     }
 
@@ -1990,7 +1992,43 @@ impl OpenAiSseTranslator {
             self.emit_message_start(&mut out);
         }
         self.close_text_block(&mut out);
-        self.close_tool_block(&mut out);
+        // Emit each buffered tool call as a complete, non-overlapping `tool_use`
+        // block, in OpenAI index order. Streaming the fragments incrementally is
+        // impossible because OpenAI may interleave them across indices, which
+        // Anthropic's one-open-block-at-a-time SSE cannot represent.
+        let mut tools = std::mem::take(&mut self.tool_calls);
+        tools.sort_by_key(|tool| tool.index);
+        for tool in &tools {
+            let block_index = self.next_block_index;
+            self.next_block_index += 1;
+            let id = if tool.id.is_empty() {
+                "toolu_local"
+            } else {
+                tool.id.as_str()
+            };
+            let name = if tool.name.is_empty() {
+                "tool"
+            } else {
+                tool.name.as_str()
+            };
+            push_sse(
+                &mut out,
+                "content_block_start",
+                json!({"type":"content_block_start","index":block_index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            );
+            if !tool.args.is_empty() {
+                push_sse(
+                    &mut out,
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":block_index,"delta":{"type":"input_json_delta","partial_json":tool.args}}),
+                );
+            }
+            push_sse(
+                &mut out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":block_index}),
+            );
+        }
         let stop_reason = self.mapped_stop_reason();
         let output_tokens = self
             .output_tokens
@@ -2018,6 +2056,12 @@ impl OpenAiSseTranslator {
     fn output_tokens_estimate(&self) -> u64 {
         self.output_tokens
             .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1))
+    }
+
+    /// Real prompt token count from the streamed usage chunk when present
+    /// (`stream_options.include_usage`), else the pre-request estimate.
+    fn input_tokens(&self, estimate: u64) -> u64 {
+        self.prompt_tokens.unwrap_or(estimate)
     }
 }
 
@@ -2075,7 +2119,7 @@ fn openai_chat_stream_to_anthropic(
                         record_remote_token_usage(
                             metrics.as_ref(),
                             Some(&request_id),
-                            Some(estimated_input_tokens),
+                            Some(translator.input_tokens(estimated_input_tokens)),
                             Some(translator.output_tokens_estimate()),
                             Some(selected_model.clone()),
                         );
@@ -2111,7 +2155,7 @@ fn openai_chat_stream_to_anthropic(
                 metrics.record(MetricsUpdate::RequestCompleted {
                     request_id: request_id.clone(),
                     status_code: Some(StatusCode::OK.as_u16()),
-                    input_tokens: Some(estimated_input_tokens),
+                    input_tokens: Some(translator.input_tokens(estimated_input_tokens)),
                     output_tokens: output_tokens.or(Some(translator.output_tokens_estimate())),
                     selected_model: Some(selected_model.clone()),
                 });
@@ -3098,6 +3142,99 @@ mod tests {
             .find(|e| e["type"] == "message_delta")
             .unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    /// OpenAI may continue arguments for tool index 0 *after* index 1 has already
+    /// appeared. Buffering must reconstruct each index's args correctly and still
+    /// emit strictly non-overlapping blocks (no delta after a block's stop).
+    #[test]
+    fn openai_stream_interleaved_tool_calls_reconstruct_and_do_not_overlap() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        // index 0 opens with a partial argument fragment.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n",
+        ));
+        // index 1 appears (fully) BEFORE index 0 is finished.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+        ));
+        // index 0 RESUMES with the rest of its arguments.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.rs\\\"}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        // Strictly sequential blocks: 0 fully closed before 1 opens — no delta may
+        // appear after its block's content_block_stop.
+        let block_seq: Vec<(&str, i64)> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["type"].as_str(),
+                    Some("content_block_start")
+                        | Some("content_block_delta")
+                        | Some("content_block_stop")
+                )
+            })
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["index"].as_i64().unwrap_or(-1),
+                )
+            })
+            .collect();
+        assert_eq!(
+            block_seq,
+            vec![
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+                ("content_block_stop", 1),
+            ],
+            "interleaved tool args must not produce overlapping/out-of-order blocks"
+        );
+        // Each index's interleaved fragments reconstruct to valid JSON.
+        let args: Vec<&str> = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(args, vec!["{\"path\":\"a.rs\"}", "{\"q\":\"x\"}"]);
+        for raw in &args {
+            serde_json::from_str::<Value>(raw).expect("reconstructed tool args are valid JSON");
+        }
+    }
+
+    /// The trailing usage chunk's `prompt_tokens` must be captured and preferred
+    /// over the pre-request estimate for input-token reporting.
+    #[test]
+    fn openai_stream_captures_prompt_tokens_from_usage_chunk() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 999);
+        let _ = t.push_bytes(
+            b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        // Before the usage chunk, fall back to the estimate.
+        assert_eq!(t.input_tokens(999), 999);
+        let _ = t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = t.push_bytes(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7}}\n\n",
+        );
+        assert_eq!(t.prompt_tokens, Some(42));
+        assert_eq!(
+            t.input_tokens(999),
+            42,
+            "real prompt_tokens must win over estimate"
+        );
+        assert_eq!(t.output_tokens, Some(7));
     }
 
     #[test]
