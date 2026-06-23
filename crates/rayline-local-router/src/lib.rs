@@ -1764,11 +1764,17 @@ fn openai_chat_response_to_anthropic(value: &Value, model: &str) -> Value {
 struct OpenAiSseTranslator {
     selected_model: String,
     estimated_input_tokens: u64,
-    line_buffer: String,
+    /// Raw, undecoded upstream bytes awaiting a complete `\n`-terminated line.
+    /// Kept as bytes (not a String) so a multi-byte UTF-8 codepoint split across
+    /// two upstream chunks is never lossily mangled before the line is complete.
+    line_buffer: Vec<u8>,
     message_started: bool,
     message_id: Option<String>,
     next_block_index: usize,
     open_text_block: Option<usize>,
+    /// The currently-open `tool_use` block, if any, so a new tool call closes the
+    /// previous one and Anthropic blocks never overlap.
+    open_tool_block: Option<usize>,
     /// OpenAI tool index -> Anthropic block index (once the block is opened).
     tool_blocks: HashMap<u64, usize>,
     saw_tool: bool,
@@ -1791,7 +1797,7 @@ impl OpenAiSseTranslator {
     /// Feed a raw byte chunk; returns Anthropic SSE text to forward downstream.
     /// Partial trailing lines are buffered until completed by a later chunk.
     fn push_bytes(&mut self, bytes: &[u8]) -> String {
-        self.line_buffer.push_str(&String::from_utf8_lossy(bytes));
+        self.line_buffer.extend_from_slice(bytes);
         let mut out = String::new();
         while let Some(line) = self.next_line() {
             self.handle_line(&line, &mut out);
@@ -1800,14 +1806,17 @@ impl OpenAiSseTranslator {
     }
 
     /// Pop one complete line (terminated by `\n`), trimming a trailing `\r`.
+    /// Decoding is deferred until the line is whole; `\n`/`\r` are ASCII and can
+    /// never fall inside a multi-byte codepoint, so a complete line always
+    /// decodes cleanly even when the upstream split a codepoint across chunks.
     fn next_line(&mut self) -> Option<String> {
-        let idx = self.line_buffer.find('\n')?;
-        let mut line = self.line_buffer[..idx].to_owned();
+        let idx = self.line_buffer.iter().position(|&b| b == b'\n')?;
+        let mut line = self.line_buffer[..idx].to_vec();
         self.line_buffer.drain(..idx + 1);
-        if line.ends_with('\r') {
+        if line.last() == Some(&b'\r') {
             line.pop();
         }
-        Some(line)
+        Some(String::from_utf8_lossy(&line).into_owned())
     }
 
     fn handle_line(&mut self, line: &str, out: &mut String) {
@@ -1891,6 +1900,8 @@ impl OpenAiSseTranslator {
         let index = match self.open_text_block {
             Some(index) => index,
             None => {
+                // A text run after a tool call would otherwise overlap its block.
+                self.close_tool_block(out);
                 let index = self.next_block_index;
                 self.next_block_index += 1;
                 self.open_text_block = Some(index);
@@ -1919,16 +1930,29 @@ impl OpenAiSseTranslator {
         }
     }
 
+    fn close_tool_block(&mut self, out: &mut String) {
+        if let Some(index) = self.open_tool_block.take() {
+            push_sse(
+                out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            );
+        }
+    }
+
     fn emit_tool_fragment(&mut self, call: &Value, out: &mut String) {
         let openai_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-        // A new tool index means a new tool block; close any open text run first.
+        // A new tool index means a new tool block; close the open text run and the
+        // previous tool block first so Anthropic blocks stay strictly sequential.
         if !self.tool_blocks.contains_key(&openai_index) {
             self.close_text_block(out);
+            self.close_tool_block(out);
             self.saw_tool = true;
             self.saw_content = true;
             let block_index = self.next_block_index;
             self.next_block_index += 1;
             self.tool_blocks.insert(openai_index, block_index);
+            self.open_tool_block = Some(block_index);
             let id = call
                 .get("id")
                 .and_then(Value::as_str)
@@ -1966,15 +1990,7 @@ impl OpenAiSseTranslator {
             self.emit_message_start(&mut out);
         }
         self.close_text_block(&mut out);
-        let mut tool_indices = self.tool_blocks.values().copied().collect::<Vec<_>>();
-        tool_indices.sort_unstable();
-        for index in tool_indices {
-            push_sse(
-                &mut out,
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            );
-        }
+        self.close_tool_block(&mut out);
         let stop_reason = self.mapped_stop_reason();
         let output_tokens = self
             .output_tokens
@@ -3003,6 +3019,85 @@ mod tests {
             .filter_map(|e| e["delta"]["text"].as_str())
             .collect();
         assert_eq!(concatenated, "split");
+    }
+
+    #[test]
+    fn openai_stream_preserves_multibyte_codepoint_split_across_chunks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 3);
+        // "café" — é is 0xC3 0xA9; split the upstream chunk *inside* that codepoint.
+        let line =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\n\n";
+        let split = line.iter().position(|&b| b == 0xc3).unwrap() + 1;
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(&line[..split]));
+        emitted.push_str(&t.push_bytes(&line[split..]));
+        emitted.push_str(&t.finish());
+
+        let text: String = sse_events(&emitted)
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(
+            text, "café",
+            "codepoint split across chunks must survive intact"
+        );
+        assert!(!text.contains('\u{FFFD}'), "no replacement character");
+    }
+
+    #[test]
+    fn openai_stream_sequential_tool_calls_emit_non_overlapping_blocks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"f\\\":1}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"q\\\":2}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        // Block lifecycle must be strictly sequential: 0 fully closes before 1 opens.
+        let block_seq: Vec<(&str, i64)> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["type"].as_str(),
+                    Some("content_block_start") | Some("content_block_stop")
+                )
+            })
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["index"].as_i64().unwrap_or(-1),
+                )
+            })
+            .collect();
+        assert_eq!(
+            block_seq,
+            vec![
+                ("content_block_start", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_stop", 1),
+            ],
+            "two streamed tool calls must not produce overlapping Anthropic blocks"
+        );
+        let names: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .filter_map(|e| e["content_block"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Read", "Grep"]);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
