@@ -2447,6 +2447,9 @@ fn router_meta(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
+    if let Some(fingerprint) = router_config_fingerprint(request.router_config_path.as_deref()) {
+        meta.insert("router_config_sha256".to_owned(), fingerprint);
+    }
     meta.insert("local_model_id".to_owned(), request.local_model_id.clone());
     meta.insert("adapter_port".to_owned(), request.adapter_port.to_string());
     meta.insert(
@@ -2611,10 +2614,18 @@ fn proxy_meta(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
+    if let Some(fingerprint) = router_config_fingerprint(router_config_path) {
+        meta.insert("router_config_sha256".to_owned(), fingerprint);
+    }
     if let Some(bin_path) = bin_path {
         meta.insert("bin_path".to_owned(), bin_path.display().to_string());
     }
     meta
+}
+
+fn router_config_fingerprint(router_config_path: Option<&Path>) -> Option<String> {
+    let bytes = fs::read(router_config_path?).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 fn metadata_matches_config(
@@ -2655,6 +2666,7 @@ fn format_meta(meta: &BTreeMap<String, String>) -> String {
         "local_available",
         "local_router_port",
         "router_config_path",
+        "router_config_sha256",
         "local_model_id",
         "local_adapter_port",
         "local_custom",
@@ -3133,6 +3145,38 @@ mod tests {
         requested.insert("metrics_port".to_owned(), "20814".to_owned());
 
         assert!(metadata_matches_config(&on_disk, &requested));
+    }
+
+    #[test]
+    fn metadata_detects_router_config_content_changes_at_same_path() {
+        let home = unique_test_dir("router-config-meta");
+        std::fs::create_dir_all(&home).unwrap();
+        let config_path = home.join("routes.json");
+        std::fs::write(
+            &config_path,
+            r#"{"endpoints":{},"routes":{"default":{"endpoint":"local"}}}"#,
+        )
+        .unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.router_config_path = Some(config_path.clone());
+        request.local_model_id = "local-model".to_owned();
+        let on_disk = router_meta(&home, &request, None, None);
+
+        std::fs::write(
+            &config_path,
+            r#"{"endpoints":{},"routes":{"default":{"endpoint":"ollama","model":"llama3"}}}"#,
+        )
+        .unwrap();
+        let requested = router_meta(&home, &request, None, None);
+
+        assert_ne!(
+            on_disk.get("router_config_sha256"),
+            requested.get("router_config_sha256")
+        );
+        assert!(!metadata_matches_config(&on_disk, &requested));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
