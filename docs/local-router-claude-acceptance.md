@@ -132,10 +132,12 @@ rayline --version
 ```bash
 # Reset to a clean slate
 rayline local clear
-# Also remove any "onboarding" key from settings (or clear the file):
-# jq 'del(.onboarding)' ~/.config/rayline/settings.json | sponge ~/.config/rayline/settings.json
+# Also remove the "onboarding" marker so the first-run wizard re-triggers.
+# (portable; macOS has no `sponge`)
+tmp=$(mktemp) && jq 'del(.onboarding)' ~/.config/rayline/settings.json > "$tmp" && mv "$tmp" ~/.config/rayline/settings.json
 
 rayline claude --local
+# (Tip: `rayline local onboard` re-runs the wizard directly, no settings edit needed.)
 ```
 
 **Expected:**
