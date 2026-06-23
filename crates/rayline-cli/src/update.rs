@@ -285,8 +285,13 @@ async fn fetch_latest_version(channel: &str) -> Result<Version, UpdateError> {
     })?;
     let pointer = fetch_pointer_bytes(&url).await?;
     // Fail closed: the version pointer must carry a verifiable signature before
-    // we trust the version it names. Without this, a tampered or MITM'd
-    // `latest.txt` could pin users to an older (but validly signed) release.
+    // we trust the version it names. This prevents an attacker from FORGING a
+    // pointer to an arbitrary or never-released version. It does NOT, on its
+    // own, defeat replay/freeze: an attacker who can serve content may replay an
+    // older, validly-signed pointer. The `target > current` check in
+    // `evaluate_check` blocks rolling BELOW the installed version, but full
+    // anti-rollback/freshness (a signed timestamp+expiry or highest-seen-version
+    // floor) is tracked as a follow-up — see docs/release.md.
     let signature = fetch_pointer_bytes(&format!("{url}.minisig")).await?;
     parse_verified_latest(&pointer, &signature, crate::MINISIGN_PUBLIC_KEYS)
 }

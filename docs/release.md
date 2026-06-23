@@ -68,9 +68,19 @@ https://get.rayline.ai/cli/latest.txt.minisig
 
 The pointer contains only the public version string (for example `0.2.0`). The
 updater fetches `latest.txt.minisig` and verifies it before trusting the
-version, so a tampered pointer cannot downgrade users to an older release. Copy
-the signed `latest.txt` / `latest.txt.minisig` from the release assets verbatim
-— do not hand-edit the pointer or its signature will no longer match.
+version, so a **forged or hand-edited** pointer — naming an arbitrary or
+never-released version — is rejected. Copy the signed `latest.txt` /
+`latest.txt.minisig` from the release assets verbatim; do not hand-edit the
+pointer or its signature will no longer match.
+
+> **Known limitation (replay / freeze).** Signing proves the pointer is
+> *authentic*, not *fresh*. An attacker who can serve content may replay an
+> older, validly-signed `latest.txt` to freeze users on a stale head, or pin
+> them to an old (still validly-signed) version above their installed one. The
+> client refuses to roll *below* the installed version (`target > current`), but
+> full anti-rollback needs freshness — a signed timestamp + expiry or a
+> highest-seen-version floor — which is tracked as a follow-up, not delivered by
+> pointer signing alone.
 
 For non-production channels, copy the same signed pair under the channel name
 (`latest-dev.txt` / `latest-dev.txt.minisig` or `latest-main.txt` /
