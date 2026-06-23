@@ -503,12 +503,65 @@ pub fn render_listings_json(
     listings: &[ModelListing],
     hardware: Option<&rayline_llama::HardwareInfo>,
 ) -> String {
+    render_listings_json_with_providers(&[], listings, hardware, None)
+}
+
+pub fn render_listings_json_with_providers(
+    provider_groups: &[(
+        crate::providers::ProviderId,
+        Vec<crate::providers::ProviderModel>,
+    )],
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+    selected_provider: Option<(&str, &str)>,
+) -> String {
     let total_ram_bytes = hardware.map(|hw| hw.total_ram_bytes);
+    let provider_count = provider_groups
+        .iter()
+        .map(|(_, models)| models.len())
+        .sum::<usize>();
+    let builtin_selections = ordered_selectable(listings)
+        .into_iter()
+        .enumerate()
+        .map(|(index, listing)| (listing.model.id.as_str(), provider_count + index + 1))
+        .collect::<Vec<_>>();
+    let provider_models = provider_groups
+        .iter()
+        .flat_map(|(provider, models)| {
+            models.iter().map(move |model| {
+                let selected =
+                    selected_provider.is_some_and(|(selected_provider, selected_model)| {
+                        selected_provider == provider.as_str() && selected_model == model.model
+                    });
+                json!({
+                    "id": format!("{}:{}", provider.as_str(), model.model),
+                    "source": "provider",
+                    "provider": provider.as_str(),
+                    "provider_label": provider.label(),
+                    "model": model.model,
+                    "name": model.model,
+                    "size_bytes": model.size_bytes,
+                    "selected": selected,
+                })
+            })
+        })
+        .enumerate()
+        .map(|(index, mut value)| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("selection".to_owned(), json!(index + 1));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
     let models = listings
         .iter()
         .map(|listing| {
+            let selection = builtin_selections
+                .iter()
+                .find_map(|(id, selection)| (*id == listing.model.id).then_some(*selection));
             json!({
                 "id": listing.model.id,
+                "source": "builtin",
                 "name": listing.model.name,
                 "repo": listing.model.repo,
                 "filename": listing.model.filename,
@@ -523,11 +576,13 @@ pub fn render_listings_json(
                 "selected": listing.selected,
                 "is_moe": listing.model.is_moe,
                 "active_ram_bytes": listing.model.active_ram_bytes,
+                "selection": selection,
             })
         })
         .collect::<Vec<_>>();
     let payload = json!({
         "total_ram_bytes": total_ram_bytes,
+        "provider_models": provider_models,
         "models": models,
     });
     format!("{payload}\n")
@@ -694,11 +749,18 @@ pub fn resolve_picker_selection(entries: &[PickerEntry], token: &str) -> Option<
         }
         return None;
     }
-    entries.iter().find_map(|entry| match entry {
-        PickerEntry::Provider(model) if model.model == token => Some(entry.clone()),
-        PickerEntry::BuiltIn(model) if model.id == token => Some(entry.clone()),
-        _ => None,
-    })
+    entries
+        .iter()
+        .find_map(|entry| match entry {
+            PickerEntry::BuiltIn(model) if model.id == token => Some(entry.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            entries.iter().find_map(|entry| match entry {
+                PickerEntry::Provider(model) if model.model == token => Some(entry.clone()),
+                _ => None,
+            })
+        })
 }
 
 pub fn render_listings_human_with_providers(
@@ -1019,23 +1081,32 @@ pub async fn models_command(
     let env_name = crate::status::resolve_env(env_name, Some(&home));
     let models = fetch_curated(&env_name).await;
     let hardware = detect_hardware();
+    let local_config = crate::local_model::read_from_home(&home);
     // Only a Recommended-mode pick counts as the selected catalog model. In
     // Custom mode `model_id` is still populated (preserved for switching back),
     // but the active selection is the custom endpoint, not this row.
-    let selected_id = crate::local_model::read_from_home(&home).and_then(|config| {
-        matches!(config.mode, crate::local_model::LocalModelMode::Recommended)
-            .then_some(config.model_id)
+    let selected_id = local_config.as_ref().and_then(|config| {
+        (config.mode == crate::local_model::LocalModelMode::Recommended)
+            .then(|| config.model_id.clone())
+            .flatten()
+    });
+    let selected_provider = local_config.as_ref().and_then(|config| {
+        (config.mode == crate::local_model::LocalModelMode::Custom)
+            .then(|| Some((config.provider.clone()?, config.model.clone()?)))
             .flatten()
     });
     let listings = listings(models, hardware, selected_id.as_deref());
+    let provider_groups = crate::providers::discover_all().await;
     Ok(if json {
-        render_listings_json(&listings, hardware)
+        render_listings_json_with_providers(
+            &provider_groups,
+            &listings,
+            hardware,
+            selected_provider
+                .as_ref()
+                .map(|(provider, model)| (provider.as_str(), model.as_str())),
+        )
     } else {
-        let provider_groups = crate::providers::discover_all().await;
-        let selected_provider = crate::local_model::read_from_home(&home).and_then(|config| {
-            (config.mode == crate::local_model::LocalModelMode::Custom)
-                .then_some((config.provider?, config.model?))
-        });
         // Compute recommended_id: same policy as recommend_for_hardware —
         // best non-Red model by (fit, already-downloaded, quality) — pure,
         // no extra network call.
@@ -1793,6 +1864,41 @@ mod tests {
     }
 
     #[test]
+    fn render_listings_json_includes_provider_models() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::Ollama,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::Ollama,
+                model: "qwen3-coder:30b".to_owned(),
+                size_bytes: Some(18_000_000_000),
+            }],
+        )];
+
+        let output = render_listings_json_with_providers(
+            &providers,
+            &listings,
+            None,
+            Some(("ollama", "qwen3-coder:30b")),
+        );
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let provider = &value["provider_models"][0];
+        assert_eq!(provider["provider"], "ollama");
+        assert_eq!(provider["model"], "qwen3-coder:30b");
+        assert_eq!(provider["selection"], 1);
+        assert_eq!(provider["selected"], true);
+        assert_eq!(value["models"][0]["id"], "model-a");
+        assert_eq!(value["models"][0]["selection"], 2);
+    }
+
+    #[test]
     fn resolve_picker_selection_maps_numbers_and_ids() {
         let listings = vec![test_listing(
             "model-a",
@@ -1827,6 +1933,36 @@ mod tests {
         assert!(matches!(
             resolve_picker_selection(&entries, "model-a"),
             Some(PickerEntry::BuiltIn(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_picker_selection_prefers_builtin_id_over_provider_model_name() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::LmStudio,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::LmStudio,
+                model: "model-a".to_owned(),
+                size_bytes: None,
+            }],
+        )];
+        let entries = picker_entries(&providers, &listings);
+
+        assert!(matches!(
+            resolve_picker_selection(&entries, "1"),
+            Some(PickerEntry::Provider(model)) if model.model == "model-a"
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "model-a"),
+            Some(PickerEntry::BuiltIn(model)) if model.id == "model-a"
         ));
     }
 

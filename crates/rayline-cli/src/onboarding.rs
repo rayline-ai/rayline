@@ -389,7 +389,11 @@ mod tests {
     }
 
     fn tmp_home() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("rl-onboard-{}", std::process::id()));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rl-onboard-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".config").join("rayline")).unwrap();
         dir
