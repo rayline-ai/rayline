@@ -490,3 +490,61 @@ async fn openrouter_anthropic_image_shape_detection() {
         answer.trim()
     );
 }
+
+/// Documented default auth: an `anthropic_messages` endpoint with `api_key_env`
+/// and NO `auth` override sends the key as `x-api-key` (the historical default).
+/// Proven against OpenRouter's Anthropic endpoint, which accepts x-api-key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openrouter_anthropic_default_xapikey_auth() {
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("SKIP openrouter_anthropic_default_xapikey_auth: OPENROUTER_API_KEY not set");
+        return;
+    }
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "anthropic-compatible",
+            "protocol": "anthropic_messages",
+            "base_url": "https://openrouter.ai/api",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "models": ["anthropic/claude-sonnet-4.6"]
+            // No "auth" field => default x-api-key for anthropic_messages.
+        }],
+        "routes": {
+            "main": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-4.6"},
+            "default": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-4.6"}
+        }
+    });
+    let path = write_config("openrouter-xapikey", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "rayline-router",
+            "stream": false,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Reply with the single word PONG."}]
+        }))
+        .send()
+        .await
+        .expect("send x-api-key request");
+    let resp = expect_ok(resp).await;
+    let body: Value = resp.json().await.expect("json body");
+    let text = body["content"]
+        .as_array()
+        .and_then(|blocks| blocks.iter().find(|b| b["type"] == "text"))
+        .and_then(|b| b["text"].as_str())
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        text.to_uppercase().contains("PONG"),
+        "default x-api-key auth round-trip failed; body={body}"
+    );
+    let _ = std::fs::remove_file(path);
+    println!(
+        "PASS openrouter_anthropic_default_xapikey_auth: reply={:?}",
+        text.trim()
+    );
+}
