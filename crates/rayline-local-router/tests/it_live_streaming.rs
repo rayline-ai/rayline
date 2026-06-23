@@ -135,8 +135,14 @@ fn concatenated_text(events: &[Value]) -> String {
         .collect()
 }
 
-/// A 1x1 solid red PNG, base64-encoded (no external deps).
-const RED_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+/// Base64 PNG of three distinct colored shapes — a red circle, a blue square,
+/// and a green triangle on white — generated offline and checked in under
+/// `fixtures/`. A real multi-shape image (not a solid pixel, which providers
+/// reject as "unsupported") lets the image tests assert the model actually
+/// perceived the picture by naming the shapes and colors back.
+fn shapes_png_b64() -> &'static str {
+    include_str!("fixtures/shapes_png_base64.txt").trim()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn openai_chat_true_streaming_text() {
@@ -265,9 +271,9 @@ async fn openai_chat_tool_use_streaming() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn openai_chat_image_input() {
+async fn openai_chat_image_shape_detection() {
     if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("SKIP openai_chat_image_input: OPENAI_API_KEY not set");
+        eprintln!("SKIP openai_chat_image_shape_detection: OPENAI_API_KEY not set");
         return;
     }
     let port = free_port();
@@ -297,11 +303,11 @@ async fn openai_chat_image_input() {
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "What color is this image? Answer with one word."},
+                    {"type": "text", "text": "List each colored shape in this image, one per line as '<color> <shape>'."},
                     {"type": "image", "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": RED_PIXEL_PNG_B64
+                        "data": shapes_png_b64()
                     }}
                 ]
             }]
@@ -317,12 +323,24 @@ async fn openai_chat_image_input() {
         .and_then(|b| b["text"].as_str())
         .unwrap_or("")
         .to_owned();
+    // The model must name the shapes and colors back, proving it perceived the
+    // image (and that the router delivered it intact through the conversion).
+    let lower = answer.to_lowercase();
+    for needle in ["red", "blue", "green", "circle", "triangle"] {
+        assert!(
+            lower.contains(needle),
+            "model did not report {needle:?} for the shapes image; answer={answer:?} ({body})"
+        );
+    }
     assert!(
-        !answer.trim().is_empty(),
-        "expected a textual answer about the image, got {body}"
+        lower.contains("square") || lower.contains("rectangle"),
+        "model did not report the blue square; answer={answer:?} ({body})"
     );
     let _ = std::fs::remove_file(path);
-    println!("PASS openai_chat_image_input: answer={:?}", answer.trim());
+    println!(
+        "PASS openai_chat_image_shape_detection: answer={:?}",
+        answer.trim()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -371,11 +389,26 @@ async fn openrouter_anthropic_streaming() {
         .filter(|e| e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta")
         .count();
     let text = concatenated_text(&events);
+    // The router passes OpenRouter's native Anthropic SSE through verbatim, so we
+    // assert the event structure arrived intact. We deliberately do NOT require a
+    // minimum delta count: OpenRouter's chunk granularity is provider-controlled
+    // and sometimes coalesces the whole reply into a single content_block_delta.
     assert!(
-        text_deltas > 1,
-        "expected MANY native Anthropic text_delta events, got {text_deltas}; text={text:?}"
+        text_deltas >= 1,
+        "expected at least one native Anthropic text_delta; text={text:?}"
     );
-    assert!(types.contains(&"message_stop".to_owned()));
+    assert!(
+        types.contains(&"message_start".to_owned()),
+        "missing message_start"
+    );
+    assert!(
+        types.contains(&"message_stop".to_owned()),
+        "missing message_stop"
+    );
+    assert!(
+        text.contains("20"),
+        "streamed reply should contain the counted sequence; got {text:?}"
+    );
     let _ = std::fs::remove_file(path);
     println!(
         "PASS openrouter_anthropic_streaming: text_delta_events={text_deltas} reply={:?}",
@@ -384,9 +417,9 @@ async fn openrouter_anthropic_streaming() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn openrouter_anthropic_image_non_stream() {
+async fn openrouter_anthropic_image_shape_detection() {
     if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("SKIP openrouter_anthropic_image_non_stream: OPENROUTER_API_KEY not set");
+        eprintln!("SKIP openrouter_anthropic_image_shape_detection: OPENROUTER_API_KEY not set");
         return;
     }
     let port = free_port();
@@ -418,11 +451,11 @@ async fn openrouter_anthropic_image_non_stream() {
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "What color is this image? Answer with one word."},
+                    {"type": "text", "text": "List each colored shape in this image, one per line as '<color> <shape>'."},
                     {"type": "image", "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": RED_PIXEL_PNG_B64
+                        "data": shapes_png_b64()
                     }}
                 ]
             }]
@@ -438,13 +471,22 @@ async fn openrouter_anthropic_image_non_stream() {
         .and_then(|b| b["text"].as_str())
         .unwrap_or("")
         .to_owned();
+    // The model must name the shapes and colors back, proving it perceived the
+    // image (and that the router delivered it intact through the conversion).
+    let lower = answer.to_lowercase();
+    for needle in ["red", "blue", "green", "circle", "triangle"] {
+        assert!(
+            lower.contains(needle),
+            "model did not report {needle:?} for the shapes image; answer={answer:?} ({body})"
+        );
+    }
     assert!(
-        !answer.trim().is_empty(),
-        "expected a textual answer about the image, got {body}"
+        lower.contains("square") || lower.contains("rectangle"),
+        "model did not report the blue square; answer={answer:?} ({body})"
     );
     let _ = std::fs::remove_file(path);
     println!(
-        "PASS openrouter_anthropic_image_non_stream: answer={:?}",
+        "PASS openrouter_anthropic_image_shape_detection: answer={:?}",
         answer.trim()
     );
 }
