@@ -341,7 +341,12 @@ fn parse_agent_definition(markdown: &str) -> Option<(String, Capability)> {
             break;
         }
         if let Some(rest) = line.strip_prefix("name:") {
-            name = Some(rest.trim().trim_matches(['"', '\'']).to_ascii_lowercase());
+            name = Some(
+                strip_yaml_comment(rest)
+                    .trim()
+                    .trim_matches(['"', '\''])
+                    .to_ascii_lowercase(),
+            );
         } else if let Some(rest) = line.strip_prefix("tools:") {
             tools = Some(rest.trim().to_owned());
         }
@@ -353,13 +358,26 @@ fn parse_agent_definition(markdown: &str) -> Option<(String, Capability)> {
     Some((name, capability))
 }
 
+/// Strip a YAML inline comment: everything from a `#` that starts the string or
+/// follows whitespace. Avoids cutting a `#` embedded inside a token.
+fn strip_yaml_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return &value[..i];
+        }
+    }
+    value
+}
+
 /// Classify a `tools:` frontmatter value. `*` or "All tools" grants everything
 /// (mutating); an explicit list is read-only only if it names no mutating tool.
-/// YAML quoting/brackets are stripped both around the whole value and per token,
-/// so `tools: "Bash"`, `tools: "Read, Edit"`, and `tools: [Read, Edit]` are
+/// YAML inline comments are stripped, and quoting/brackets are removed both
+/// around the whole value and per token, so `tools: "Bash"`, `tools: "Read,
+/// Edit"`, `tools: [Read, Edit]`, and `tools: Read, Bash # runs tests` are all
 /// classified correctly rather than slipping past the mutating-tool check.
 fn classify_tools(tools: &str) -> Capability {
-    let trimmed = tools
+    let trimmed = strip_yaml_comment(tools)
         .trim()
         .trim_matches(['"', '\''])
         .trim()
@@ -1310,6 +1328,20 @@ mod tests {
         assert_eq!(classify_tools("\"Read, Edit\""), Capability::Mutating);
         assert_eq!(classify_tools("[Read, Edit]"), Capability::Mutating);
         assert_eq!(classify_tools("[\"Read\", \"Glob\"]"), Capability::ReadOnly);
+        // YAML inline comments must not hide a mutating tool either.
+        assert_eq!(
+            classify_tools("Read, Bash # runs tests"),
+            Capability::Mutating
+        );
+        assert_eq!(
+            classify_tools("[Read, Edit] # comment"),
+            Capability::Mutating
+        );
+        assert_eq!(classify_tools("Read, Grep # safe"), Capability::ReadOnly);
+        assert_eq!(classify_tools("* # everything"), Capability::Mutating);
+        // A `#` inside a token (no preceding space) is NOT a comment.
+        assert_eq!(strip_yaml_comment("Read, C#Tool"), "Read, C#Tool");
+        assert_eq!(strip_yaml_comment("Read # c"), "Read ");
     }
 
     #[test]

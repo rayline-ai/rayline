@@ -333,9 +333,13 @@ pub fn write_default_local_routes(home: &Path) -> io::Result<PathBuf> {
     let dir = home.join(crate::ROUTER_STATE_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("local-default-routes.json");
+    // Use the saved mapping whenever it exists — including an all-cloud choice
+    // that compacts to zero exceptions, where `routes_config_json` emits its
+    // "route nothing local" sentinel. Only a never-configured machine (no
+    // `subagent_routes` key) falls back to the hardcoded read-only allowlist.
     let value = match crate::discover::read_subagent_routes(home) {
-        Some(routes) if !routes.routes.is_empty() => crate::discover::routes_config_json(&routes),
-        _ => default_local_routes_json(),
+        Some(routes) => crate::discover::routes_config_json(&routes),
+        None => default_local_routes_json(),
     };
     let body = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
@@ -464,6 +468,30 @@ mod tests {
         let text = std::fs::read_to_string(&a).unwrap();
         assert!(text.contains("\"Explore\""));
         assert!(text.contains("\"endpoint\": \"local\""));
+    }
+
+    #[test]
+    fn write_default_local_routes_honors_saved_all_cloud_mapping() {
+        // A saved all-cloud mapping compacts to zero exceptions. The generated
+        // config must reflect that explicit choice (the sentinel → route nothing
+        // local), NOT fall back to the hardcoded read-only allowlist.
+        let home = tmp_home();
+        crate::discover::write_subagent_routes_in_home(
+            &home,
+            &crate::discover::SubagentRoutes::default(), // default cloud, no exceptions
+        )
+        .unwrap();
+
+        let path = write_default_local_routes(&home).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("\"Explore\""),
+            "must not regenerate the hardcoded allowlist: {text}"
+        );
+        assert!(
+            text.contains("__rayline_no_local_subagents__"),
+            "expected the route-nothing sentinel: {text}"
+        );
     }
 
     #[tokio::test]
