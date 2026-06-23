@@ -757,6 +757,16 @@ pub fn resolve_picker_selection(entries: &[PickerEntry], token: &str) -> Option<
         })
         .or_else(|| {
             entries.iter().find_map(|entry| match entry {
+                PickerEntry::Provider(model)
+                    if format!("{}:{}", model.provider.as_str(), model.model) == token =>
+                {
+                    Some(entry.clone())
+                }
+                _ => None,
+            })
+        })
+        .or_else(|| {
+            entries.iter().find_map(|entry| match entry {
                 PickerEntry::Provider(model) if model.model == token => Some(entry.clone()),
                 _ => None,
             })
@@ -1931,8 +1941,48 @@ mod tests {
             Some(PickerEntry::Provider(_))
         ));
         assert!(matches!(
+            resolve_picker_selection(&entries, "lmstudio:qwen2.5-coder-7b"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::LmStudio
+                    && model.model == "qwen2.5-coder-7b"
+        ));
+        assert!(matches!(
             resolve_picker_selection(&entries, "model-a"),
             Some(PickerEntry::BuiltIn(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_picker_selection_disambiguates_provider_qualified_ids() {
+        let providers = vec![
+            (
+                crate::providers::ProviderId::Ollama,
+                vec![crate::providers::ProviderModel {
+                    provider: crate::providers::ProviderId::Ollama,
+                    model: "shared-model".to_owned(),
+                    size_bytes: None,
+                }],
+            ),
+            (
+                crate::providers::ProviderId::LmStudio,
+                vec![crate::providers::ProviderModel {
+                    provider: crate::providers::ProviderId::LmStudio,
+                    model: "shared-model".to_owned(),
+                    size_bytes: None,
+                }],
+            ),
+        ];
+        let entries = picker_entries(&providers, &[]);
+
+        assert!(matches!(
+            resolve_picker_selection(&entries, "lmstudio:shared-model"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::LmStudio
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "ollama:shared-model"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::Ollama
         ));
     }
 
