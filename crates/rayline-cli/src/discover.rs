@@ -18,6 +18,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::style::Print;
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -49,8 +54,9 @@ const MAX_META_FILES: usize = 200_000;
 /// `--all` is passed.
 const MIN_USES_DISPLAYED: u64 = 2;
 
-/// Rows shown per page in the interactive picker.
-const PAGE_SIZE: usize = 25;
+/// Rows shown per page in the interactive picker. 16 so every row on a page is
+/// addressable by a single hex key (`0`-`9`, `a`-`f`).
+const PAGE_SIZE: usize = 16;
 
 /// What we know about an agent's mutating capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -687,19 +693,60 @@ impl KindFilter {
     }
 }
 
-/// What an applied input line means for the edit loop.
+/// A single keypress translated into a picker command. Rows on the current page
+/// are addressed by a hex slot (`0`-`9`, `a`-`f`); commands use non-hex keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickerKey {
+    /// Cycle the target of the row in this 0-based slot on the current page.
+    Row(usize),
+    NextPage,
+    PrevPage,
+    CycleFilter,
+    AllLocal,
+    AllCloud,
+    Search,
+    Save,
+    Quit,
+    /// An unrecognized key — ignored.
+    Ignore,
+}
+
+/// Map a character to a picker command. Hex digits address page rows; the
+/// remaining keys are commands chosen to never collide with `0`-`9a`-`f`.
+pub fn map_key(c: char) -> PickerKey {
+    match c {
+        '0'..='9' => PickerKey::Row((c as u8 - b'0') as usize),
+        'a'..='f' => PickerKey::Row((c as u8 - b'a' + 10) as usize),
+        'n' => PickerKey::NextPage,
+        'p' => PickerKey::PrevPage,
+        'k' => PickerKey::CycleFilter,
+        'L' => PickerKey::AllLocal,
+        'C' => PickerKey::AllCloud,
+        '/' => PickerKey::Search,
+        's' => PickerKey::Save,
+        'q' => PickerKey::Quit,
+        _ => PickerKey::Ignore,
+    }
+}
+
+/// What an applied key means for the edit loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PickerAction {
     Continue,
+    /// The caller should enter name-search input mode.
+    Search,
     Save,
     Quit,
 }
 
-/// The editable picker: the full row set plus the current kind filter and page.
-/// The filter/page are a *view* over `rows`; saving always uses every row.
+/// The editable picker: the full row set plus the current view (kind filter +
+/// name query) and page. The view is a window over `rows`; saving uses every
+/// row regardless of the active filter.
 pub struct PickerState {
     pub rows: Vec<Row>,
     pub filter: KindFilter,
+    /// Lowercased substring filter on the agent name; empty = no name filter.
+    pub query: String,
     pub page: usize,
 }
 
@@ -708,16 +755,20 @@ impl PickerState {
         Self {
             rows,
             filter: KindFilter::All,
+            query: String::new(),
             page: 0,
         }
     }
 
-    /// Indices into `rows` matching the current filter (the ordered view).
+    /// Indices into `rows` matching the current kind filter AND name query.
     fn view(&self) -> Vec<usize> {
         self.rows
             .iter()
             .enumerate()
             .filter(|(_, row)| self.filter.matches(row.capability))
+            .filter(|(_, row)| {
+                self.query.is_empty() || row.agent_type.to_ascii_lowercase().contains(&self.query)
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -726,67 +777,62 @@ impl PickerState {
         view_len.div_ceil(PAGE_SIZE).max(1)
     }
 
-    /// Apply one line of picker input. `<numbers>` are 1-based positions within
-    /// the current filtered view; `n`/`p` page; `f` cycles the filter; `a`/`c`
-    /// bulk-set the *filtered* view to local/cloud.
-    pub fn apply(&mut self, menu: &TargetMenu, input: &str) -> Result<PickerAction, String> {
-        let trimmed = input.trim();
-        let view = self.view();
-        match trimmed {
-            "" => return Ok(PickerAction::Save),
-            "q" | "quit" => return Ok(PickerAction::Quit),
-            "n" | "next" => {
-                if self.page + 1 < self.page_count(view.len()) {
+    /// `rows` indices shown on the current page (≤ PAGE_SIZE).
+    fn page_rows(&self) -> Vec<usize> {
+        self.view()
+            .into_iter()
+            .skip(self.page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .collect()
+    }
+
+    /// Set the name query (lowercased) and reset to the first page.
+    pub fn set_query(&mut self, query: &str) {
+        self.query = query.trim().to_ascii_lowercase();
+        self.page = 0;
+    }
+
+    /// Apply a single keypress. Returns the resulting edit-loop action.
+    pub fn apply_key(&mut self, menu: &TargetMenu, key: PickerKey) -> PickerAction {
+        match key {
+            PickerKey::Row(slot) => {
+                if let Some(&row) = self.page_rows().get(slot) {
+                    self.rows[row].target = menu.cycle(&self.rows[row].target);
+                }
+                PickerAction::Continue
+            }
+            PickerKey::NextPage => {
+                if self.page + 1 < self.page_count(self.view().len()) {
                     self.page += 1;
                 }
-                return Ok(PickerAction::Continue);
+                PickerAction::Continue
             }
-            "p" | "prev" => {
+            PickerKey::PrevPage => {
                 self.page = self.page.saturating_sub(1);
-                return Ok(PickerAction::Continue);
+                PickerAction::Continue
             }
-            "f" | "filter" => {
+            PickerKey::CycleFilter => {
                 self.filter = self.filter.next();
                 self.page = 0;
-                return Ok(PickerAction::Continue);
+                PickerAction::Continue
             }
-            "a" | "all" => {
-                for &index in &view {
+            PickerKey::AllLocal => {
+                for index in self.view() {
                     self.rows[index].target = SubagentTarget::Local;
                 }
-                return Ok(PickerAction::Continue);
+                PickerAction::Continue
             }
-            "c" | "cloud" => {
-                for &index in &view {
+            PickerKey::AllCloud => {
+                for index in self.view() {
                     self.rows[index].target = SubagentTarget::Cloud;
                 }
-                return Ok(PickerAction::Continue);
+                PickerAction::Continue
             }
-            _ => {}
+            PickerKey::Search => PickerAction::Search,
+            PickerKey::Save => PickerAction::Save,
+            PickerKey::Quit => PickerAction::Quit,
+            PickerKey::Ignore => PickerAction::Continue,
         }
-        let mut positions = Vec::new();
-        for token in trimmed.split(|c: char| c.is_whitespace() || c == ',') {
-            if token.is_empty() {
-                continue;
-            }
-            let position: usize = token
-                .parse()
-                .map_err(|_| format!("unknown command or row: {token:?}"))?;
-            if position < 1 || position > view.len() {
-                return Err(format!("row {position} is out of range (1-{})", view.len()));
-            }
-            positions.push(position - 1);
-        }
-        if positions.is_empty() {
-            return Err(
-                "enter row numbers, `n`/`p` to page, `f` to filter, `a`/`c` for bulk, or Enter to save".to_owned(),
-            );
-        }
-        for position in positions {
-            let row = view[position];
-            self.rows[row].target = menu.cycle(&self.rows[row].target);
-        }
-        Ok(PickerAction::Continue)
     }
 }
 
@@ -841,53 +887,99 @@ pub async fn run_subagents_command(json: bool, include_all: bool) -> Result<(), 
     run_picker(&home, &menu, PickerState::new(rows), discovered.len())
 }
 
-/// The interactive edit loop: render the current page → read a line → apply →
-/// repeat until the user saves or quits.
+/// RAII guard: enter raw mode + alternate screen, restore on drop so a panic or
+/// early return never leaves the user's terminal wedged. Mirrors `router.rs`.
+struct PickerTerminalGuard;
+
+impl PickerTerminalGuard {
+    fn enter(stdout: &mut io::Stdout) -> io::Result<Self> {
+        terminal::enable_raw_mode().map_err(io::Error::other)?;
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for PickerTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// The interactive edit loop: draw the current page → read ONE keypress → apply
+/// → repeat until the user saves or quits. No Enter required to act on a key.
 fn run_picker(
     home: &Path,
     menu: &TargetMenu,
     mut state: PickerState,
     discovered_total: usize,
 ) -> Result<(), String> {
-    let cli = crate::CLI_BIN;
-    eprintln!(
-        "\nDiscovered {discovered_total} subagent type(s); editing {shown}.\n\
-         Read-only agents are pre-selected for local — a bad local read is recoverable, a bad edit isn't.",
-        shown = state.rows.len(),
-    );
-    loop {
-        render_state(&state);
-        let cycle_hint = if menu.endpoints.is_empty() {
-            "local/cloud"
-        } else {
-            "cloud→local→endpoint"
-        };
-        eprintln!(
-            "Commands: <#> cycle {cycle_hint} · n/p page · f filter (→{next}) · a/c all local/cloud (filtered) · Enter save · q quit",
-            next = state.filter.next().label(),
-        );
-        eprint!("> ");
-        io::stderr().flush().ok();
+    let saved = {
+        let mut stdout = io::stdout();
+        let _guard = PickerTerminalGuard::enter(&mut stdout).map_err(|e| e.to_string())?;
+        let mut searching: Option<String> = None;
+        loop {
+            draw_picker(
+                &mut stdout,
+                &state,
+                menu,
+                discovered_total,
+                searching.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
 
-        let mut input = String::new();
-        if io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| e.to_string())?
-            == 0
-        {
-            // EOF — treat as quit without saving.
-            eprintln!("\nNo changes saved.");
-            return Ok(());
-        }
-        match state.apply(menu, &input) {
-            Ok(PickerAction::Save) => break,
-            Ok(PickerAction::Quit) => {
-                eprintln!("No changes saved.");
-                return Ok(());
+            let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
-            Ok(PickerAction::Continue) => continue,
-            Err(message) => eprintln!("  {message}"),
+            // Ctrl-C always aborts without saving (raw mode swallows the signal).
+            if matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                break false;
+            }
+
+            // Name-search input mode captures text until Enter (commit) / Esc.
+            if let Some(buffer) = searching.as_mut() {
+                match key.code {
+                    KeyCode::Enter => {
+                        state.set_query(buffer);
+                        searching = None;
+                    }
+                    KeyCode::Esc => searching = None,
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) => buffer.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+
+            let action = match key.code {
+                KeyCode::Enter => PickerAction::Save,
+                KeyCode::Esc => PickerAction::Quit,
+                KeyCode::Char(c) => state.apply_key(menu, map_key(c)),
+                _ => PickerAction::Continue,
+            };
+            match action {
+                PickerAction::Continue => continue,
+                PickerAction::Search => searching = Some(state.query.clone()),
+                PickerAction::Save => break true,
+                PickerAction::Quit => break false,
+            }
         }
+    };
+
+    if !saved {
+        eprintln!("No changes saved.");
+        return Ok(());
     }
 
     let routes = rows_to_routes(&state.rows);
@@ -901,54 +993,96 @@ fn run_picker(
         .filter(|r| !matches!(r.target, SubagentTarget::Cloud))
         .count();
     eprintln!(
-        "\nSaved. {local} subagent(s) route to local under `{cli} claude --local`; the rest stay on cloud."
+        "\nSaved. {local} subagent(s) route to local under `{cli} claude --local`; the rest stay on cloud.",
+        cli = crate::CLI_BIN,
     );
     Ok(())
 }
 
-/// Render the current page of the filtered view. Row numbers are 1-based
-/// positions within the filtered view, so `<#>` is stable until the filter
-/// changes.
-fn render_state(state: &PickerState) {
+/// Draw the current page into the alternate screen. Row slots are labeled with
+/// a single hex digit (`0`-`f`); pressing it cycles that row.
+fn draw_picker(
+    stdout: &mut io::Stdout,
+    state: &PickerState,
+    menu: &TargetMenu,
+    discovered_total: usize,
+    searching: Option<&str>,
+) -> io::Result<()> {
     let view = state.view();
     let total = view.len();
     let pages = state.page_count(total);
     let start = state.page * PAGE_SIZE;
     let end = (start + PAGE_SIZE).min(total);
-    eprintln!(
-        "\nFilter: {filter}   Page {page}/{pages}   ({shown} of {total} shown)",
-        filter = state.filter.label(),
-        page = state.page + 1,
-        shown = if total == 0 {
-            "0".to_owned()
-        } else {
-            format!("{}–{}", start + 1, end)
-        },
-    );
-    eprintln!(
-        "    #  {:<34} {:>7}  {:<10} → target",
-        "agent", "uses", "kind"
-    );
+
+    let query_note = if state.query.is_empty() {
+        String::new()
+    } else {
+        format!("  search:\"{}\"", state.query)
+    };
+    let mut lines: Vec<String> = vec![
+        format!(
+            "Map {discovered_total} subagent(s) to local/cloud for `{} claude --local`.",
+            crate::CLI_BIN
+        ),
+        format!(
+            "Filter: {filter}{query_note}   Page {page}/{pages}   ({shown} of {total} shown)",
+            filter = state.filter.label(),
+            page = state.page + 1,
+            shown = if total == 0 {
+                "0".to_owned()
+            } else {
+                format!("{}-{}", start + 1, end)
+            },
+        ),
+        format!(
+            "  key  {:<34} {:>6}  {:<10} target",
+            "agent", "uses", "kind"
+        ),
+    ];
     if total == 0 {
-        eprintln!("  (no agents match this filter — press `f` to change it)");
-        return;
+        lines.push("  (no agents match — press k or / to change)".to_owned());
     }
-    for (offset, &row_index) in view[start..end].iter().enumerate() {
-        let row = &state.rows[row_index];
-        let uses = if row.uses == 0 {
-            "—".to_owned()
+    for (slot, &row_index) in view[start..end].iter().enumerate() {
+        let agent = &state.rows[row_index];
+        let uses = if agent.uses == 0 {
+            "-".to_owned()
         } else {
-            row.uses.to_string()
+            agent.uses.to_string()
         };
-        eprintln!(
-            "  {:>3}  {:<34} {:>7}  {:<10} {}",
-            start + offset + 1,
-            truncate(&row.agent_type, 34),
+        lines.push(format!(
+            "   {:1x}   {:<34} {:>6}  {:<10} {}",
+            slot,
+            truncate(&agent.agent_type, 34),
             uses,
-            row.capability.label(),
-            row.target.short_label(),
-        );
+            agent.capability.label(),
+            agent.target.short_label(),
+        ));
     }
+
+    // Pin the footer below a full page so it doesn't jump on short last pages.
+    while lines.len() < PAGE_SIZE + 4 {
+        lines.push(String::new());
+    }
+    lines.push(match searching {
+        Some(buffer) => format!("search name: {buffer}_   (Enter apply · Esc cancel)"),
+        None => {
+            let cycle_hint = if menu.endpoints.is_empty() {
+                "local/cloud"
+            } else {
+                "cloud->local->endpoint"
+            };
+            format!(
+                "0-f cycle {cycle_hint} · n/p page · k kind(->{}) · / search · L/C all local/cloud · s save · q quit",
+                state.filter.next().label()
+            )
+        }
+    });
+
+    queue!(stdout, Clear(ClearType::All))?;
+    for (row, text) in lines.into_iter().enumerate() {
+        queue!(stdout, MoveTo(0, row as u16), Print(text))?;
+    }
+    stdout.flush()
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1396,75 +1530,112 @@ mod tests {
     }
 
     #[test]
-    fn picker_cycles_bulk_and_validates() {
+    fn map_key_addresses_hex_rows_and_commands() {
+        assert_eq!(map_key('0'), PickerKey::Row(0));
+        assert_eq!(map_key('9'), PickerKey::Row(9));
+        assert_eq!(map_key('a'), PickerKey::Row(10));
+        assert_eq!(map_key('f'), PickerKey::Row(15));
+        assert_eq!(map_key('n'), PickerKey::NextPage);
+        assert_eq!(map_key('p'), PickerKey::PrevPage);
+        assert_eq!(map_key('k'), PickerKey::CycleFilter);
+        assert_eq!(map_key('L'), PickerKey::AllLocal);
+        assert_eq!(map_key('C'), PickerKey::AllCloud);
+        assert_eq!(map_key('/'), PickerKey::Search);
+        assert_eq!(map_key('s'), PickerKey::Save);
+        assert_eq!(map_key('q'), PickerKey::Quit);
+        assert_eq!(map_key('z'), PickerKey::Ignore);
+    }
+
+    #[test]
+    fn picker_cycles_rows_bulk_and_signals() {
         let menu = TargetMenu::default();
         let mut state = PickerState::new(vec![
             row("a", SubagentTarget::Cloud),
             row("b", SubagentTarget::Local),
         ]);
-        // Empty → Save; `q` → Quit.
-        assert_eq!(state.apply(&menu, "  "), Ok(PickerAction::Save));
-        assert_eq!(state.apply(&menu, "q"), Ok(PickerAction::Quit));
-        // Cycle rows 1 and 2 (cloud⇄local without endpoints).
-        assert_eq!(state.apply(&menu, "1 2"), Ok(PickerAction::Continue));
+        // Save / Quit / Search signals.
+        assert_eq!(state.apply_key(&menu, PickerKey::Save), PickerAction::Save);
+        assert_eq!(state.apply_key(&menu, PickerKey::Quit), PickerAction::Quit);
+        assert_eq!(
+            state.apply_key(&menu, PickerKey::Search),
+            PickerAction::Search
+        );
+        // Hex slot cycles that row (cloud⇄local without endpoints).
+        assert_eq!(
+            state.apply_key(&menu, PickerKey::Row(0)),
+            PickerAction::Continue
+        );
         assert_eq!(state.rows[0].target, SubagentTarget::Local);
-        assert_eq!(state.rows[1].target, SubagentTarget::Cloud);
-        // `c` → all cloud, `a` → all local (over the filtered view).
-        assert_eq!(state.apply(&menu, "c"), Ok(PickerAction::Continue));
+        // A slot past the page is a no-op, not a panic.
+        assert_eq!(
+            state.apply_key(&menu, PickerKey::Row(9)),
+            PickerAction::Continue
+        );
+        // Bulk over the (unfiltered) view.
+        state.apply_key(&menu, PickerKey::AllCloud);
         assert!(state.rows.iter().all(|r| r.target == SubagentTarget::Cloud));
-        assert_eq!(state.apply(&menu, "a"), Ok(PickerAction::Continue));
+        state.apply_key(&menu, PickerKey::AllLocal);
         assert!(state.rows.iter().all(|r| r.target == SubagentTarget::Local));
-        // Out of range / unknown command → Err (re-prompt).
-        assert!(state.apply(&menu, "9").is_err());
-        assert!(state.apply(&menu, "z").is_err());
     }
 
     #[test]
-    fn picker_filter_scopes_view_numbering_and_bulk() {
+    fn picker_filter_and_search_scope_the_view() {
         let menu = TargetMenu::default();
         let mut state = PickerState::new(vec![
-            row_cap("ro1", SubagentTarget::Local, Capability::ReadOnly),
-            row_cap("edit1", SubagentTarget::Cloud, Capability::Mutating),
-            row_cap("ro2", SubagentTarget::Local, Capability::ReadOnly),
+            row_cap(
+                "codebase-locator",
+                SubagentTarget::Local,
+                Capability::ReadOnly,
+            ),
+            row_cap("refactorer", SubagentTarget::Cloud, Capability::Mutating),
+            row_cap(
+                "codebase-analyzer",
+                SubagentTarget::Local,
+                Capability::ReadOnly,
+            ),
         ]);
-        // `f` cycles All → ReadOnly. The view now holds only ro1, ro2.
-        assert_eq!(state.apply(&menu, "f"), Ok(PickerAction::Continue));
+        // Kind filter → read-only view is rows 0 and 2; hex slot is page-relative.
+        state.apply_key(&menu, PickerKey::CycleFilter);
         assert_eq!(state.filter, KindFilter::ReadOnly);
         assert_eq!(state.view(), vec![0, 2]);
-        // View-relative numbering: "2" is ro2 (rows[2]), not the mutating row.
-        assert_eq!(state.apply(&menu, "2"), Ok(PickerAction::Continue));
+        state.apply_key(&menu, PickerKey::Row(1)); // slot 1 → rows[2]
         assert_eq!(state.rows[2].target, SubagentTarget::Cloud);
-        assert_eq!(state.rows[1].target, SubagentTarget::Cloud); // untouched mutating
-        // Bulk `a` over the read-only filter leaves the mutating row alone.
-        state.rows[2].target = SubagentTarget::Local;
-        assert_eq!(state.apply(&menu, "a"), Ok(PickerAction::Continue));
+        assert_eq!(state.rows[1].target, SubagentTarget::Cloud); // mutating untouched
+
+        // Bulk over the read-only filter spares the mutating row.
+        state.apply_key(&menu, PickerKey::AllLocal);
         assert_eq!(state.rows[0].target, SubagentTarget::Local);
         assert_eq!(state.rows[2].target, SubagentTarget::Local);
-        assert_eq!(state.rows[1].target, SubagentTarget::Cloud); // still cloud
-        // A number beyond the filtered view is rejected.
-        assert!(state.apply(&menu, "3").is_err());
+        assert_eq!(state.rows[1].target, SubagentTarget::Cloud);
+
+        // Name search composes with the kind filter (case-insensitive substring).
+        state.set_query("ANALYZER");
+        assert_eq!(state.view(), vec![2]);
+        // Clearing the query restores the kind-filtered view.
+        state.set_query("");
+        assert_eq!(state.view(), vec![0, 2]);
     }
 
     #[test]
-    fn picker_paging_advances_and_clamps() {
+    fn picker_pages_at_sixteen_and_clamps() {
         let menu = TargetMenu::default();
-        let rows: Vec<Row> = (0..60)
+        let rows: Vec<Row> = (0..40)
             .map(|i| row(&format!("agent-{i}"), SubagentTarget::Cloud))
             .collect();
         let mut state = PickerState::new(rows);
-        assert_eq!(state.page_count(state.view().len()), 3); // 60 / 25 → 3 pages
-        assert_eq!(state.apply(&menu, "n"), Ok(PickerAction::Continue));
+        assert_eq!(state.page_count(state.view().len()), 3); // 40 / 16 → 3 pages
+        state.apply_key(&menu, PickerKey::NextPage);
         assert_eq!(state.page, 1);
-        assert_eq!(state.apply(&menu, "n"), Ok(PickerAction::Continue));
+        // Slot 0 on page 1 (PAGE_SIZE=16) addresses rows[16].
+        state.apply_key(&menu, PickerKey::Row(0));
+        assert_eq!(state.rows[16].target, SubagentTarget::Local);
+        state.apply_key(&menu, PickerKey::NextPage);
+        state.apply_key(&menu, PickerKey::NextPage); // clamp at last page
         assert_eq!(state.page, 2);
-        // Clamp at the last page.
-        assert_eq!(state.apply(&menu, "n"), Ok(PickerAction::Continue));
-        assert_eq!(state.page, 2);
-        // `p` walks back and clamps at 0.
-        assert_eq!(state.apply(&menu, "p"), Ok(PickerAction::Continue));
+        state.apply_key(&menu, PickerKey::PrevPage);
         assert_eq!(state.page, 1);
         // Changing the filter resets to page 0.
-        state.apply(&menu, "f").unwrap();
+        state.apply_key(&menu, PickerKey::CycleFilter);
         assert_eq!(state.page, 0);
     }
 

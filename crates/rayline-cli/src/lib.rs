@@ -282,9 +282,10 @@ routing target (local or cloud) for `rayline claude --local`. Read-only agents
 are pre-selected for local. The mapping is saved to settings.json and applied
 on the next `--local` launch.
 
-The interactive picker shows 25 per page (n/p to page); press `f` to filter by
-kind (all / read-only / has-edit / unknown) and `a`/`c` to send the whole
-filtered set to local/cloud at once.
+The interactive picker is single-keypress (no Enter needed): 16 rows per page
+labeled 0-9a-f cycle that row's target; n/p page; k cycles the kind filter
+(all / read-only / has-edit / unknown); / searches by agent name; L/C send the
+whole filtered set to local/cloud; s (or Enter) saves; q (or Esc) quits.
 
 Options:
   --json    Print discovered agents and their default target as JSON; no prompt
