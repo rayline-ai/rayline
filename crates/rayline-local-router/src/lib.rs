@@ -1485,7 +1485,14 @@ fn build_openai_chat_request(body: &Value, model: &str, want_stream: bool) -> Va
         // Ask the upstream for a trailing usage chunk so we can report real token counts.
         out.insert("stream_options".to_owned(), json!({"include_usage": true}));
     }
-    for key in ["max_tokens", "temperature", "top_p", "stop"] {
+    // Anthropic `max_tokens` maps to OpenAI `max_completion_tokens`. Newer OpenAI
+    // models (gpt-5.x, o-series) reject the deprecated `max_tokens` outright, and
+    // older models (gpt-4o*) accept `max_completion_tokens` too, so always emit
+    // the modern field.
+    if let Some(value) = body.get("max_tokens") {
+        out.insert("max_completion_tokens".to_owned(), value.clone());
+    }
+    for key in ["temperature", "top_p", "stop"] {
         if let Some(value) = body.get(key) {
             out.insert(key.to_owned(), value.clone());
         }
@@ -3283,6 +3290,23 @@ mod tests {
         // Streaming requests must opt in to the trailing usage chunk.
         assert_eq!(request["stream"], true);
         assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn max_tokens_maps_to_openai_max_completion_tokens() {
+        let body = json!({
+            "model": "gpt-5.4-mini",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let request = build_openai_chat_request(&body, "gpt-5.4-mini", false);
+        // Newer OpenAI models (gpt-5.x, o-series) reject the deprecated `max_tokens`,
+        // so the router must translate it to `max_completion_tokens`.
+        assert_eq!(request["max_completion_tokens"], 32000);
+        assert!(
+            request.get("max_tokens").is_none(),
+            "deprecated max_tokens must not be forwarded"
+        );
     }
 
     #[test]
