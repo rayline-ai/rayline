@@ -6,5 +6,9 @@
 *.key
 credentials.json
 
+# Example dependencies
+node_modules/
+__pycache__/
+
 # Local design notes / superpowers specs — kept on disk, never committed
 /docs/superpowers/

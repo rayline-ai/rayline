@@ -47,7 +47,7 @@ Commands:
   auth       Sign in to hosted Rayline
   status     Show current CLI auth status
   claude     Run Claude Code through Rayline routing
-  router     Inspect or stop the local Rayline router runtime
+  router     Start, inspect, or stop the local Rayline router runtime
   top        Show live router request metrics
   local      Configure local model routing
   update     Check for or install a rayline launcher update
@@ -128,10 +128,26 @@ const ROUTER_HELP: &str = "\
 Usage: rayline router COMMAND
 
 Commands:
+  start    Start router processes
   status   Show router status
   logs     Print router logs
   top      Show live router request metrics
   stop     Stop router processes
+";
+
+const ROUTER_START_HELP: &str = "\
+Usage: rayline router start [--route <all|subagents>]
+
+Start the local router + transparent proxy daemon and exit, leaving it running.
+Point an Anthropic SDK client at the proxy on http://127.0.0.1:20810 (and trust
+the proxy CA cert) to route requests through it. The on-device model comes from
+your `rayline local` configuration.
+
+Options:
+  --route <all|subagents>   What the proxy routes through the router
+                            (default: all). With `all`, request model
+                            `rayline-local` to reach the on-device model.
+  --help                    Show this message and exit
 ";
 
 const ROUTER_STATUS_HELP: &str = "\
@@ -340,6 +356,18 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
+        RaylineDispatch::RouterStart(request) => {
+            match crate::router::start_from_cli(&request).await {
+                Ok(message) => {
+                    print!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         RaylineDispatch::RouterStatus(request) => {
             match crate::router::render_status(&request).await {
                 Ok(message) => {
@@ -553,6 +581,7 @@ pub enum RaylineDispatch {
     AuthToken(status::AuthTokenRequest),
     AuthLogout(status::AuthLogoutRequest),
     ClaudeRun(claude::RunRequest),
+    RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
     RouterLogs(router::RouterLogsRequest),
     RouterTop(router::RouterTopRequest),
@@ -1176,6 +1205,9 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     match args.next()?.to_str()? {
+        "start" => {
+            parse_router_start_request(args, root_env_explicit).map(RaylineDispatch::RouterStart)
+        }
         "status" => {
             if args.next().is_some() {
                 return None;
@@ -1198,6 +1230,47 @@ where
         }
         _ => None,
     }
+}
+
+fn parse_router_start_request<'a, I>(
+    mut args: std::iter::Peekable<I>,
+    root_env_explicit: bool,
+) -> Option<crate::router::RouterStartCliRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    // `router start` is always local; default to routing everything so a plain
+    // SDK client can reach the on-device model via model-name routing.
+    let mut route_scope = RouteScope::All;
+    while let Some(arg) = args.next() {
+        let arg = arg.to_str()?;
+        if arg == "--help" {
+            return None;
+        }
+        // Accepted for symmetry with the routing surface; the router daemon is
+        // inherently local, so this is a no-op.
+        if arg == "--local" {
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--route=") {
+            route_scope = parse_route_scope(value)?;
+            continue;
+        }
+        if arg == "--route" {
+            route_scope = parse_route_scope(args.next()?.to_str()?)?;
+            continue;
+        }
+        return None;
+    }
+    let proxy_routing_mode = match route_scope {
+        RouteScope::All => crate::router::PROXY_ROUTING_MODE_ALL,
+        RouteScope::Subagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
+    }
+    .to_owned();
+    Some(crate::router::RouterStartCliRequest {
+        proxy_routing_mode,
+        root_env_explicit,
+    })
 }
 
 fn parse_router_logs_request<'a, I>(
@@ -1568,6 +1641,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["local", "off"] => Some(LOCAL_OFF_HELP),
         ["local", "onboard"] => Some(LOCAL_ONBOARD_HELP),
         ["router"] => Some(ROUTER_HELP),
+        ["router", "start"] => Some(ROUTER_START_HELP),
         ["router", "status"] => Some(ROUTER_STATUS_HELP),
         ["router", "logs"] => Some(ROUTER_LOGS_HELP),
         ["router", "top"] => Some(ROUTER_TOP_HELP),
@@ -2074,7 +2148,6 @@ mod tests {
             &["rayline", "claude", "setup"][..],
             &["rayline", "claude", "run", "setup"][..],
             &["rayline", "claude", "--model", "x", "hooks", "status"][..],
-            &["rayline", "router", "start"][..],
         ] {
             assert_eq!(
                 rayline_dispatch_for_argv(&argv(args)),
@@ -2082,5 +2155,50 @@ mod tests {
                 "{args:?} should be unavailable"
             );
         }
+    }
+
+    #[test]
+    fn router_start_dispatch_defaults_to_all_route() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "router", "start"])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(
+                    request.proxy_routing_mode,
+                    crate::router::PROXY_ROUTING_MODE_ALL
+                );
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_start_dispatch_accepts_route_subagents() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "router",
+            "start",
+            "--route",
+            "subagents",
+        ])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(
+                    request.proxy_routing_mode,
+                    crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+                );
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_start_help_is_available() {
+        assert!(rayline_help_for_argv(&argv(&["rayline", "router", "start", "--help"])).is_some());
+    }
+
+    #[test]
+    fn router_start_rejects_unknown_route() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--route", "bogus"])),
+            RaylineDispatch::Unavailable,
+        );
     }
 }

@@ -119,6 +119,14 @@ pub struct RouterStopRequest {
     pub root_env_explicit: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterStartCliRequest {
+    /// Proxy routing mode: `PROXY_ROUTING_MODE_ALL` or
+    /// `PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS`.
+    pub proxy_routing_mode: String,
+    pub root_env_explicit: bool,
+}
+
 impl RouterStatusRequest {
     pub fn should_forward_for_invalid_envvar(&self) -> bool {
         crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
@@ -230,6 +238,12 @@ impl RouterLogsRequest {
 impl RouterTopRequest {
     pub fn should_forward_for_invalid_envvar(&self) -> bool {
         false
+    }
+}
+
+impl RouterStartCliRequest {
+    pub fn should_forward_for_invalid_envvar(&self) -> bool {
+        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
     }
 }
 
@@ -1531,6 +1545,34 @@ async fn resolve_start_model(
 pub async fn start_from_home(home: &Path, request: &RouterStartRequest) -> io::Result<String> {
     let bin_path = resolve_rld_bin(home)?;
     start_from_home_with_rld_bin(home, request, &bin_path).await
+}
+
+/// Start the local router daemon (router + embedded proxy) without launching
+/// Claude Code, then return a status string. This mirrors the local startup that
+/// `rayline claude --local` performs, but leaves the daemon running so other
+/// clients (e.g. the Anthropic SDK pointed at the proxy on 127.0.0.1:20810) can
+/// use it. The model comes from the stored `local_model` config, exactly like
+/// `start`.
+pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    let bin_path = resolve_rld_bin(&home)?;
+    let mut start_request = RouterStartRequest::local_router_defaults(request.root_env_explicit);
+    start_request.enable_proxy = true;
+    start_request.proxy_routing_mode = request.proxy_routing_mode.clone();
+    // Selective-subagents materializes the conservative read-only subagent
+    // allowlist as the proxy's static config; all-route leaves it unset so the
+    // daemon's built-in model routes apply (requesting `rayline-local` then
+    // lands on the on-device model).
+    if start_request.proxy_routing_mode == PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS {
+        start_request.router_config_path = Some(
+            crate::onboarding::write_default_local_routes(&home).map_err(|error| {
+                io::Error::other(format!("failed to write default local routes: {error}"))
+            })?,
+        );
+    }
+    let start_request = resolve_start_model(&home, start_request).await?;
+    start_from_home_with_rld_bin(&home, &start_request, &bin_path).await
 }
 
 pub async fn stop(_request: &RouterStopRequest) -> io::Result<String> {
