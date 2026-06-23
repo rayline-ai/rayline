@@ -27,7 +27,19 @@ pip install -r requirements.txt
 
 ## Configure
 
-1. Start the router (give the on-device model a minute to load on first use):
+1. Pick your local model (one of these — both set the single model behind
+   `rayline-local`):
+
+   ```bash
+   # Option 1 — Rayline downloads and runs the model (bundled llama.cpp):
+   rayline local models             # list the catalog, copy a <model-id>
+   rayline local use <model-id>
+
+   # Option 2 — you run the model yourself (Ollama / LM Studio / etc.):
+   rayline local custom --url http://127.0.0.1:11434 --model <model-id>
+   ```
+
+2. Start the router (give the on-device model a minute to load on first use):
 
    ```bash
    rayline router start
@@ -41,7 +53,7 @@ pip install -r requirements.txt
 
    Stop it later with `rayline router stop`.
 
-2. Set `CA_CERT` in [`main.py`](main.py) to Rayline's proxy CA path for your OS.
+3. Set `CA_CERT` in [`main.py`](main.py) to Rayline's proxy CA path for your OS.
    The client must trust this cert because Rayline intercepts TLS:
 
    | OS | Path |
