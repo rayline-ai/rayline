@@ -3,7 +3,9 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::Read;
-use std::io::{self, IsTerminal, Write};
+#[cfg(target_os = "macos")]
+use std::io::Write;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
