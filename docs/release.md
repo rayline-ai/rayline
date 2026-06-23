@@ -43,28 +43,49 @@ binary assets against `SHA256SUMS`.
 ## Self-Update Mirror
 
 The built-in `rayline update` command reads from `https://get.rayline.ai` by
-default. After the GitHub Release is created, mirror the same bare binary assets
-and `SHA256SUMS` to:
+default. After the GitHub Release is created, mirror the bare binary assets and
+**both** signature files to:
 
 ```text
 https://get.rayline.ai/cli/v<version>/rayline-<platform>
 https://get.rayline.ai/cli/v<version>/rld-<platform>
 https://get.rayline.ai/cli/v<version>/SHA256SUMS
+https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
 
-Then update the channel pointer:
+`SHA256SUMS.minisig` is **required**: `rayline update` verifies it against the
+pinned public key before trusting any checksum, and fails closed if it is
+missing or invalid.
+
+Then update the channel pointer **and its signature** — both are produced and
+signed by the release workflow and uploaded as the `latest.txt` /
+`latest.txt.minisig` release assets:
 
 ```text
 https://get.rayline.ai/cli/latest.txt
+https://get.rayline.ai/cli/latest.txt.minisig
 ```
 
-The pointer file contains only the public version string, for example:
+The pointer contains only the public version string (for example `0.2.0`). The
+updater fetches `latest.txt.minisig` and verifies it before trusting the
+version, so a **forged or hand-edited** pointer — naming an arbitrary or
+never-released version — is rejected. Copy the signed `latest.txt` /
+`latest.txt.minisig` from the release assets verbatim; do not hand-edit the
+pointer or its signature will no longer match.
 
-```text
-0.2.0
-```
+> **Known limitation (replay / freeze).** Signing proves the pointer is
+> *authentic*, not *fresh*. An attacker who can serve content may replay an
+> older, validly-signed `latest.txt` to freeze users on a stale head, or pin
+> them to an old (still validly-signed) version above their installed one. The
+> client refuses to roll *below* the installed version (`target > current`), but
+> full anti-rollback needs freshness — a signed timestamp + expiry or a
+> highest-seen-version floor — which is tracked as a follow-up, not delivered by
+> pointer signing alone.
 
-Use `latest-dev.txt` or `latest-main.txt` only for non-production channels.
+For non-production channels, copy the same signed pair under the channel name
+(`latest-dev.txt` / `latest-dev.txt.minisig` or `latest-main.txt` /
+`latest-main.txt.minisig`); the signature is over the version content, not the
+filename, so it stays valid.
 
 ## Local Validation
 
