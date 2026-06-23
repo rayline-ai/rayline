@@ -283,32 +283,52 @@ async fn fetch_latest_version(channel: &str) -> Result<Version, UpdateError> {
     let url = latest_url_for(channel).ok_or_else(|| {
         UpdateError::Network(format!("channel '{channel}' has no latest pointer"))
     })?;
+    let pointer = fetch_pointer_bytes(&url).await?;
+    // Fail closed: the version pointer must carry a verifiable signature before
+    // we trust the version it names. Without this, a tampered or MITM'd
+    // `latest.txt` could pin users to an older (but validly signed) release.
+    let signature = fetch_pointer_bytes(&format!("{url}.minisig")).await?;
+    parse_verified_latest(&pointer, &signature, crate::MINISIGN_PUBLIC_KEYS)
+}
+
+async fn fetch_pointer_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
-        .map_err(|error| UpdateError::Network(format!("failed to fetch latest version: {error}")))?
-        .get(url.clone())
+        .map_err(|error| UpdateError::Network(format!("failed to fetch {url}: {error}")))?
+        .get(url)
         .send()
         .await
-        .map_err(|error| {
-            UpdateError::Network(format!("failed to fetch latest version: {error}"))
-        })?;
-
+        .map_err(|error| UpdateError::Network(format!("failed to fetch {url}: {error}")))?;
     if !response.status().is_success() {
         return Err(UpdateError::Network(format!(
-            "latest pointer returned HTTP {}",
+            "{url} returned HTTP {}",
             response.status().as_u16()
         )));
     }
-
-    let text = response
-        .text()
+    response
+        .bytes()
         .await
-        .map_err(|error| UpdateError::Network(format!("failed to fetch latest version: {error}")))?
-        .trim()
-        .to_owned();
-    Version::parse(&text).map_err(|_| {
-        UpdateError::Network(format!("could not parse version from response: {text:?}"))
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| UpdateError::Network(format!("failed to fetch {url}: {error}")))
+}
+
+/// Verify the latest-pointer bytes against a pinned key, then parse the version.
+///
+/// Fails closed: an absent/invalid signature, non-UTF-8 bytes, or an
+/// unparseable version is an error. The signature is over the pointer's raw
+/// bytes, so a tampered version string no longer matches.
+fn parse_verified_latest(
+    pointer: &[u8],
+    signature: &[u8],
+    pubkeys: &[&str],
+) -> Result<Version, UpdateError> {
+    verify_signature(pointer, signature, pubkeys)?;
+    let text = std::str::from_utf8(pointer)
+        .map_err(|_| UpdateError::Network("latest pointer is not valid UTF-8".to_owned()))?
+        .trim();
+    Version::parse(text).map_err(|_| {
+        UpdateError::Network(format!("could not parse version from pointer: {text:?}"))
     })
 }
 
@@ -1041,6 +1061,10 @@ mod tests {
     // Untrusted public key (different keypair, not in the pinned set)
     const UNTRUSTED_PUBKEY: &str = "RWQR3fP7y6Yexmbshr2vDmkWJeKelP8y80oyaUgE9AjMymImLFrUu0Dy";
 
+    // Test public key for the latest.txt pointer fixtures (matches
+    // tests/fixtures/latest.txt.minisig). Testing only — NOT the production key.
+    const LATEST_TEST_PUBKEY: &str = "RWTORxdK/+7+ayF6kfI5TjZjEMLnbo81yDtE94iGpdP7yJHQ0F+HGm0l";
+
     fn fixture(name: &str) -> Vec<u8> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
@@ -1111,6 +1135,45 @@ mod tests {
             verify_signature(&sums, &sig, &[UNTRUSTED_PUBKEY, TEST_PUBKEY]).is_ok(),
             "must succeed when any pinned key matches"
         );
+    }
+
+    // ── latest.txt version-pointer verification ──────────────────────────────
+
+    /// Signed pointer + matching pinned key → verifies and parses the version.
+    #[test]
+    fn latest_pointer_valid_signature_parses() {
+        let pointer = fixture("latest.txt");
+        let sig = fixture("latest.txt.minisig");
+        let version = parse_verified_latest(&pointer, &sig, &[LATEST_TEST_PUBKEY])
+            .expect("valid signed pointer should verify and parse");
+        assert_eq!(version.public, "99.0.0");
+    }
+
+    /// Tampered pointer (version swapped) → rejected; the signature is over the
+    /// original bytes. This is the downgrade-attack defense.
+    #[test]
+    fn latest_pointer_tampered_version_rejected() {
+        let pointer = fixture("latest.txt.tampered");
+        let sig = fixture("latest.txt.minisig");
+        assert!(matches!(
+            parse_verified_latest(&pointer, &sig, &[LATEST_TEST_PUBKEY]),
+            Err(UpdateError::Signature(_))
+        ));
+    }
+
+    /// Missing signature → fail closed (no version trusted).
+    #[test]
+    fn latest_pointer_missing_signature_fails_closed() {
+        let pointer = fixture("latest.txt");
+        assert!(parse_verified_latest(&pointer, &[], &[LATEST_TEST_PUBKEY]).is_err());
+    }
+
+    /// Signature under an unpinned key → rejected.
+    #[test]
+    fn latest_pointer_unpinned_key_rejected() {
+        let pointer = fixture("latest.txt");
+        let sig = fixture("latest.txt.minisig");
+        assert!(parse_verified_latest(&pointer, &sig, &[UNTRUSTED_PUBKEY]).is_err());
     }
 
     // ── Integration tests for download_and_verify ─────────────────────────────
