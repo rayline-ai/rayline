@@ -386,6 +386,12 @@ fn endpoint_id(base_url: &str) -> String {
     format!("custom-{slug}")
 }
 
+/// Sentinel allowlist entry for an all-cloud mapping. The proxy treats an EMPTY
+/// selective-subagent list as the legacy "route every subagent to local", so to
+/// honor an explicit all-cloud choice we keep the list non-empty with a key that
+/// can never match a real agent id or type — nothing gets intercepted.
+const ROUTE_NOTHING_SENTINEL: &str = "__rayline_no_local_subagents__";
+
 /// Build the managed router config (proxy allowlist + router endpoints + routes)
 /// from a persisted mapping. Cloud agents are omitted so the proxy leaves them
 /// on cloud; local agents use the bundled `local` endpoint (no model — the
@@ -413,6 +419,14 @@ pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
             }
         }
     }
+    // All-cloud mapping → empty allowlist would invert to "route everything
+    // local"; emit the sentinel so the proxy intercepts nothing instead.
+    if subagents.is_empty() {
+        subagents.insert(
+            ROUTE_NOTHING_SENTINEL.to_owned(),
+            json!({ "endpoint": "local" }),
+        );
+    }
     let mut config = serde_json::Map::new();
     config.insert(
         "routes".to_owned(),
@@ -425,7 +439,10 @@ pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
                 json!({
                     "id": id,
                     "kind": "custom",
-                    "protocol": "openai_chat",
+                    // Custom endpoints saved via `local custom` are Anthropic
+                    // Messages servers (validated at `{base_url}/v1/messages`),
+                    // so the router must speak that protocol, not openai_chat.
+                    "protocol": "anthropic_messages",
                     "base_url": base_url,
                     "models": models,
                 })
@@ -448,22 +465,38 @@ pub struct TargetMenu {
     pub endpoints: Vec<(String, String)>,
 }
 
-/// Read the configured custom endpoints (beyond the active/bundled model) so the
-/// picker can offer them as per-subagent targets.
+/// Read the configured custom endpoints (beyond the bundled `local` model) so
+/// the picker can offer them as per-subagent targets.
 pub fn target_menu(home: &Path) -> TargetMenu {
+    let Some(cfg) = local_model::read_from_home(home) else {
+        return TargetMenu::default();
+    };
+    // Only in Custom mode is the active `base_url`/`model` the bundled "local"
+    // target — there it must not also appear as a separate endpoint. In
+    // Recommended mode "local" is the bundled GGUF, so any retained custom pair
+    // is a real alternative endpoint the user can still route subagents to.
+    let active_local = if matches!(cfg.mode, local_model::LocalModelMode::Custom) {
+        cfg.base_url
+            .as_ref()
+            .zip(cfg.model.as_ref())
+            .map(|(base_url, model)| (base_url.clone(), model.clone()))
+    } else {
+        None
+    };
+    let mut candidates: Vec<(String, String)> = cfg
+        .custom_endpoints
+        .iter()
+        .map(|endpoint| (endpoint.base_url.clone(), endpoint.model.clone()))
+        .collect();
+    if matches!(cfg.mode, local_model::LocalModelMode::Recommended) {
+        if let (Some(base_url), Some(model)) = (cfg.base_url.as_ref(), cfg.model.as_ref()) {
+            candidates.push((base_url.clone(), model.clone()));
+        }
+    }
     let mut endpoints = Vec::new();
-    if let Some(cfg) = local_model::read_from_home(home) {
-        // The active base_url/model IS "local" in custom mode, so exclude it;
-        // surface only the *other* saved endpoints as distinct targets.
-        let active = match (cfg.base_url.as_ref(), cfg.model.as_ref()) {
-            (Some(base_url), Some(model)) => Some((base_url.clone(), model.clone())),
-            _ => None,
-        };
-        for endpoint in &cfg.custom_endpoints {
-            let pair = (endpoint.base_url.clone(), endpoint.model.clone());
-            if Some(&pair) != active.as_ref() && !endpoints.contains(&pair) {
-                endpoints.push(pair);
-            }
+    for pair in candidates {
+        if Some(&pair) != active_local.as_ref() && !endpoints.contains(&pair) {
+            endpoints.push(pair);
         }
     }
     TargetMenu { endpoints }
@@ -1000,7 +1033,8 @@ mod tests {
         let endpoints = config["endpoints"].as_array().unwrap();
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0]["id"], analyzer_endpoint);
-        assert_eq!(endpoints[0]["protocol"], "openai_chat");
+        // Custom endpoints are Anthropic Messages servers (see P2).
+        assert_eq!(endpoints[0]["protocol"], "anthropic_messages");
         assert_eq!(endpoints[0]["base_url"], "http://localhost:11434/v1");
     }
 
@@ -1008,7 +1042,7 @@ mod tests {
     fn generated_config_deserializes_as_local_router_config() {
         // The contract that matters at runtime: the file we materialize must
         // load as the local router's own RouterConfig (field names, the
-        // `openai_chat` protocol tag, local routes without a model).
+        // `anthropic_messages` protocol tag, local routes without a model).
         let mut routes = SubagentRoutes::default();
         routes
             .routes
@@ -1037,17 +1071,56 @@ mod tests {
     }
 
     #[test]
-    fn routes_config_all_cloud_has_no_endpoints_and_empty_allowlist() {
+    fn routes_config_all_cloud_emits_sentinel_not_empty_allowlist() {
+        // An empty allowlist would invert to "route everything local" at the
+        // proxy (P1). An all-cloud mapping must instead emit the non-matching
+        // sentinel so nothing is intercepted, and define no endpoints.
         let mut routes = SubagentRoutes::default();
         routes.routes.insert("a".into(), SubagentTarget::Cloud);
+        routes.routes.insert("b".into(), SubagentTarget::Cloud);
         let config = routes_config_json(&routes);
-        assert!(
-            config["routes"]["subagents"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        let subagents = config["routes"]["subagents"].as_object().unwrap();
+
+        assert!(!subagents.is_empty(), "allowlist must not be empty");
+        assert!(!subagents.contains_key("a"));
+        assert!(!subagents.contains_key("b"));
+        assert!(subagents.contains_key(ROUTE_NOTHING_SENTINEL));
         assert!(config.get("endpoints").is_none());
+    }
+
+    #[test]
+    fn target_menu_offers_retained_endpoint_in_recommended_mode_only() {
+        // P3: in Recommended mode a retained custom base_url/model is a real
+        // alternative endpoint and must be offered; in Custom mode that same
+        // pair IS the bundled `local` target and must be hidden.
+        let recommended = tmp_home("menu-rec");
+        status::write_settings(
+            &recommended,
+            &json!({ "local_model": {
+                "mode": "recommended",
+                "base_url": "http://127.0.0.1:11434",
+                "model": "llama3.3",
+            }}),
+        )
+        .unwrap();
+        let menu = target_menu(&recommended);
+        assert_eq!(
+            menu.endpoints,
+            vec![("http://127.0.0.1:11434".to_owned(), "llama3.3".to_owned())],
+        );
+
+        let custom = tmp_home("menu-custom");
+        status::write_settings(
+            &custom,
+            &json!({ "local_model": {
+                "mode": "custom",
+                "base_url": "http://127.0.0.1:11434",
+                "model": "llama3.3",
+            }}),
+        )
+        .unwrap();
+        // The active custom pair is "local", so it is not also a menu endpoint.
+        assert!(target_menu(&custom).endpoints.is_empty());
     }
 
     #[test]
