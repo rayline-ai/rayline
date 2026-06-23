@@ -24,6 +24,20 @@ an isolated Claude config dir:
 rayline claude --local --isolated
 ```
 
+Start the local router + transparent proxy **without** launching Claude Code, for
+use from your own code (e.g. an Anthropic SDK client pointed at the proxy on
+`http://127.0.0.1:20810`). It routes every request through the router by default,
+so requesting model `rayline-local` reaches your on-device model:
+
+```bash
+rayline router start                 # route all (default)
+rayline router start --route subagents
+rayline router stop                  # stop it when done
+```
+
+See [examples/cloud](../examples/cloud) and [examples/local](../examples/local)
+for runnable Python and TypeScript clients.
+
 Check for CLI updates:
 
 ```bash

@@ -1,0 +1,2 @@
+# Anthropic SDK.
+anthropic>=0.40
