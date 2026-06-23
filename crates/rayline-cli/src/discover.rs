@@ -19,6 +19,7 @@ use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{local_model, status};
 
@@ -253,12 +254,31 @@ pub fn load_agent_definitions(dirs: &[PathBuf]) -> HashMap<String, Capability> {
                 continue;
             };
             if let Some((name, cap)) = parse_agent_definition(&text) {
-                // Keep built-ins and earlier (global) definitions over later ones.
-                index.entry(name).or_insert(cap);
+                // Routing is keyed only by agent name, so when the same name has
+                // several definitions (global + project, or a name shadowing a
+                // built-in) the *most mutating* capability must win — never
+                // under-classify a command/edit-capable agent as read-only.
+                index
+                    .entry(name)
+                    .and_modify(|existing| *existing = more_capable(*existing, cap))
+                    .or_insert(cap);
             }
         }
     }
     index
+}
+
+/// Pick the more mutating of two capabilities (Mutating > ReadOnly > Unknown).
+/// Used to merge duplicate agent definitions conservatively.
+fn more_capable(a: Capability, b: Capability) -> Capability {
+    fn rank(capability: Capability) -> u8 {
+        match capability {
+            Capability::Mutating => 2,
+            Capability::ReadOnly => 1,
+            Capability::Unknown => 0,
+        }
+    }
+    if rank(b) > rank(a) { b } else { a }
 }
 
 /// Parse a `*.md` agent definition's YAML frontmatter; returns the lowercased
@@ -290,8 +310,17 @@ fn parse_agent_definition(markdown: &str) -> Option<(String, Capability)> {
 
 /// Classify a `tools:` frontmatter value. `*` or "All tools" grants everything
 /// (mutating); an explicit list is read-only only if it names no mutating tool.
+/// YAML quoting/brackets are stripped both around the whole value and per token,
+/// so `tools: "Bash"`, `tools: "Read, Edit"`, and `tools: [Read, Edit]` are
+/// classified correctly rather than slipping past the mutating-tool check.
 fn classify_tools(tools: &str) -> Capability {
-    let trimmed = tools.trim();
+    let trimmed = tools
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
     if trimmed.is_empty() {
         return Capability::Unknown;
     }
@@ -301,7 +330,12 @@ fn classify_tools(tools: &str) -> Capability {
     }
     let grants_mutation = trimmed
         .split(',')
-        .map(|tool| tool.trim().to_ascii_lowercase())
+        .map(|tool| {
+            tool.trim()
+                .trim_matches(['"', '\''])
+                .trim()
+                .to_ascii_lowercase()
+        })
         .any(|tool| MUTATING_TOOLS.contains(&tool.as_str()));
     if grants_mutation {
         Capability::Mutating
@@ -370,6 +404,8 @@ pub fn write_subagent_routes_in_home(home: &Path, routes: &SubagentRoutes) -> io
 
 /// Synthesize a stable router-endpoint id from a base URL (base URLs are not
 /// valid endpoint ids; this maps each distinct URL to one deterministic token).
+/// The truncated slug is for readability; a short digest of the full URL is
+/// appended so two URLs sharing a 40-char slug prefix never collide onto one id.
 fn endpoint_id(base_url: &str) -> String {
     let slug: String = base_url
         .chars()
@@ -383,7 +419,13 @@ fn endpoint_id(base_url: &str) -> String {
         .collect();
     let slug = slug.trim_matches('-');
     let slug = &slug[..slug.len().min(40)];
-    format!("custom-{slug}")
+    let digest = Sha256::digest(base_url.as_bytes());
+    let suffix: String = digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("custom-{slug}-{suffix}")
 }
 
 /// Sentinel allowlist entry for an all-cloud mapping. The proxy treats an EMPTY
@@ -922,6 +964,12 @@ mod tests {
         assert_eq!(classify_tools("*"), Capability::Mutating);
         assert_eq!(classify_tools("WebSearch, WebFetch"), Capability::ReadOnly);
         assert_eq!(classify_tools(""), Capability::Unknown);
+        // P1: YAML quoting/brackets must not hide a mutating tool.
+        assert_eq!(classify_tools("\"Bash\""), Capability::Mutating);
+        assert_eq!(classify_tools("'Bash'"), Capability::Mutating);
+        assert_eq!(classify_tools("\"Read, Edit\""), Capability::Mutating);
+        assert_eq!(classify_tools("[Read, Edit]"), Capability::Mutating);
+        assert_eq!(classify_tools("[\"Read\", \"Glob\"]"), Capability::ReadOnly);
     }
 
     #[test]
@@ -948,6 +996,34 @@ mod tests {
             Capability::Mutating
         );
         assert_eq!(capability_of("never-seen", &index), Capability::Unknown);
+    }
+
+    #[test]
+    fn duplicate_definitions_let_mutating_win() {
+        // P2: a read-only `reviewer` globally and a mutating one project-local
+        // must classify as mutating (routing is keyed only by name).
+        let base = std::env::temp_dir().join(format!("rl-disc-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let global = base.join("global");
+        let project = base.join("project");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            global.join("reviewer.md"),
+            "---\nname: reviewer\ntools: Read, Grep\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("reviewer.md"),
+            "---\nname: reviewer\ntools: Read, Edit\n---\n",
+        )
+        .unwrap();
+
+        let index = load_agent_definitions(&[global.clone(), project.clone()]);
+        assert_eq!(capability_of("reviewer", &index), Capability::Mutating);
+        // Order-independent: project listed first still resolves to mutating.
+        let index = load_agent_definitions(&[project, global]);
+        assert_eq!(capability_of("reviewer", &index), Capability::Mutating);
     }
 
     #[test]
@@ -1130,6 +1206,36 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("custom-"));
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn endpoint_id_distinguishes_urls_sharing_a_slug_prefix() {
+        // P2: two URLs whose first 40 slug chars are identical must still get
+        // distinct ids (the digest suffix), or routes_config_json would merge
+        // them onto one base URL and misroute the second.
+        let prefix = "a".repeat(60);
+        let one = endpoint_id(&format!("http://{prefix}.example.com/v1"));
+        let two = endpoint_id(&format!("http://{prefix}.other.com/v1"));
+        assert_ne!(one, two);
+
+        // And those distinct ids yield two endpoints (not a silent merge).
+        let mut routes = SubagentRoutes::default();
+        routes.routes.insert(
+            "a".into(),
+            SubagentTarget::Endpoint {
+                base_url: format!("http://{prefix}.example.com/v1"),
+                model: "m1".into(),
+            },
+        );
+        routes.routes.insert(
+            "b".into(),
+            SubagentTarget::Endpoint {
+                base_url: format!("http://{prefix}.other.com/v1"),
+                model: "m2".into(),
+            },
+        );
+        let config = routes_config_json(&routes);
+        assert_eq!(config["endpoints"].as_array().unwrap().len(), 2);
     }
 
     #[test]
