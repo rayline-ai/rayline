@@ -301,11 +301,12 @@ pub fn load_agent_definitions(dirs: &[PathBuf]) -> HashMap<String, Capability> {
             if let Some((name, cap)) = parse_agent_definition(&text) {
                 // Routing is keyed only by agent name, so when the same name has
                 // several definitions (global + project, or a name shadowing a
-                // built-in) the *most mutating* capability must win — never
-                // under-classify a command/edit-capable agent as read-only.
+                // built-in) the most CONSERVATIVE capability wins — a read-only
+                // verdict only survives if every definition agrees, so we never
+                // route a command/edit-capable (or unparsed) agent local.
                 index
                     .entry(name)
-                    .and_modify(|existing| *existing = more_capable(*existing, cap))
+                    .and_modify(|existing| *existing = more_conservative(*existing, cap))
                     .or_insert(cap);
             }
         }
@@ -313,14 +314,18 @@ pub fn load_agent_definitions(dirs: &[PathBuf]) -> HashMap<String, Capability> {
     index
 }
 
-/// Pick the more mutating of two capabilities (Mutating > ReadOnly > Unknown).
-/// Used to merge duplicate agent definitions conservatively.
-fn more_capable(a: Capability, b: Capability) -> Capability {
+/// Merge two capabilities for the same agent name, keeping the one that is
+/// safest to route locally. Only `ReadOnly` is routed local by default, so it
+/// ranks LOWEST: `Mutating > Unknown > ReadOnly`. A read-only classification
+/// therefore survives a merge only when no other definition is mutating or
+/// unparsed — `Unknown` (treated as unsafe everywhere) is never downgraded to
+/// read-only.
+fn more_conservative(a: Capability, b: Capability) -> Capability {
     fn rank(capability: Capability) -> u8 {
         match capability {
             Capability::Mutating => 2,
-            Capability::ReadOnly => 1,
-            Capability::Unknown => 0,
+            Capability::Unknown => 1,
+            Capability::ReadOnly => 0,
         }
     }
     if rank(b) > rank(a) { b } else { a }
@@ -394,10 +399,12 @@ fn classify_tools(tools: &str) -> Capability {
     let grants_mutation = trimmed
         .split(',')
         .map(|tool| {
-            tool.trim()
-                .trim_matches(['"', '\''])
-                .trim()
-                .to_ascii_lowercase()
+            let tool = tool.trim().trim_matches(['"', '\'']).trim();
+            // Claude's allowed-tool syntax scopes a tool with a suffix, e.g.
+            // `Bash(git add:*)` or `Write(src/**)`. Match the base tool name
+            // before the `(` so a scoped mutating tool is still mutating.
+            let base = tool.split('(').next().unwrap_or(tool).trim();
+            base.to_ascii_lowercase()
         })
         .any(|tool| MUTATING_TOOLS.contains(&tool.as_str()));
     if grants_mutation {
@@ -1342,6 +1349,18 @@ mod tests {
         // A `#` inside a token (no preceding space) is NOT a comment.
         assert_eq!(strip_yaml_comment("Read, C#Tool"), "Read, C#Tool");
         assert_eq!(strip_yaml_comment("Read # c"), "Read ");
+        // Claude's scoped allowed-tool syntax must still read as mutating.
+        assert_eq!(
+            classify_tools("Read, Bash(git add:*)"),
+            Capability::Mutating
+        );
+        assert_eq!(classify_tools("Write(src/**), Read"), Capability::Mutating);
+        assert_eq!(
+            classify_tools("[Read, Bash(git add:*)]"),
+            Capability::Mutating
+        );
+        // A scoped non-mutating tool stays read-only.
+        assert_eq!(classify_tools("Read(foo), Grep"), Capability::ReadOnly);
     }
 
     #[test]
@@ -1396,6 +1415,49 @@ mod tests {
         // Order-independent: project listed first still resolves to mutating.
         let index = load_agent_definitions(&[project, global]);
         assert_eq!(capability_of("reviewer", &index), Capability::Mutating);
+    }
+
+    #[test]
+    fn duplicate_with_unknown_definition_is_not_downgraded_to_readonly() {
+        // One read-only def + one tool-less (Unknown) def of the same name must
+        // NOT resolve to read-only, since Unknown is treated as unsafe (cloud).
+        let base = std::env::temp_dir().join(format!("rl-disc-unk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let a = base.join("a");
+        let b = base.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(
+            a.join("helper.md"),
+            "---\nname: helper\ntools: Read, Grep\n---\n",
+        )
+        .unwrap();
+        // No `tools:` line → Unknown capability.
+        std::fs::write(
+            b.join("helper.md"),
+            "---\nname: helper\ndescription: x\n---\n",
+        )
+        .unwrap();
+
+        let index = load_agent_definitions(&[a.clone(), b.clone()]);
+        assert_eq!(capability_of("helper", &index), Capability::Unknown);
+        // Order-independent.
+        let index = load_agent_definitions(&[b, a]);
+        assert_eq!(capability_of("helper", &index), Capability::Unknown);
+
+        // And as a unit: more_conservative keeps Unknown over ReadOnly, Mutating over both.
+        assert_eq!(
+            more_conservative(Capability::ReadOnly, Capability::Unknown),
+            Capability::Unknown
+        );
+        assert_eq!(
+            more_conservative(Capability::Unknown, Capability::Mutating),
+            Capability::Mutating
+        );
+        assert_eq!(
+            more_conservative(Capability::ReadOnly, Capability::ReadOnly),
+            Capability::ReadOnly
+        );
     }
 
     #[test]
