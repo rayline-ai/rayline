@@ -3,6 +3,21 @@
 This document covers the one-time key-generation setup required before shipping
 Rayline releases with minisign signature verification.
 
+## Status (2026-06-23) — production key provisioned
+
+- ✅ Production keypair generated (minisign, passphrase-less for unattended CI).
+- ✅ Public key embedded in `crates/rayline-cli/src/lib.rs` (`MINISIGN_PUBLIC_KEYS`) and
+  `scripts/install-rayline.sh` (`RAYLINE_PUBKEY`): `RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1`.
+- ✅ `MINISIGN_SECRET_KEY` set as a secret on the protected `release` GitHub environment
+  (required reviewer: `chilang`; self-review allowed for the solo maintainer).
+- ✅ Keypair verified end-to-end (sign with secret → verify with the committed public key).
+- ⏳ **REMAINING (human):** back up the secret key to 1Password — a `0600` copy was left at
+  `~/rayline-prod-minisign.key`; stash it, then shred the file. Without a backup, the only copy
+  is the (unreadable) GitHub secret, and recovery means rotating to a new key.
+- ⏳ **REMAINING:** verify the first signed release end-to-end (a real tag → CI signs → `rayline update` accepts).
+
+The sections below are the original setup guide / rotation reference.
+
 ## Prerequisites
 
 Install [minisign](https://jedisct1.github.io/minisign/):

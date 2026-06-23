@@ -109,9 +109,9 @@ download "$base_url/SHA256SUMS" "$tmp_dir/SHA256SUMS"
 # Signature verification (best-effort: required when minisign is available).
 if command -v minisign >/dev/null 2>&1; then
   download "$base_url/SHA256SUMS.minisig" "$tmp_dir/SHA256SUMS.minisig"
-  # TODO(release): replace this placeholder with the production public key before shipping.
-  #                See RELEASING-SIGNING.md.
-  RAYLINE_PUBKEY="${RAYLINE_MINISIGN_PUBKEY:-RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP}"
+  # rayline production signing public key (matches MINISIGN_PUBLIC_KEYS in rayline-cli; see RELEASING-SIGNING.md).
+  # Override only for testing against a non-production signing key.
+  RAYLINE_PUBKEY="${RAYLINE_MINISIGN_PUBKEY:-RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1}"
   if ! minisign -Vm "$tmp_dir/SHA256SUMS" -P "$RAYLINE_PUBKEY" >/dev/null 2>&1; then
     echo "error: SHA256SUMS signature verification failed. The release may be tampered." >&2
     echo "       To override (not recommended), uninstall minisign before running this script." >&2
