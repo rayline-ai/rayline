@@ -84,10 +84,23 @@ pub struct EndpointConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Overrides the protocol-default auth scheme. `None` keeps the historical
+    /// per-protocol behavior (`anthropic_messages` -> `x-api-key`,
+    /// `openai_chat` -> bearer).
+    #[serde(default)]
+    pub auth: Option<AuthMode>,
 }
 
 fn default_endpoint_kind() -> String {
     "provider".to_owned()
+}
+
+/// Optional per-endpoint auth override (serialized as `"bearer"` / `"api_key"`).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Bearer,
+    ApiKey,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -317,6 +330,7 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
                 models: vec!["claude-sonnet-4-6".to_owned(), "claude-opus-4-7".to_owned()],
                 headers: HashMap::new(),
+                auth: None,
             },
             EndpointConfig {
                 id: "openai".to_owned(),
@@ -326,18 +340,20 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 api_key_env: Some("OPENAI_API_KEY".to_owned()),
                 models: vec!["gpt-5.2".to_owned(), "gpt-5.2-codex".to_owned()],
                 headers: HashMap::new(),
+                auth: None,
             },
             EndpointConfig {
+                // OpenRouter exposes a native Anthropic Messages endpoint at
+                // /v1/messages that accepts bearer auth and streams native
+                // Anthropic SSE, so prefer it over the openai_chat shim.
                 id: "openrouter".to_owned(),
                 kind: "provider".to_owned(),
-                protocol: EndpointProtocol::OpenAIChat,
-                base_url: "https://openrouter.ai/api/v1".to_owned(),
+                protocol: EndpointProtocol::AnthropicMessages,
+                base_url: "https://openrouter.ai/api".to_owned(),
                 api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
-                models: vec![
-                    "openai/gpt-5.2".to_owned(),
-                    "anthropic/claude-sonnet-4.6".to_owned(),
-                ],
+                models: vec!["anthropic/claude-sonnet-4.6".to_owned()],
                 headers: HashMap::new(),
+                auth: Some(AuthMode::Bearer),
             },
         ],
         routes: RoutesConfig {
@@ -892,7 +908,7 @@ async fn forward_openai_chat_endpoint(
 ) -> Result<Response<BoxBody>> {
     let want_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let estimated_input_tokens = approximate_input_tokens(&body);
-    let request_body = build_openai_chat_request(&body, &decision.selected_model);
+    let request_body = build_openai_chat_request(&body, &decision.selected_model, want_stream);
     let url = format!(
         "{}/chat/completions",
         endpoint.base_url.trim_end_matches('/')
@@ -915,6 +931,16 @@ async fn forward_openai_chat_endpoint(
             Some(estimated_input_tokens),
         )
         .await;
+    }
+    if want_stream {
+        // True streaming: translate OpenAI Chat SSE -> Anthropic SSE chunk by chunk.
+        return Ok(openai_chat_stream_to_anthropic(
+            resp,
+            decision,
+            state.opts.metrics.clone(),
+            request_id.to_owned(),
+            estimated_input_tokens,
+        ));
     }
     let value = resp.json::<Value>().await?;
     let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
@@ -941,10 +967,20 @@ enum AuthStyle {
     Bearer,
 }
 
+/// Resolve the auth scheme actually used for an endpoint: an explicit `auth`
+/// override wins, otherwise the protocol's historical default is kept.
+fn resolve_auth_style(endpoint: &EndpointConfig, protocol_default: AuthStyle) -> AuthStyle {
+    match endpoint.auth {
+        Some(AuthMode::Bearer) => AuthStyle::Bearer,
+        Some(AuthMode::ApiKey) => AuthStyle::Anthropic,
+        None => protocol_default,
+    }
+}
+
 fn apply_endpoint_headers(
     mut request: reqwest::RequestBuilder,
     endpoint: &EndpointConfig,
-    auth_style: AuthStyle,
+    protocol_default: AuthStyle,
 ) -> Result<reqwest::RequestBuilder> {
     for (name, value) in &endpoint.headers {
         request = request.header(name, value);
@@ -956,7 +992,7 @@ fn apply_endpoint_headers(
                 endpoint.id
             )
         })?;
-        request = match auth_style {
+        request = match resolve_auth_style(endpoint, protocol_default) {
             AuthStyle::Anthropic => request.header("x-api-key", key),
             AuthStyle::Bearer => request.bearer_auth(key),
         };
@@ -1428,7 +1464,7 @@ fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
     headers.insert("x-rayline-route-id", route_id);
 }
 
-fn build_openai_chat_request(body: &Value, model: &str) -> Value {
+fn build_openai_chat_request(body: &Value, model: &str, want_stream: bool) -> Value {
     let mut messages = Vec::new();
     if let Some(system) = body.get("system") {
         let content = content_to_text(system);
@@ -1444,8 +1480,19 @@ fn build_openai_chat_request(body: &Value, model: &str) -> Value {
     let mut out = Map::new();
     out.insert("model".to_owned(), Value::String(model.to_owned()));
     out.insert("messages".to_owned(), Value::Array(messages));
-    out.insert("stream".to_owned(), Value::Bool(false));
-    for key in ["max_tokens", "temperature", "top_p", "stop"] {
+    out.insert("stream".to_owned(), Value::Bool(want_stream));
+    if want_stream {
+        // Ask the upstream for a trailing usage chunk so we can report real token counts.
+        out.insert("stream_options".to_owned(), json!({"include_usage": true}));
+    }
+    // Anthropic `max_tokens` maps to OpenAI `max_completion_tokens`. Newer OpenAI
+    // models (gpt-5.x, o-series) reject the deprecated `max_tokens` outright, and
+    // older models (gpt-4o*) accept `max_completion_tokens` too, so always emit
+    // the modern field.
+    if let Some(value) = body.get("max_tokens") {
+        out.insert("max_completion_tokens".to_owned(), value.clone());
+    }
+    for key in ["temperature", "top_p", "stop"] {
         if let Some(value) = body.get(key) {
             out.insert(key.to_owned(), value.clone());
         }
@@ -1523,6 +1570,50 @@ fn append_openai_messages(out: &mut Vec<Value>, message: &Value) {
         return;
     }
 
+    // When the user message carries image blocks we must emit OpenAI multimodal
+    // content PARTS instead of a flat string; otherwise we keep the plain-string
+    // shape to avoid churning behavior for the common text-only path.
+    let has_image = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"));
+    if has_image {
+        let mut parts = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(value) = block.get("text").and_then(Value::as_str) {
+                        if !value.is_empty() {
+                            parts.push(json!({"type": "text", "text": value}));
+                        }
+                    }
+                }
+                Some("image") => {
+                    if let Some(url) = anthropic_image_to_openai_url(block) {
+                        parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                }
+                Some("tool_result") => {
+                    if !parts.is_empty() {
+                        out.push(json!({"role": "user", "content": Value::Array(parts)}));
+                        parts = Vec::new();
+                    }
+                    let tool_call_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("toolu_local");
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": content_to_text(block.get("content").unwrap_or(&Value::Null)),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        out.push(json!({"role": role, "content": Value::Array(parts)}));
+        return;
+    }
+
     let mut user_text = String::new();
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
@@ -1546,13 +1637,32 @@ fn append_openai_messages(out: &mut Vec<Value>, message: &Value) {
                     "content": content_to_text(block.get("content").unwrap_or(&Value::Null)),
                 }));
             }
-            Some("image") => {
-                user_text.push_str("\n[image omitted by local router MVP]\n");
-            }
             _ => {}
         }
     }
     out.push(json!({"role": role, "content": user_text}));
+}
+
+/// Convert an Anthropic image block into an OpenAI `image_url` value string.
+/// `base64` sources become `data:<media_type>;base64,<data>` URLs; `url`
+/// sources pass through. Returns `None` if the block is malformed.
+fn anthropic_image_to_openai_url(block: &Value) -> Option<String> {
+    let source = block.get("source")?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str)?;
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
 }
 
 fn tool_to_openai(tool: &Value) -> Option<Value> {
@@ -1636,6 +1746,438 @@ fn openai_chat_response_to_anthropic(value: &Value, model: &str) -> Value {
             "output_tokens": value.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
         }
     })
+}
+
+/// Streaming translator state: OpenAI Chat `chat.completion.chunk` SSE in,
+/// Anthropic Messages SSE out.
+///
+/// State machine (one Anthropic block index per text run and per OpenAI tool
+/// index):
+///   - lazily emit `message_start` on the first chunk (real `id` if present,
+///     else generated; input_tokens = estimate, corrected later);
+///   - on a text fragment: open a text block if none is open
+///     (`content_block_start`), emit one `content_block_delta`/`text_delta` per
+///     fragment, and `content_block_stop` when the run ends;
+///   - on a tool_call delta: close any open text block, on the first delta for
+///     an OpenAI index open a `tool_use` block and remember name/id, then emit
+///     one `input_json_delta` per `function.arguments` fragment;
+///   - terminal chunk (`finish_reason` set) flushes open blocks, then on stream
+///     end emit `message_delta` (mapped stop_reason + output_tokens) and
+///     `message_stop`.
+///
+/// One OpenAI streamed tool call, accumulated across delta fragments.
+#[derive(Default)]
+struct ToolCallAcc {
+    index: u64,
+    id: String,
+    name: String,
+    args: String,
+}
+
+/// `output_tokens` prefers the trailing usage chunk's `completion_tokens`,
+/// otherwise falls back to a rough running estimate.
+#[derive(Default)]
+struct OpenAiSseTranslator {
+    selected_model: String,
+    estimated_input_tokens: u64,
+    /// Raw, undecoded upstream bytes awaiting a complete `\n`-terminated line.
+    /// Kept as bytes (not a String) so a multi-byte UTF-8 codepoint split across
+    /// two upstream chunks is never lossily mangled before the line is complete.
+    line_buffer: Vec<u8>,
+    message_started: bool,
+    message_id: Option<String>,
+    next_block_index: usize,
+    open_text_block: Option<usize>,
+    /// Tool calls accumulated by OpenAI `tool_calls[].index`, in first-seen order.
+    /// OpenAI may interleave argument fragments across indices, which a strictly
+    /// sequential Anthropic block stream cannot express incrementally, so we
+    /// buffer here and emit complete, non-overlapping `tool_use` blocks in
+    /// `finish`.
+    tool_calls: Vec<ToolCallAcc>,
+    saw_tool: bool,
+    finish_reason: Option<String>,
+    /// Real prompt token count from the trailing usage chunk, when present.
+    prompt_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    running_output_chars: usize,
+    saw_content: bool,
+    finished: bool,
+}
+
+impl OpenAiSseTranslator {
+    fn new(selected_model: &str, estimated_input_tokens: u64) -> Self {
+        Self {
+            selected_model: selected_model.to_owned(),
+            estimated_input_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Feed a raw byte chunk; returns Anthropic SSE text to forward downstream.
+    /// Partial trailing lines are buffered until completed by a later chunk.
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.line_buffer.extend_from_slice(bytes);
+        let mut out = String::new();
+        while let Some(line) = self.next_line() {
+            self.handle_line(&line, &mut out);
+        }
+        out
+    }
+
+    /// Pop one complete line (terminated by `\n`), trimming a trailing `\r`.
+    /// Decoding is deferred until the line is whole; `\n`/`\r` are ASCII and can
+    /// never fall inside a multi-byte codepoint, so a complete line always
+    /// decodes cleanly even when the upstream split a codepoint across chunks.
+    fn next_line(&mut self) -> Option<String> {
+        let idx = self.line_buffer.iter().position(|&b| b == b'\n')?;
+        let mut line = self.line_buffer[..idx].to_vec();
+        self.line_buffer.drain(..idx + 1);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(String::from_utf8_lossy(&line).into_owned())
+    }
+
+    fn handle_line(&mut self, line: &str, out: &mut String) {
+        let Some(payload) = line.strip_prefix("data:") else {
+            // Blank lines, comments (`:`), and event: lines carry no JSON.
+            return;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        self.handle_chunk(&value, out);
+    }
+
+    fn handle_chunk(&mut self, chunk: &Value, out: &mut String) {
+        if !self.message_started {
+            if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                self.message_id = Some(id.to_owned());
+            }
+            self.emit_message_start(out);
+        }
+
+        // Trailing usage chunk: `choices` empty, populated `usage`. With
+        // `stream_options.include_usage` this carries the REAL prompt + completion
+        // counts, which we prefer over the pre-request estimate for metrics.
+        if let Some(usage) = chunk.get("usage") {
+            if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                self.prompt_tokens = Some(prompt);
+            }
+            if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                self.output_tokens = Some(completion);
+            }
+        }
+
+        let Some(choice) = chunk.pointer("/choices/0") else {
+            return;
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    self.emit_text_fragment(text, out);
+                }
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                if !tool_calls.is_empty() {
+                    // Text (if any) is complete once tool calls begin.
+                    self.close_text_block(out);
+                }
+                for call in tool_calls {
+                    self.accumulate_tool_fragment(call);
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_owned());
+        }
+    }
+
+    fn emit_message_start(&mut self, out: &mut String) {
+        self.message_started = true;
+        let id = self
+            .message_id
+            .clone()
+            .unwrap_or_else(|| "msg_rayline_local".to_owned());
+        push_sse(
+            out,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.selected_model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": self.estimated_input_tokens, "output_tokens": 0},
+                }
+            }),
+        );
+    }
+
+    fn emit_text_fragment(&mut self, text: &str, out: &mut String) {
+        self.saw_content = true;
+        self.running_output_chars += text.chars().count();
+        let index = match self.open_text_block {
+            Some(index) => index,
+            None => {
+                let index = self.next_block_index;
+                self.next_block_index += 1;
+                self.open_text_block = Some(index);
+                push_sse(
+                    out,
+                    "content_block_start",
+                    json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                );
+                index
+            }
+        };
+        push_sse(
+            out,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+        );
+    }
+
+    fn close_text_block(&mut self, out: &mut String) {
+        if let Some(index) = self.open_text_block.take() {
+            push_sse(
+                out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            );
+        }
+    }
+
+    /// Accumulate one streamed `tool_calls[]` fragment. Nothing is emitted here;
+    /// complete, non-overlapping tool blocks are written in `finish`, because
+    /// OpenAI may interleave argument fragments across tool indices.
+    fn accumulate_tool_fragment(&mut self, call: &Value) {
+        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        self.saw_tool = true;
+        self.saw_content = true;
+        let entry = match self.tool_calls.iter().position(|tool| tool.index == index) {
+            Some(pos) => &mut self.tool_calls[pos],
+            None => {
+                self.tool_calls.push(ToolCallAcc {
+                    index,
+                    ..Default::default()
+                });
+                self.tool_calls.last_mut().unwrap()
+            }
+        };
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                entry.id = id.to_owned();
+            }
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                entry.name = name.to_owned();
+            }
+        }
+        if let Some(fragment) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            entry.args.push_str(fragment);
+        }
+    }
+
+    /// Close all open blocks and emit `message_delta` + `message_stop`.
+    fn finish(&mut self) -> String {
+        let mut out = String::new();
+        if self.finished {
+            return out;
+        }
+        self.finished = true;
+        if !self.message_started {
+            self.emit_message_start(&mut out);
+        }
+        self.close_text_block(&mut out);
+        // Emit each buffered tool call as a complete, non-overlapping `tool_use`
+        // block, in OpenAI index order. Streaming the fragments incrementally is
+        // impossible because OpenAI may interleave them across indices, which
+        // Anthropic's one-open-block-at-a-time SSE cannot represent.
+        let mut tools = std::mem::take(&mut self.tool_calls);
+        tools.sort_by_key(|tool| tool.index);
+        for tool in &tools {
+            let block_index = self.next_block_index;
+            self.next_block_index += 1;
+            let id = if tool.id.is_empty() {
+                "toolu_local"
+            } else {
+                tool.id.as_str()
+            };
+            let name = if tool.name.is_empty() {
+                "tool"
+            } else {
+                tool.name.as_str()
+            };
+            push_sse(
+                &mut out,
+                "content_block_start",
+                json!({"type":"content_block_start","index":block_index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            );
+            if !tool.args.is_empty() {
+                push_sse(
+                    &mut out,
+                    "content_block_delta",
+                    json!({"type":"content_block_delta","index":block_index,"delta":{"type":"input_json_delta","partial_json":tool.args}}),
+                );
+            }
+            push_sse(
+                &mut out,
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":block_index}),
+            );
+        }
+        let stop_reason = self.mapped_stop_reason();
+        let output_tokens = self
+            .output_tokens
+            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1));
+        push_sse(
+            &mut out,
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":Value::Null},"usage":{"output_tokens":output_tokens}}),
+        );
+        push_sse(&mut out, "message_stop", json!({"type":"message_stop"}));
+        out
+    }
+
+    fn mapped_stop_reason(&self) -> &'static str {
+        if self.saw_tool {
+            return "tool_use";
+        }
+        match self.finish_reason.as_deref() {
+            Some("tool_calls") => "tool_use",
+            Some("length") => "max_tokens",
+            _ => "end_turn",
+        }
+    }
+
+    fn output_tokens_estimate(&self) -> u64 {
+        self.output_tokens
+            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1))
+    }
+
+    /// Real prompt token count from the streamed usage chunk when present
+    /// (`stream_options.include_usage`), else the pre-request estimate.
+    fn input_tokens(&self, estimate: u64) -> u64 {
+        self.prompt_tokens.unwrap_or(estimate)
+    }
+}
+
+/// Stream OpenAI Chat SSE upstream, translating to Anthropic SSE as bytes
+/// arrive. Mirrors the side-effects of `response_from_reqwest`:
+/// `add_decision_headers`, `FirstToken` on the first content/tool delta,
+/// incremental + terminal token usage, `RequestCompleted`/`RequestErrored`.
+fn openai_chat_stream_to_anthropic(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    request_id: String,
+    estimated_input_tokens: u64,
+) -> Response<BoxBody> {
+    let selected_model = decision.selected_model.clone();
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut translator = OpenAiSseTranslator::new(&selected_model, estimated_input_tokens);
+        let mut stream = resp.bytes_stream();
+        let mut downstream_open = true;
+        let mut saw_first_token = false;
+        let mut stream_error = None;
+        record_remote_token_usage(
+            metrics.as_ref(),
+            Some(&request_id),
+            Some(estimated_input_tokens),
+            None,
+            Some(selected_model.clone()),
+        );
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let emitted = translator.push_bytes(&bytes);
+                    if !emitted.is_empty() {
+                        if !saw_first_token && translator.saw_content {
+                            saw_first_token = true;
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record(MetricsUpdate::FirstToken {
+                                    request_id: request_id.clone(),
+                                });
+                            }
+                        }
+                        if downstream_open
+                            && tx
+                                .send(Ok(Frame::data(Bytes::from(emitted))))
+                                .await
+                                .is_err()
+                        {
+                            downstream_open = false;
+                        }
+                        record_remote_token_usage(
+                            metrics.as_ref(),
+                            Some(&request_id),
+                            Some(translator.input_tokens(estimated_input_tokens)),
+                            Some(translator.output_tokens_estimate()),
+                            Some(selected_model.clone()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    if downstream_open {
+                        let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let tail = translator.finish();
+        if downstream_open && !tail.is_empty() && stream_error.is_none() {
+            let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+        }
+        let output_tokens = translator.output_tokens;
+        if let Some(metrics) = metrics.as_ref() {
+            if let Some(error) = stream_error {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    error,
+                });
+            } else {
+                if !saw_first_token {
+                    metrics.record(MetricsUpdate::FirstToken {
+                        request_id: request_id.clone(),
+                    });
+                }
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    input_tokens: Some(translator.input_tokens(estimated_input_tokens)),
+                    output_tokens: output_tokens.or(Some(translator.output_tokens_estimate())),
+                    selected_model: Some(selected_model.clone()),
+                });
+            }
+        }
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body_out)
+        .unwrap();
+    add_decision_headers(response.headers_mut(), decision);
+    response
 }
 
 fn synthetic_anthropic_sse(decision: &RouteDecision, message: &Value) -> Response<BoxBody> {
@@ -2405,5 +2947,482 @@ mod tests {
             Some(1234),
             "PromptCache emission missing: prompt_cache_tokens not recorded in sink"
         );
+    }
+
+    /// Collect the `data:` JSON payloads of emitted Anthropic SSE, in order.
+    fn sse_events(emitted: &str) -> Vec<Value> {
+        emitted
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|payload| serde_json::from_str::<Value>(payload).expect("valid sse json"))
+            .collect()
+    }
+
+    #[test]
+    fn openai_stream_emits_many_text_deltas() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 7);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(b"data: [DONE]\n\n"));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(types.first(), Some(&"message_start"));
+        // One content_block_start, then one delta PER fragment (two), then stop.
+        let text_deltas = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+            })
+            .count();
+        assert_eq!(text_deltas, 2, "expected one text_delta per fragment");
+        let concatenated: String = events
+            .iter()
+            .filter(|event| event["delta"]["type"] == "text_delta")
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(concatenated, "Hello world");
+        // message_start input estimate, message_delta carries real output tokens.
+        let start = events
+            .iter()
+            .find(|e| e["type"] == "message_start")
+            .unwrap();
+        assert_eq!(start["message"]["usage"]["input_tokens"], 7);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert_eq!(delta["usage"]["output_tokens"], 2);
+        assert_eq!(types.last(), Some(&"message_stop"));
+    }
+
+    #[test]
+    fn openai_stream_reconstructs_single_tool_call_args() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"id\":\"chatcmpl-t\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\"\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        let start = events
+            .iter()
+            .find(|e| e["type"] == "content_block_start")
+            .expect("tool block start");
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(start["content_block"]["name"], "Read");
+        assert_eq!(start["content_block"]["id"], "call_1");
+        let args: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(args, "{\"file\":\"a.rs\"}");
+        let parsed: Value = serde_json::from_str(&args).expect("reconstructed json args");
+        assert_eq!(parsed["file"], "a.rs");
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn openai_stream_handles_event_split_across_chunks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 3);
+        // First chunk ends mid-JSON-object (no trailing newline): nothing parses yet.
+        let first = t.push_bytes(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"con");
+        assert!(
+            sse_events(&first)
+                .iter()
+                .all(|e| e["type"] != "content_block_delta"),
+            "partial line must not emit a text delta yet"
+        );
+        // Second chunk completes the object and terminates the line.
+        let second = t.push_bytes(b"tent\":\"split\"}}]}\n\n");
+        let events = sse_events(&second);
+        let concatenated: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(concatenated, "split");
+    }
+
+    #[test]
+    fn openai_stream_preserves_multibyte_codepoint_split_across_chunks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 3);
+        // "café" — é is 0xC3 0xA9; split the upstream chunk *inside* that codepoint.
+        let line =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\n\n";
+        let split = line.iter().position(|&b| b == 0xc3).unwrap() + 1;
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(&line[..split]));
+        emitted.push_str(&t.push_bytes(&line[split..]));
+        emitted.push_str(&t.finish());
+
+        let text: String = sse_events(&emitted)
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(
+            text, "café",
+            "codepoint split across chunks must survive intact"
+        );
+        assert!(!text.contains('\u{FFFD}'), "no replacement character");
+    }
+
+    #[test]
+    fn openai_stream_sequential_tool_calls_emit_non_overlapping_blocks() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"f\\\":1}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"q\\\":2}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        // Block lifecycle must be strictly sequential: 0 fully closes before 1 opens.
+        let block_seq: Vec<(&str, i64)> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["type"].as_str(),
+                    Some("content_block_start") | Some("content_block_stop")
+                )
+            })
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["index"].as_i64().unwrap_or(-1),
+                )
+            })
+            .collect();
+        assert_eq!(
+            block_seq,
+            vec![
+                ("content_block_start", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_stop", 1),
+            ],
+            "two streamed tool calls must not produce overlapping Anthropic blocks"
+        );
+        let names: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .filter_map(|e| e["content_block"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Read", "Grep"]);
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    /// OpenAI may continue arguments for tool index 0 *after* index 1 has already
+    /// appeared. Buffering must reconstruct each index's args correctly and still
+    /// emit strictly non-overlapping blocks (no delta after a block's stop).
+    #[test]
+    fn openai_stream_interleaved_tool_calls_reconstruct_and_do_not_overlap() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 5);
+        let mut emitted = String::new();
+        // index 0 opens with a partial argument fragment.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n",
+        ));
+        // index 1 appears (fully) BEFORE index 0 is finished.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"Grep\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}}]}\n\n",
+        ));
+        // index 0 RESUMES with the rest of its arguments.
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.rs\\\"}\"}}]}}]}\n\n",
+        ));
+        emitted.push_str(&t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ));
+        emitted.push_str(&t.finish());
+
+        let events = sse_events(&emitted);
+        // Strictly sequential blocks: 0 fully closed before 1 opens — no delta may
+        // appear after its block's content_block_stop.
+        let block_seq: Vec<(&str, i64)> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["type"].as_str(),
+                    Some("content_block_start")
+                        | Some("content_block_delta")
+                        | Some("content_block_stop")
+                )
+            })
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["index"].as_i64().unwrap_or(-1),
+                )
+            })
+            .collect();
+        assert_eq!(
+            block_seq,
+            vec![
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+                ("content_block_stop", 1),
+            ],
+            "interleaved tool args must not produce overlapping/out-of-order blocks"
+        );
+        // Each index's interleaved fragments reconstruct to valid JSON.
+        let args: Vec<&str> = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(args, vec!["{\"path\":\"a.rs\"}", "{\"q\":\"x\"}"]);
+        for raw in &args {
+            serde_json::from_str::<Value>(raw).expect("reconstructed tool args are valid JSON");
+        }
+    }
+
+    /// The trailing usage chunk's `prompt_tokens` must be captured and preferred
+    /// over the pre-request estimate for input-token reporting.
+    #[test]
+    fn openai_stream_captures_prompt_tokens_from_usage_chunk() {
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 999);
+        let _ = t.push_bytes(
+            b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        // Before the usage chunk, fall back to the estimate.
+        assert_eq!(t.input_tokens(999), 999);
+        let _ = t.push_bytes(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = t.push_bytes(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7}}\n\n",
+        );
+        assert_eq!(t.prompt_tokens, Some(42));
+        assert_eq!(
+            t.input_tokens(999),
+            42,
+            "real prompt_tokens must win over estimate"
+        );
+        assert_eq!(t.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn image_block_becomes_openai_image_url_part() {
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what color is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+                ]
+            }]
+        });
+
+        let request = build_openai_chat_request(&body, "gpt-4o-mini", false);
+        let content = &request["messages"][0]["content"];
+        assert!(content.is_array(), "image message must use content parts");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what color is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn url_image_source_passes_through() {
+        let block = json!({"type":"image","source":{"type":"url","url":"https://x/y.png"}});
+        assert_eq!(
+            anthropic_image_to_openai_url(&block).as_deref(),
+            Some("https://x/y.png")
+        );
+    }
+
+    #[test]
+    fn text_only_user_message_keeps_string_content() {
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            }]
+        });
+        let request = build_openai_chat_request(&body, "gpt-4o-mini", true);
+        assert_eq!(request["messages"][0]["content"], "hi");
+        // Streaming requests must opt in to the trailing usage chunk.
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn max_tokens_maps_to_openai_max_completion_tokens() {
+        let body = json!({
+            "model": "gpt-5.4-mini",
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let request = build_openai_chat_request(&body, "gpt-5.4-mini", false);
+        // Newer OpenAI models (gpt-5.x, o-series) reject the deprecated `max_tokens`,
+        // so the router must translate it to `max_completion_tokens`.
+        assert_eq!(request["max_completion_tokens"], 32000);
+        assert!(
+            request.get("max_tokens").is_none(),
+            "deprecated max_tokens must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn auth_override_resolves_over_protocol_default() {
+        let mut endpoint = EndpointConfig {
+            id: "x".to_owned(),
+            kind: "provider".to_owned(),
+            protocol: EndpointProtocol::AnthropicMessages,
+            base_url: "https://example".to_owned(),
+            api_key_env: None,
+            models: vec![],
+            headers: HashMap::new(),
+            auth: None,
+        };
+        // No override: protocol default is kept.
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Anthropic),
+            AuthStyle::Anthropic
+        ));
+        endpoint.auth = Some(AuthMode::Bearer);
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Anthropic),
+            AuthStyle::Bearer
+        ));
+        endpoint.auth = Some(AuthMode::ApiKey);
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Bearer),
+            AuthStyle::Anthropic
+        ));
+    }
+
+    /// Feed bytes through the translator one byte at a time to stress the
+    /// cross-chunk line buffering, then flush. Returns the concatenated
+    /// Anthropic SSE output.
+    fn translate_byte_by_byte(translator: &mut OpenAiSseTranslator, raw: &[u8]) -> String {
+        let mut out = String::new();
+        for byte in raw {
+            out.push_str(&translator.push_bytes(&[*byte]));
+        }
+        out.push_str(&translator.finish());
+        out
+    }
+
+    // These fixtures are REAL `gpt-4o-mini` streaming responses captured from the
+    // live OpenAI API (see crates/rayline-local-router/tests/fixtures), so the
+    // translator is exercised against actual provider wire bytes — including the
+    // trailing `usage` chunk and `data: [DONE]` sentinel — fed one byte at a time.
+    #[test]
+    fn translates_real_openai_text_stream_fixture() {
+        let raw = include_bytes!("../tests/fixtures/openai_text_stream.sse");
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 18);
+        let emitted = translate_byte_by_byte(&mut t, raw);
+        let events = sse_events(&emitted);
+        let types: Vec<&str> = events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(types.first(), Some(&"message_start"));
+        assert_eq!(types.last(), Some(&"message_stop"));
+        let text_deltas = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta")
+            .count();
+        assert!(
+            text_deltas > 1,
+            "real stream must yield many text deltas, got {text_deltas}"
+        );
+        let text: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .filter_map(|e| e["delta"]["text"].as_str())
+            .collect();
+        // The model was asked to count 1..8 space separated.
+        assert!(
+            text.contains('1') && text.contains('8'),
+            "unexpected reply text: {text:?}"
+        );
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        // Output tokens come from the real trailing usage chunk (completion_tokens=15).
+        assert_eq!(delta["usage"]["output_tokens"], 15);
+    }
+
+    #[test]
+    fn translates_real_openai_tool_stream_fixture() {
+        let raw = include_bytes!("../tests/fixtures/openai_tool_stream.sse");
+        let mut t = OpenAiSseTranslator::new("gpt-4o-mini", 52);
+        let emitted = translate_byte_by_byte(&mut t, raw);
+        let events = sse_events(&emitted);
+        let tool_start = events
+            .iter()
+            .find(|e| {
+                e["type"] == "content_block_start" && e["content_block"]["type"] == "tool_use"
+            })
+            .expect("a tool_use content_block_start");
+        assert_eq!(tool_start["content_block"]["name"], "get_weather");
+        let args: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e["delta"]["partial_json"].as_str())
+            .collect();
+        let parsed: Value =
+            serde_json::from_str(&args).unwrap_or_else(|_| panic!("reconstructed args: {args:?}"));
+        assert!(
+            parsed["city"].as_str().is_some(),
+            "expected a city argument, got {parsed:?}"
+        );
+        // Provider sent finish_reason="stop", but a tool block was emitted, so we
+        // must still map to tool_use.
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["stop_reason"], "tool_use");
     }
 }
