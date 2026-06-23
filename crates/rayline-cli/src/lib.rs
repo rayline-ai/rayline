@@ -1073,7 +1073,14 @@ where
         claude_args.push(arg.clone());
     }
 
-    let local_provider_model = local_provider.and_then(|_| model.take());
+    let local_provider_model = if matches!(
+        local_provider,
+        Some(crate::providers::ProviderId::Ollama | crate::providers::ProviderId::LmStudio)
+    ) {
+        model.take()
+    } else {
+        None
+    };
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -1904,12 +1911,21 @@ mod tests {
 
     #[test]
     fn claude_local_provider_llamacpp_uses_builtin_path() {
-        let request = claude_run(&["rayline", "claude", "--local-provider", "llamacpp"]);
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--local-provider",
+            "llamacpp",
+            "--model",
+            "claude-sonnet-4-20250514",
+        ]);
         assert!(request.local_router);
         assert_eq!(
             request.local_provider,
             Some(crate::providers::ProviderId::LlamaCpp)
         );
+        assert_eq!(request.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(request.local_provider_model, None);
     }
 
     #[test]
