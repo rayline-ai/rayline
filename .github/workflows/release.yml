@@ -155,6 +155,7 @@ jobs:
         shell: bash
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           # Install minisign
@@ -163,8 +164,16 @@ jobs:
           key_file="$(mktemp)"
           trap 'rm -f "$key_file"' EXIT
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
-          # Sign SHA256SUMS
+          # Sign SHA256SUMS (covers the binaries/archives).
           minisign -S -s "$key_file" -m dist/SHA256SUMS
+          # Generate and sign the channel version pointer so `rayline update`
+          # verifies the version it is told to install before trusting it
+          # (defeats downgrade attacks). Signed separately from SHA256SUMS; the
+          # signature is over the version bytes, so the same latest.txt /
+          # latest.txt.minisig can be mirrored under any channel pointer name.
+          version="${RELEASE_TAG#v}"
+          printf '%s\n' "$version" > dist/latest.txt
+          minisign -S -s "$key_file" -m dist/latest.txt
 
       - name: Upload signed checksums
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -173,6 +182,8 @@ jobs:
           path: |
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
+            dist/latest.txt
+            dist/latest.txt.minisig
           if-no-files-found: error
 
   publish:
