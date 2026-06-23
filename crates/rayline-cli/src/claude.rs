@@ -287,11 +287,12 @@ async fn explicit_provider_config(
         "openai_chat",
     )
     .map_err(RunError::Router)?;
-    let routes = crate::providers::write_provider_routes(
+    let routes = crate::providers::write_provider_routes_for_config(
         home,
         provider,
         &crate::providers::provider_openai_base(&endpoint),
         &model,
+        request.router_config_path.as_deref(),
     )
     .map_err(|error| RunError::Router(format!("failed to write provider routes: {error}")))?;
     Ok(Some((cfg, routes)))
@@ -300,6 +301,7 @@ async fn explicit_provider_config(
 async fn provider_routes_for_config(
     home: &Path,
     cfg: &crate::local_model::LocalModelConfig,
+    explicit_config_path: Option<&Path>,
 ) -> Result<Option<PathBuf>, RunError> {
     let Some(provider) = provider_from_config(cfg) else {
         return Ok(None);
@@ -326,11 +328,12 @@ async fn provider_routes_for_config(
             provider_name = provider.as_str(),
         )));
     }
-    crate::providers::write_provider_routes(
+    crate::providers::write_provider_routes_for_config(
         home,
         provider,
         &crate::providers::provider_openai_base(&endpoint),
         model,
+        explicit_config_path,
     )
     .map(Some)
     .map_err(|error| RunError::Router(format!("failed to write provider routes: {error}")))
@@ -528,7 +531,9 @@ async fn run_command_from_home(
                     )));
                 }
             };
-            let routes = provider_routes_for_config(home, &cfg).await?;
+            let routes =
+                provider_routes_for_config(home, &cfg, request.router_config_path.as_deref())
+                    .await?;
             (cfg, routes)
         };
         let mut start_request =

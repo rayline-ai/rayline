@@ -153,9 +153,14 @@ fn normalize_provider_root(raw: &str) -> Result<String, String> {
     if stripped.is_empty() {
         return Err("provider URL must not be empty".to_owned());
     }
-    reqwest::Url::parse(stripped)
+    let with_scheme = if stripped.contains("://") {
+        stripped.to_owned()
+    } else {
+        format!("http://{stripped}")
+    };
+    reqwest::Url::parse(&with_scheme)
         .map_err(|error| format!("invalid provider URL {stripped:?}: {error}"))?;
-    Ok(stripped.trim_end_matches('/').to_owned())
+    Ok(with_scheme.trim_end_matches('/').to_owned())
 }
 
 fn validate_auto_discovery_loopback(base_url: &str) -> Result<(), String> {
@@ -267,17 +272,143 @@ pub fn provider_routes_json(id: ProviderId, base_url_v1: &str, model: &str) -> V
     })
 }
 
+pub fn provider_routes_json_with_explicit_config(
+    id: ProviderId,
+    base_url_v1: &str,
+    model: &str,
+    explicit: &Value,
+) -> Value {
+    let mut generated = provider_routes_json(id, base_url_v1, model);
+    merge_explicit_endpoints(&mut generated, explicit);
+    merge_explicit_routes(&mut generated, id, model, explicit);
+    generated
+}
+
+fn merge_explicit_endpoints(generated: &mut Value, explicit: &Value) {
+    let Some(explicit_endpoints) = explicit.get("endpoints").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(generated_endpoints) = generated.get_mut("endpoints").and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for endpoint in explicit_endpoints {
+        let endpoint = endpoint.clone();
+        let id = endpoint.get("id").and_then(Value::as_str);
+        if let Some(index) = id.and_then(|id| {
+            generated_endpoints
+                .iter()
+                .position(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+        }) {
+            generated_endpoints[index] = endpoint;
+        } else {
+            generated_endpoints.push(endpoint);
+        }
+    }
+}
+
+fn merge_explicit_routes(generated: &mut Value, id: ProviderId, model: &str, explicit: &Value) {
+    let Some(explicit_routes) = explicit.get("routes").and_then(Value::as_object) else {
+        return;
+    };
+    let routes = generated
+        .as_object_mut()
+        .expect("provider routes are an object")
+        .entry("routes")
+        .or_insert_with(|| json!({}));
+    let routes = routes
+        .as_object_mut()
+        .expect("provider route routes field is an object");
+
+    for key in ["main", "subagent", "default"] {
+        if let Some(target) = explicit_routes.get(key) {
+            routes.insert(
+                key.to_owned(),
+                rewrite_provider_route_target(id, model, target),
+            );
+        }
+    }
+
+    if let Some(model_routes) = explicit_routes
+        .get("model_routes")
+        .and_then(Value::as_object)
+    {
+        let target_map = routes
+            .entry("model_routes")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("provider model_routes field is an object");
+        for (key, target) in model_routes {
+            target_map.insert(
+                key.clone(),
+                rewrite_provider_route_target(id, model, target),
+            );
+        }
+    }
+
+    if let Some(subagents) = explicit_routes.get("subagents").and_then(Value::as_object) {
+        let rewritten = subagents
+            .iter()
+            .map(|(key, target)| {
+                (
+                    key.clone(),
+                    rewrite_provider_route_target(id, model, target),
+                )
+            })
+            .collect();
+        routes.insert("subagents".to_owned(), Value::Object(rewritten));
+    }
+}
+
+fn rewrite_provider_route_target(id: ProviderId, model: &str, target: &Value) -> Value {
+    let mut target = target.clone();
+    let Some(object) = target.as_object_mut() else {
+        return target;
+    };
+    let endpoint = object.get("endpoint").and_then(Value::as_str);
+    if endpoint == Some("local") {
+        object.insert("endpoint".to_owned(), Value::String(id.as_str().to_owned()));
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
+    } else if endpoint == Some(id.as_str())
+        && object
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(|model| model.trim().is_empty())
+    {
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+    target
+}
+
 pub fn write_provider_routes(
     home: &Path,
     id: ProviderId,
     base_url_v1: &str,
     model: &str,
 ) -> io::Result<PathBuf> {
+    write_provider_routes_for_config(home, id, base_url_v1, model, None)
+}
+
+pub fn write_provider_routes_for_config(
+    home: &Path,
+    id: ProviderId,
+    base_url_v1: &str,
+    model: &str,
+    explicit_config_path: Option<&Path>,
+) -> io::Result<PathBuf> {
     let dir = home.join(crate::ROUTER_STATE_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("provider-routes.json");
-    let body = serde_json::to_vec_pretty(&provider_routes_json(id, base_url_v1, model))
-        .map_err(io::Error::other)?;
+    let value = match explicit_config_path {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)?;
+            let explicit = serde_json::from_str::<Value>(&raw).map_err(io::Error::other)?;
+            provider_routes_json_with_explicit_config(id, base_url_v1, model, &explicit)
+        }
+        None => provider_routes_json(id, base_url_v1, model),
+    };
+    let body = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -379,6 +510,15 @@ mod tests {
     }
 
     #[test]
+    fn provider_endpoint_accepts_bare_host_port_env() {
+        with_env("OLLAMA_HOST", Some("127.0.0.1:11434"), || {
+            let endpoint = provider_endpoint(ProviderId::Ollama).unwrap().unwrap();
+            assert_eq!(endpoint.base_url, "http://127.0.0.1:11434");
+            assert_eq!(endpoint.source, EndpointSource::Env("OLLAMA_HOST"));
+        });
+    }
+
+    #[test]
     fn provider_endpoint_rejects_remote_env_for_auto_discovery() {
         with_env("OLLAMA_HOST", Some("http://10.0.0.4:11434"), || {
             assert!(provider_endpoint(ProviderId::Ollama).is_err());
@@ -422,6 +562,55 @@ mod tests {
         assert_eq!(
             value["routes"]["model_routes"]["rayline-local"]["endpoint"],
             "ollama"
+        );
+    }
+
+    #[test]
+    fn provider_routes_merge_explicit_config_preserves_subagent_allowlist() {
+        let explicit = json!({
+            "endpoints": [{
+                "id": "openrouter",
+                "protocol": "openai_chat",
+                "base_url": "https://openrouter.ai/api/v1",
+                "models": ["openai/gpt-5.2"]
+            }],
+            "routes": {
+                "subagents": {
+                    "Explore": { "endpoint": "local" }
+                },
+                "model_routes": {
+                    "custom-reviewer": {
+                        "endpoint": "openrouter",
+                        "model": "openai/gpt-5.2"
+                    }
+                }
+            }
+        });
+        let value = provider_routes_json_with_explicit_config(
+            ProviderId::Ollama,
+            "http://localhost:11434/v1",
+            "qwen3-coder:30b",
+            &explicit,
+        );
+        let subagents = value["routes"]["subagents"].as_object().unwrap();
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents["Explore"]["endpoint"], "ollama");
+        assert_eq!(subagents["Explore"]["model"], "qwen3-coder:30b");
+        assert!(subagents.get("codebase-locator").is_none());
+        assert_eq!(
+            value["routes"]["model_routes"]["rayline-subagent"]["endpoint"],
+            "ollama"
+        );
+        assert_eq!(
+            value["routes"]["model_routes"]["custom-reviewer"]["endpoint"],
+            "openrouter"
+        );
+        let endpoints = value["endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|endpoint| endpoint["id"] == "ollama"));
+        assert!(
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint["id"] == "openrouter")
         );
     }
 }
