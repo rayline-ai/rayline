@@ -382,6 +382,18 @@ fn provider_from_config(
     }
 }
 
+fn provider_config_cloud_fallback(
+    request_local_router: bool,
+    routing_mode: RoutingMode,
+    isolated: bool,
+    enable_local_router: bool,
+    local_cfg: Option<&crate::local_model::LocalModelConfig>,
+) -> bool {
+    !request_local_router
+        && local_cfg.is_some_and(|cfg| provider_from_config(cfg).is_some())
+        && implicit_local_engages(routing_mode, isolated, enable_local_router)
+}
+
 fn provider_unavailable_error(
     provider: crate::providers::ProviderId,
     base_url: &str,
@@ -544,6 +556,13 @@ async fn run_command_from_home(
         .as_ref()
         .map(enable_local_router_from_router_settings)
         .unwrap_or(false);
+    let provider_cloud_fallback = provider_config_cloud_fallback(
+        request.local_router,
+        request.routing_mode,
+        request.isolated,
+        enable_local_router,
+        local_cfg.as_ref(),
+    );
     let local_start_request = if request.local_router {
         let provider_config = explicit_provider_config(request, home).await?;
         let (cfg, provider_routes_path) = if let Some((cfg, routes)) = provider_config {
@@ -743,23 +762,24 @@ async fn run_command_from_home(
             // running with its model loaded — wasting RAM/GPU and holding the
             // shared proxy port this non-isolated cloud launch is about to
             // rebind (`configure_proxy_env` → `start_proxy_from_home`). Stop it
-            // so the replacement proxy can take the port, but only when the
-            // account toggle is *confirmed* off: `settings.is_some()` rules out
-            // a failed `/v1/settings` fetch (and the not-engageable config
-            // case), where the server gate may still be on and an existing
-            // session is legitimately routing local. Gated to non-isolated
-            // proxy mode — `--isolated` uses a private port and override mode
-            // starts no proxy, so neither replaces the embedded proxy. The
-            // helper further restricts the stop to a daemon that actually owns
-            // this proxy port. Placed after the conflict check commits, so a
-            // cancelled launch never tears the daemon down without a successor;
-            // and we preflight the daemon binary the replacement proxy needs
-            // (`resolve_rld_bin`) so a launch that could not start its own proxy
-            // never performs the destructive stop and strands the session.
-            let toggle_confirmed_off = settings.is_some() && !enable_local_router;
+            // so the replacement proxy can take the port. This is allowed only
+            // when this launch is definitively cloud-only for the shared proxy:
+            // either the account toggle is confirmed off, or the toggle is on
+            // but the saved local provider requires explicit `--local` and this
+            // run already warned that it is falling back to cloud routing.
+            // Gated to non-isolated proxy mode — `--isolated` uses a private
+            // port and override mode starts no proxy. The helper further
+            // restricts the stop to a daemon that actually owns this proxy port.
+            // Placed after the conflict check commits, so a cancelled launch
+            // never tears the daemon down without a successor; and we preflight
+            // the daemon binary the replacement proxy needs (`resolve_rld_bin`)
+            // so a launch that could not start its own proxy never performs the
+            // destructive stop and strands the session.
+            let cloud_launch_replaces_local_proxy =
+                (settings.is_some() && !enable_local_router) || provider_cloud_fallback;
             if local_start_request.is_none()
                 && !isolated
-                && toggle_confirmed_off
+                && cloud_launch_replaces_local_proxy
                 && crate::router::resolve_rld_bin(home).is_ok()
             {
                 let proxy_port = resolve_proxy_port(false)?;
@@ -2415,6 +2435,56 @@ mod local_provider_tests {
         cfg.model_sha256 = None;
 
         assert!(coerce_llamacpp_config(cfg).is_none());
+    }
+
+    #[test]
+    fn provider_config_cloud_fallback_requires_implicit_shared_proxy_provider() {
+        let provider_cfg = config_with_recommended_pick(crate::local_model::LocalModelMode::Custom);
+        let mut non_provider_cfg = provider_cfg.clone();
+        non_provider_cfg.protocol = Some("anthropic_messages".to_owned());
+
+        assert!(provider_config_cloud_fallback(
+            false,
+            RoutingMode::Proxy,
+            false,
+            true,
+            Some(&provider_cfg),
+        ));
+        assert!(!provider_config_cloud_fallback(
+            true,
+            RoutingMode::Proxy,
+            false,
+            true,
+            Some(&provider_cfg),
+        ));
+        assert!(!provider_config_cloud_fallback(
+            false,
+            RoutingMode::Override,
+            false,
+            true,
+            Some(&provider_cfg),
+        ));
+        assert!(!provider_config_cloud_fallback(
+            false,
+            RoutingMode::Proxy,
+            true,
+            true,
+            Some(&provider_cfg),
+        ));
+        assert!(!provider_config_cloud_fallback(
+            false,
+            RoutingMode::Proxy,
+            false,
+            false,
+            Some(&provider_cfg),
+        ));
+        assert!(!provider_config_cloud_fallback(
+            false,
+            RoutingMode::Proxy,
+            false,
+            true,
+            Some(&non_provider_cfg),
+        ));
     }
 }
 

@@ -296,12 +296,16 @@ pub fn provider_routes_json_with_explicit_config(
     explicit: &Value,
 ) -> Value {
     let mut generated = provider_routes_json(id, base_url_v1, model);
-    merge_explicit_endpoints(&mut generated, explicit);
+    merge_explicit_endpoints(&mut generated, explicit, id);
     merge_explicit_routes(&mut generated, id, model, explicit);
     generated
 }
 
-fn merge_explicit_endpoints(generated: &mut Value, explicit: &Value) {
+fn merge_explicit_endpoints(
+    generated: &mut Value,
+    explicit: &Value,
+    selected_provider: ProviderId,
+) {
     let Some(explicit_endpoints) = explicit.get("endpoints").and_then(Value::as_array) else {
         return;
     };
@@ -313,6 +317,9 @@ fn merge_explicit_endpoints(generated: &mut Value, explicit: &Value) {
     for endpoint in explicit_endpoints {
         let endpoint = endpoint.clone();
         let id = endpoint.get("id").and_then(Value::as_str);
+        if id == Some(selected_provider.as_str()) {
+            continue;
+        }
         if let Some(index) = id.and_then(|id| {
             generated_endpoints
                 .iter()
@@ -674,6 +681,45 @@ mod tests {
             endpoints
                 .iter()
                 .any(|endpoint| endpoint["id"] == "openrouter")
+        );
+    }
+
+    #[test]
+    fn provider_routes_merge_keeps_generated_provider_endpoint_on_id_collision() {
+        let explicit = json!({
+            "endpoints": [{
+                "id": "ollama",
+                "protocol": "openai_chat",
+                "base_url": "http://stale.example/v1",
+                "models": ["stale-model"]
+            }],
+            "routes": {
+                "subagents": {
+                    "Explore": { "endpoint": "local" }
+                }
+            }
+        });
+        let value = provider_routes_json_with_explicit_config(
+            ProviderId::Ollama,
+            "http://localhost:11434/v1",
+            "qwen3-coder:30b",
+            &explicit,
+        );
+        let endpoints = value["endpoints"].as_array().unwrap();
+        let ollama = endpoints
+            .iter()
+            .find(|endpoint| endpoint["id"] == "ollama")
+            .unwrap();
+
+        assert_eq!(ollama["base_url"], "http://localhost:11434/v1");
+        assert_eq!(ollama["models"][0], "qwen3-coder:30b");
+        assert_eq!(
+            value["routes"]["subagents"]["Explore"]["endpoint"],
+            "ollama"
+        );
+        assert_eq!(
+            value["routes"]["subagents"]["Explore"]["model"],
+            "qwen3-coder:30b"
         );
     }
 
