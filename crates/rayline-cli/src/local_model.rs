@@ -67,6 +67,8 @@ pub struct SavedCustomEndpoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalModelConfig {
     pub mode: LocalModelMode,
+    pub provider: Option<String>,
+    pub protocol: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     /// Curated catalog id of the recommended pick (e.g. `qwen3.6-27b-q4km`).
@@ -156,6 +158,8 @@ pub fn read_from_home(home: &Path) -> Option<LocalModelConfig> {
     };
     let base_url = string_field("base_url");
     let model = string_field("model");
+    let provider = string_field("provider");
+    let protocol = string_field("protocol");
     let model_id = string_field("model_id");
     let model_repo = string_field("model_repo");
     let model_file = string_field("model_file");
@@ -204,6 +208,8 @@ pub fn read_from_home(home: &Path) -> Option<LocalModelConfig> {
 
     Some(LocalModelConfig {
         mode,
+        provider,
+        protocol,
         base_url,
         model,
         model_id,
@@ -232,6 +238,8 @@ pub(crate) fn set_recommended_in_home(
     let existing = read_from_home(home);
     let config = LocalModelConfig {
         mode: LocalModelMode::Recommended,
+        provider: Some("llamacpp".to_owned()),
+        protocol: Some("anthropic_messages".to_owned()),
         base_url: existing.as_ref().and_then(|c| c.base_url.clone()),
         model: existing.and_then(|c| c.model),
         model_id: Some(model.id.clone()),
@@ -304,6 +312,8 @@ fn set_custom_in_home(
 
     let config = LocalModelConfig {
         mode: LocalModelMode::Custom,
+        provider: None,
+        protocol: None,
         base_url: Some(base_url),
         model,
         // Preserve the recommended pick so flipping back needs no re-pick.
@@ -318,6 +328,58 @@ fn set_custom_in_home(
     Ok(config)
 }
 
+pub fn set_provider_endpoint(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    protocol: &str,
+) -> Result<LocalModelConfig, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    set_provider_endpoint_in_home(&home, provider, base_url, model, protocol)
+}
+
+pub(crate) fn set_provider_endpoint_in_home(
+    home: &Path,
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    protocol: &str,
+) -> Result<LocalModelConfig, String> {
+    let provider = provider.trim();
+    let protocol = protocol.trim();
+    let model = model.trim();
+    if provider.is_empty() {
+        return Err("provider must be non-empty".to_owned());
+    }
+    if protocol.is_empty() {
+        return Err("protocol must be non-empty".to_owned());
+    }
+    if model.is_empty() {
+        return Err("model must be non-empty".to_owned());
+    }
+    let base_url = normalize_base_url(base_url);
+    if base_url.is_empty() {
+        return Err("base URL must be non-empty".to_owned());
+    }
+
+    let existing = read_from_home(home);
+    let config = LocalModelConfig {
+        mode: LocalModelMode::Custom,
+        provider: Some(provider.to_owned()),
+        protocol: Some(protocol.to_owned()),
+        base_url: Some(base_url),
+        model: Some(model.to_owned()),
+        model_id: existing.as_ref().and_then(|c| c.model_id.clone()),
+        model_repo: existing.as_ref().and_then(|c| c.model_repo.clone()),
+        model_file: existing.as_ref().and_then(|c| c.model_file.clone()),
+        model_revision: existing.as_ref().and_then(|c| c.model_revision.clone()),
+        model_sha256: existing.and_then(|c| c.model_sha256),
+        custom_endpoints: Vec::new(),
+    };
+    write_in_home(home, &config).map_err(|error| format!("failed to write settings: {error}"))?;
+    Ok(config)
+}
+
 /// Make a saved custom endpoint the active selection (mode custom + active
 /// fields — the shape the engagement path reads). Used when a sole saved
 /// endpoint is auto-selected.
@@ -327,6 +389,8 @@ pub(crate) fn activate_custom_endpoint_in_home(
 ) -> io::Result<LocalModelConfig> {
     let mut config = read_from_home(home).unwrap_or(LocalModelConfig {
         mode: LocalModelMode::Custom,
+        provider: None,
+        protocol: None,
         base_url: None,
         model: None,
         model_id: None,
@@ -337,6 +401,8 @@ pub(crate) fn activate_custom_endpoint_in_home(
         custom_endpoints: Vec::new(),
     });
     config.mode = LocalModelMode::Custom;
+    config.provider = None;
+    config.protocol = None;
     config.base_url = Some(endpoint.base_url.clone());
     config.model = Some(endpoint.model.clone());
     write_in_home(home, &config)?;
@@ -380,6 +446,8 @@ fn write_in_home(home: &Path, config: &LocalModelConfig) -> io::Result<()> {
     );
     for (key, value) in [
         ("base_url", &config.base_url),
+        ("provider", &config.provider),
+        ("protocol", &config.protocol),
         ("model", &config.model),
         ("model_id", &config.model_id),
         ("model_repo", &config.model_repo),
@@ -460,8 +528,20 @@ fn render_show_from_home(home: &Path, server_state: Option<bool>) -> String {
                     .model
                     .as_deref()
                     .unwrap_or("(not set — pass --model)");
+                let title = match config.provider.as_deref() {
+                    Some("ollama") => "Ollama",
+                    Some("lmstudio") => "LM Studio",
+                    Some("llamacpp") => "Built-in llama.cpp",
+                    Some("custom") | None => "Custom endpoint",
+                    Some(provider) => provider,
+                };
+                let protocol_line = config
+                    .protocol
+                    .as_deref()
+                    .map(|protocol| format!("  Protocol: {protocol}\n"))
+                    .unwrap_or_default();
                 format!(
-                    "Local model: Custom endpoint\n  URL:    {url}\n  Model:  {model}\n{routing_line}\nTest it with `{cli} local test`.\n",
+                    "Local model: {title}\n  URL:    {url}\n  Model:  {model}\n{protocol_line}{routing_line}Test it with `{cli} local test`.\n",
                 )
             }
         },
@@ -598,17 +678,16 @@ async fn fetch_router_settings(
     Some(body)
 }
 
-/// Probe `{base_url}/v1/messages` with a tiny Anthropic Messages request to
-/// confirm the endpoint speaks the protocol Claude Code needs. Returns a
-/// success line, or an error explaining the failure (a 404 here usually means
-/// the server only exposes an OpenAI-compatible API, which won't work).
+/// Probe the configured local endpoint. Legacy custom endpoints are treated as
+/// Anthropic Messages; provider-tagged endpoints may use OpenAI Chat.
 pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
+    let stored = dirs::home_dir().and_then(|home| read_from_home(&home));
     let base_url = match request.base_url.as_deref() {
         Some(raw) => normalize_base_url(raw),
         None => {
-            let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
-            read_from_home(&home)
-                .and_then(|config| config.base_url)
+            stored
+                .as_ref()
+                .and_then(|config| config.base_url.clone())
                 .ok_or_else(|| {
                     format!(
                         "No custom endpoint configured. Pass --url or run: {} local custom --url <URL> --model <NAME>",
@@ -627,12 +706,28 @@ pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
-            dirs::home_dir()
-                .and_then(|home| read_from_home(&home))
-                .and_then(|config| config.model)
+            stored
+                .as_ref()
+                .and_then(|config| config.model.as_ref())
+                .cloned()
         })
         .unwrap_or_else(|| "local".to_owned());
 
+    let protocol = if request.base_url.is_some() {
+        "anthropic_messages"
+    } else {
+        stored
+            .as_ref()
+            .and_then(|config| config.protocol.as_deref())
+            .unwrap_or("anthropic_messages")
+    };
+    match protocol {
+        "openai_chat" => test_openai_chat(&base_url, &model).await,
+        _ => test_anthropic_messages(&base_url, &model).await,
+    }
+}
+
+async fn test_anthropic_messages(base_url: &str, model: &str) -> Result<String, String> {
     let url = format!("{base_url}/v1/messages");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(TEST_TIMEOUT_SECONDS))
@@ -670,5 +765,106 @@ pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
         Err(format!("{url} returned {response_status}.{hint}"))
     } else {
         Err(format!("{url} returned {response_status}: {detail}{hint}"))
+    }
+}
+
+async fn test_openai_chat(base_url: &str, model: &str) -> Result<String, String> {
+    let url = format!("{base_url}/v1/chat/completions");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(TEST_TIMEOUT_SECONDS))
+        .build()
+        .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let body = json!({
+        "model": model,
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "ping" }],
+    });
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach {url}: {error}\nIs the server running?"))?;
+
+    let response_status = response.status();
+    if response_status.is_success() {
+        return Ok(format!(
+            "Connection OK — {url} answered {response_status} for model `{model}`."
+        ));
+    }
+    let detail = response.text().await.unwrap_or_default();
+    let detail = detail.trim();
+    let hint = if response_status.as_u16() == 404 {
+        "\nA 404 here usually means the server does not expose an OpenAI-compatible Chat Completions API (`/v1/chat/completions`)."
+    } else {
+        ""
+    };
+    if detail.is_empty() {
+        Err(format!("{url} returned {response_status}.{hint}"))
+    } else {
+        Err(format!("{url} returned {response_status}: {detail}{hint}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_home() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rayline-local-model-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn provider_endpoint_round_trips_with_protocol() {
+        let home = temp_home();
+        let config = set_provider_endpoint_in_home(
+            &home,
+            "ollama",
+            "http://localhost:11434/v1",
+            "qwen3-coder:30b",
+            "openai_chat",
+        )
+        .unwrap();
+        assert!(config.is_engageable());
+        assert_eq!(config.provider.as_deref(), Some("ollama"));
+        assert_eq!(config.protocol.as_deref(), Some("openai_chat"));
+        assert_eq!(config.base_url.as_deref(), Some("http://localhost:11434"));
+        assert_eq!(config.model.as_deref(), Some("qwen3-coder:30b"));
+
+        let read = read_from_home(&home).unwrap();
+        assert_eq!(read.mode, config.mode);
+        assert_eq!(read.provider, config.provider);
+        assert_eq!(read.protocol, config.protocol);
+        assert_eq!(read.base_url, config.base_url);
+        assert_eq!(read.model, config.model);
+        assert_eq!(read.custom_endpoints.len(), 1);
+    }
+
+    #[test]
+    fn render_show_labels_provider_configs() {
+        let home = temp_home();
+        set_provider_endpoint_in_home(
+            &home,
+            "lmstudio",
+            "http://localhost:1234",
+            "qwen2.5-coder-7b",
+            "openai_chat",
+        )
+        .unwrap();
+        let rendered = render_show_from_home(&home, Some(true));
+        assert!(rendered.contains("Local model: LM Studio"));
+        assert!(rendered.contains("Protocol: openai_chat"));
+        assert!(rendered.contains("qwen2.5-coder-7b"));
     }
 }

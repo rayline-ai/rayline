@@ -199,6 +199,50 @@ rayline claude --local --route all
 - The materialized `local-default-routes.json` (written at launch under `~/.rayline/rld/`) is NOT applied — `--route all` (Proxy mode) bypasses it
 - Verify via `rayline router top`: subagent rows show `target=local`, main rows show `target=cloud`
 
+### Step 7: Local provider endpoint
+
+With Ollama running and at least one model installed:
+
+```bash
+ollama serve
+ollama list
+rayline claude --local --local-provider ollama --model <ollama-tag> -p 'Use the Explore subagent to list the top-level files in this repo.'
+```
+
+**Expected:**
+- `rayline local show` reports `Local model: Ollama`, the provider URL, the selected model, and `Protocol: openai_chat`
+- `cat ~/.config/rayline/settings.json | jq .local_model` includes `"mode": "custom"`, `"provider": "ollama"`, `"protocol": "openai_chat"`, root `"base_url": "http://localhost:11434"`, and the selected model
+- `~/.rayline/rld/provider-routes.json` contains an `openai_chat` endpoint named `ollama` plus `routes.subagents`, `routes.subagent`, and `routes.model_routes` entries pointing to that endpoint
+- `~/.rayline/rld/rl-rld.log` shows custom upstream mode and does **not** show GGUF download or bundled `llama-server spawned`
+- `rayline router top` shows Explore/subagent rows targeting the provider endpoint; main rows stay cloud
+
+Stopped-provider failure:
+
+```bash
+rayline router stop
+# stop ollama / LM Studio
+rayline claude --local --local-provider ollama --model <ollama-tag> -p 'hello'
+```
+
+**Expected:**
+- The command exits non-zero
+- The error names the provider URL and prints the start hint (`ollama serve`)
+- It does not silently fall back to cloud routing
+
+Auto-discovery picker:
+
+```bash
+ollama serve
+rayline local models
+rayline local use <provider-row-number>
+rayline claude --local -p 'hello'
+```
+
+**Expected:**
+- `rayline local models` lists detected provider models before built-in models
+- Selecting a provider row configures it immediately (no GGUF download)
+- A later bare `rayline claude --local` reuses the persisted provider config and regenerates provider routes
+
 ---
 
 ## Troubleshooting

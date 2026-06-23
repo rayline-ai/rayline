@@ -82,6 +82,8 @@ pub struct RunRequest {
     pub auth_token: Option<String>,
     pub args: Vec<OsString>,
     pub model: Option<String>,
+    pub local_provider: Option<crate::providers::ProviderId>,
+    pub local_provider_model: Option<String>,
     pub auto_compact_window: Option<u64>,
     /// Run entirely through the local static router. This bypasses hosted
     /// router auth/settings and points the local proxy/injector at the
@@ -253,6 +255,195 @@ async fn explicit_local_router_start_request(
     ))
 }
 
+async fn explicit_provider_config(
+    request: &RunRequest,
+    home: &Path,
+) -> Result<Option<(crate::local_model::LocalModelConfig, PathBuf)>, RunError> {
+    let Some(provider) = request.local_provider else {
+        return Ok(None);
+    };
+    if provider == crate::providers::ProviderId::LlamaCpp {
+        return Ok(None);
+    }
+
+    let endpoint = crate::providers::provider_endpoint(provider).map_err(RunError::Router)?;
+    let endpoint = endpoint.ok_or_else(|| {
+        RunError::Router(format!("{} has no provider endpoint", provider.label()))
+    })?;
+    let models = crate::providers::list_models_at(&endpoint)
+        .await
+        .map_err(|error| provider_unavailable_error(provider, &endpoint.base_url, &error))?;
+    let model = resolve_provider_model(
+        provider,
+        &endpoint.base_url,
+        &models,
+        request.local_provider_model.as_deref(),
+    )?;
+    let cfg = crate::local_model::set_provider_endpoint_in_home(
+        home,
+        provider.as_str(),
+        &endpoint.base_url,
+        &model,
+        "openai_chat",
+    )
+    .map_err(RunError::Router)?;
+    let routes = crate::providers::write_provider_routes(
+        home,
+        provider,
+        &crate::providers::provider_openai_base(&endpoint),
+        &model,
+    )
+    .map_err(|error| RunError::Router(format!("failed to write provider routes: {error}")))?;
+    Ok(Some((cfg, routes)))
+}
+
+async fn provider_routes_for_config(
+    home: &Path,
+    cfg: &crate::local_model::LocalModelConfig,
+) -> Result<Option<PathBuf>, RunError> {
+    let Some(provider) = provider_from_config(cfg) else {
+        return Ok(None);
+    };
+    let base_url = cfg
+        .base_url
+        .as_deref()
+        .ok_or_else(|| RunError::Router("provider config is missing base_url".to_owned()))?;
+    let model = cfg
+        .model
+        .as_deref()
+        .ok_or_else(|| RunError::Router("provider config is missing model".to_owned()))?;
+    let endpoint = crate::providers::explicit_provider_endpoint(provider, base_url)
+        .map_err(RunError::Router)?;
+    let models = crate::providers::list_models_at(&endpoint)
+        .await
+        .map_err(|error| provider_unavailable_error(provider, &endpoint.base_url, &error))?;
+    if !models.iter().any(|candidate| candidate.model == model) {
+        return Err(RunError::Router(format!(
+            "{} is running at {}, but model `{model}` was not listed. Pick another model with `{} claude --local --local-provider {provider_name}`.",
+            provider.label(),
+            endpoint.base_url,
+            crate::CLI_BIN,
+            provider_name = provider.as_str(),
+        )));
+    }
+    crate::providers::write_provider_routes(
+        home,
+        provider,
+        &crate::providers::provider_openai_base(&endpoint),
+        model,
+    )
+    .map(Some)
+    .map_err(|error| RunError::Router(format!("failed to write provider routes: {error}")))
+}
+
+fn provider_from_config(
+    cfg: &crate::local_model::LocalModelConfig,
+) -> Option<crate::providers::ProviderId> {
+    if cfg.protocol.as_deref() != Some("openai_chat") {
+        return None;
+    }
+    match cfg.provider.as_deref() {
+        Some("ollama") => Some(crate::providers::ProviderId::Ollama),
+        Some("lmstudio") => Some(crate::providers::ProviderId::LmStudio),
+        _ => None,
+    }
+}
+
+fn provider_unavailable_error(
+    provider: crate::providers::ProviderId,
+    base_url: &str,
+    detail: &str,
+) -> RunError {
+    let hint = provider
+        .start_hint()
+        .map(|hint| format!(" Start it with: {hint}"))
+        .unwrap_or_default();
+    RunError::Router(format!(
+        "{} isn't running at {base_url}.{hint}\nProbe failed: {detail}",
+        provider.label()
+    ))
+}
+
+fn resolve_provider_model(
+    provider: crate::providers::ProviderId,
+    base_url: &str,
+    models: &[crate::providers::ProviderModel],
+    requested: Option<&str>,
+) -> Result<String, RunError> {
+    if let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        if models.iter().any(|model| model.model == requested) {
+            return Ok(requested.to_owned());
+        }
+        let available = models
+            .iter()
+            .map(|model| model.model.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(RunError::Router(format!(
+            "{} at {base_url} did not list model `{requested}`. Available models: {available}",
+            provider.label(),
+        )));
+    }
+
+    if models.is_empty() {
+        return Err(RunError::Router(format!(
+            "{} is running at {base_url}, but it did not list any models.",
+            provider.label()
+        )));
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(RunError::Router(format!(
+            "No provider model specified. Run `{} claude --local --local-provider {} --model <MODEL>`.",
+            crate::CLI_BIN,
+            provider.as_str()
+        )));
+    }
+
+    eprintln!("{} · {base_url}", provider.label());
+    for (index, model) in models.iter().enumerate() {
+        let size = model
+            .size_bytes
+            .map(crate::catalog::format_bytes)
+            .unwrap_or_else(|| "external".to_owned());
+        eprintln!("  {:>3}  {:<32}  {size}", index + 1, model.model);
+    }
+    eprint!("Model number or name — Enter to cancel › ");
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| RunError::Router(format!("failed to read provider selection: {error}")))?;
+    let token = input.trim();
+    if token.is_empty() {
+        return Err(RunError::Router("No provider model chosen.".to_owned()));
+    }
+    if let Ok(index) = token.parse::<usize>() {
+        if (1..=models.len()).contains(&index) {
+            return Ok(models[index - 1].model.clone());
+        }
+    }
+    models
+        .iter()
+        .find(|model| model.model == token)
+        .map(|model| model.model.clone())
+        .ok_or_else(|| RunError::Router(format!("Unknown provider model `{token}`.")))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonState {
+    pid: u32,
+    env_vars: std::collections::BTreeMap<String, String>,
+    env_unreadable: bool,
+    spawned_by_pid: Option<u32>,
+    started_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DaemonOwner {
+    Rayline { env_name: String, mode: RoutingMode },
+    NonRayline,
+}
+
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
     let home = dirs::home_dir().ok_or(RunError::HomeNotFound)?;
     let claude_bin = find_claude_bin(&home).ok_or(RunError::ClaudeMissing)?;
@@ -321,19 +512,31 @@ async fn run_command_from_home(
         .map(enable_local_router_from_router_settings)
         .unwrap_or(false);
     let local_start_request = if request.local_router {
-        let cfg = match crate::onboarding::ensure_local_model(home, &env_name)
-            .await
-            .map_err(|error| RunError::Router(error.to_string()))?
-        {
-            crate::onboarding::LocalModelReadiness::Ready(cfg) => cfg,
-            crate::onboarding::LocalModelReadiness::NotConfigured => {
-                return Err(RunError::Router(format!(
-                    "No local model configured for `{cli} claude --local`. Run `{cli} local onboard` to set one up, or run `{cli} claude` for cloud routing.",
-                    cli = crate::CLI_BIN,
-                )));
-            }
+        let provider_config = explicit_provider_config(request, home).await?;
+        let (cfg, provider_routes_path) = if let Some((cfg, routes)) = provider_config {
+            (cfg, Some(routes))
+        } else {
+            let cfg = match crate::onboarding::ensure_local_model(home, &env_name)
+                .await
+                .map_err(|error| RunError::Router(error.to_string()))?
+            {
+                crate::onboarding::LocalModelReadiness::Ready(cfg) => *cfg,
+                crate::onboarding::LocalModelReadiness::NotConfigured => {
+                    return Err(RunError::Router(format!(
+                        "No local model configured for `{cli} claude --local`. Run `{cli} local onboard` to set one up, or run `{cli} claude` for cloud routing.",
+                        cli = crate::CLI_BIN,
+                    )));
+                }
+            };
+            let routes = provider_routes_for_config(home, &cfg).await?;
+            (cfg, routes)
         };
-        Some(explicit_local_router_start_request(&env_name, request, Some(&cfg), home).await?)
+        let mut start_request =
+            explicit_local_router_start_request(&env_name, request, Some(&cfg), home).await?;
+        if let Some(path) = provider_routes_path {
+            start_request.router_config_path = Some(path);
+        }
+        Some(start_request)
     } else {
         match local_cfg {
             Some(cfg)
@@ -343,21 +546,30 @@ async fn run_command_from_home(
                     enable_local_router,
                 ) =>
             {
-                match resolve_engageable_local_config(home, &env_name, cfg).await {
-                    Some(cfg) => {
-                        let injector_port = resolve_injector_port(request.local_injector_port)?;
-                        let mut start_request =
-                            crate::router::RouterStartRequest::defaults(request.root_env_explicit);
-                        start_request.env_name = Some(env_name.clone());
-                        start_request.router_url = router_url.to_owned();
-                        start_request.router_url_explicit = true;
-                        start_request.injector_port = injector_port;
-                        Some(crate::router::RouterStartRequest::from_local_model(
-                            &cfg,
-                            start_request,
-                        ))
+                if provider_from_config(&cfg).is_some() {
+                    eprintln!(
+                        "Warning: local routing is enabled, but the configured provider endpoint requires `{cli} claude --local`. Continuing with cloud routing.",
+                        cli = crate::CLI_BIN,
+                    );
+                    None
+                } else {
+                    match resolve_engageable_local_config(home, &env_name, cfg).await {
+                        Some(cfg) => {
+                            let injector_port = resolve_injector_port(request.local_injector_port)?;
+                            let mut start_request = crate::router::RouterStartRequest::defaults(
+                                request.root_env_explicit,
+                            );
+                            start_request.env_name = Some(env_name.clone());
+                            start_request.router_url = router_url.to_owned();
+                            start_request.router_url_explicit = true;
+                            start_request.injector_port = injector_port;
+                            Some(crate::router::RouterStartRequest::from_local_model(
+                                &cfg,
+                                start_request,
+                            ))
+                        }
+                        None => None, // warning already printed; stay cloud
                     }
-                    None => None, // warning already printed; stay cloud
                 }
             }
             _ => None,
@@ -1041,6 +1253,8 @@ async fn resolve_engageable_local_config(
                             );
                             Some(crate::local_model::LocalModelConfig {
                                 mode: crate::local_model::LocalModelMode::Recommended,
+                                provider: Some("llamacpp".to_owned()),
+                                protocol: Some("anthropic_messages".to_owned()),
                                 base_url: cfg.base_url,
                                 model: cfg.model,
                                 model_id: Some(model.id),
