@@ -562,6 +562,11 @@ pub fn render_listings_human(
         .map(|l| l.model.name.len())
         .max()
         .unwrap_or(0);
+    let max_id_w = selectable
+        .iter()
+        .map(|l| l.model.id.len())
+        .max()
+        .unwrap_or(0);
 
     // Assign 1-based numbers from ordered_selectable.
     let indexed: Vec<(usize, &ModelListing)> = selectable
@@ -583,6 +588,10 @@ pub fn render_listings_human(
             "2",
             color,
         );
+        // Model id (dim) — the token for `local use <model-id>` and scripts.
+        let id = &listing.model.id;
+        let id_pad = max_id_w.saturating_sub(id.len());
+        let id_str = paint(&format!("{id}{}", " ".repeat(id_pad)), "2", color);
 
         let mut markers = String::new();
         if recommended_id == Some(listing.model.id.as_str()) {
@@ -602,7 +611,7 @@ pub fn render_listings_human(
             _ => {}
         }
 
-        format!("  {num_str}  {padded_name}  {size_str}{markers}\n")
+        format!("  {num_str}  {padded_name}  {size_str}  {id_str}{markers}\n")
     };
 
     // Installed section
@@ -1428,6 +1437,24 @@ mod tests {
         assert!(
             line_b.contains("7.2 GB"),
             "size must be on same line as name"
+        );
+
+        // The model id is shown on the same line (the token for
+        // `local use <model-id>` and scripts).
+        assert!(
+            line_a.contains("model-a"),
+            "id must be on same line as name"
+        );
+        assert!(
+            line_b.contains("model-b"),
+            "id must be on same line as name"
+        );
+
+        // Exactly one line per model (no duplicated rows).
+        assert_eq!(
+            output.lines().filter(|l| l.contains("Model Alpha")).count(),
+            1,
+            "exactly one line per model"
         );
 
         // Selection numbers are present on the same lines.
