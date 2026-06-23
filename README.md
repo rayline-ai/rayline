@@ -49,11 +49,11 @@ not affiliated with any model provider.
 
 More clients may be supported over time.
 
-## Use Rayline From Code
+## Use Rayline From Code or Agents
 
-You can also send your own Anthropic API traffic through Rayline from a script,
-using the official Anthropic SDKs. Examples are grouped by routing path, with a
-Python and TypeScript version of each:
+You can also send your own Anthropic API traffic through Rayline — from a script
+or your own agent — using the official Anthropic SDKs. Examples are grouped by
+routing path, with a Python and TypeScript version of each:
 
 - Cloud router (point the SDK at `https://api.rayline.ai` with a router key):
   [examples/cloud/python](examples/cloud/python) ·
