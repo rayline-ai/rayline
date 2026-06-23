@@ -260,20 +260,21 @@ async fn run_wizard(home: &Path, env_name: &str) -> io::Result<OnboardingOutcome
             }
         },
         "m" => {
-            let listing = catalog::models_command(Some(env_name), false)
+            let color = io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            let listing = catalog::models_command(Some(env_name), false, color)
                 .await
                 .map_err(io::Error::other)?;
             eprint!("{listing}");
-            eprint!("Model id to use: ");
+            eprint!("Model number (or id) — Enter to skip › ");
             io::stderr().flush().ok();
-            let mut id = String::new();
-            io::stdin().read_line(&mut id)?;
-            let id = id.trim();
-            if id.is_empty() {
+            let mut token = String::new();
+            io::stdin().read_line(&mut token)?;
+            let token = token.trim();
+            if token.is_empty() {
                 eprintln!("No model chosen; staying on cloud.");
                 OnboardingOutcome::Skipped
             } else {
-                catalog::use_command(Some(env_name), id)
+                catalog::use_command(Some(env_name), token)
                     .await
                     .map_err(io::Error::other)?;
                 OnboardingOutcome::LocalModel

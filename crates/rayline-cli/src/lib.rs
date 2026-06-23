@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsString;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
@@ -194,9 +195,10 @@ Download a recommended model into the local cache without selecting it.
 ";
 
 const LOCAL_USE_HELP: &str = "\
-Usage: rayline local use <model-id>
+Usage: rayline local use <number|model-id>
 
 Select a recommended model for the built-in llama server.
+Numbers come from `rayline local models`.
 ";
 
 const LOCAL_REMOVE_HELP: &str = "\
@@ -381,7 +383,9 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::LocalModels { env_name, json } => {
-            match catalog::models_command(env_name.as_deref(), json).await {
+            let color =
+                !json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            match catalog::models_command(env_name.as_deref(), json, color).await {
                 Ok(message) => {
                     print!("{message}");
                     ExitCode::SUCCESS
