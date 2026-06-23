@@ -158,9 +158,18 @@ fn normalize_provider_root(raw: &str) -> Result<String, String> {
     } else {
         format!("http://{stripped}")
     };
-    reqwest::Url::parse(&with_scheme)
+    let mut parsed = reqwest::Url::parse(&with_scheme)
         .map_err(|error| format!("invalid provider URL {stripped:?}: {error}"))?;
-    Ok(with_scheme.trim_end_matches('/').to_owned())
+    if parsed
+        .host_str()
+        .and_then(parse_host_ip)
+        .is_some_and(|ip| ip.is_unspecified())
+    {
+        parsed
+            .set_host(Some("localhost"))
+            .map_err(|_| format!("invalid provider URL {stripped:?}: could not set host"))?;
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn validate_auto_discovery_loopback(base_url: &str) -> Result<(), String> {
@@ -170,13 +179,21 @@ fn validate_auto_discovery_loopback(base_url: &str) -> Result<(), String> {
         return Err("provider URL must include a host".to_owned());
     };
     let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        || parse_host_ip(host).is_some_and(|ip| ip.is_loopback());
     if !is_loopback {
         return Err(format!(
             "Refusing to auto-probe non-loopback provider URL {base_url}. Use an explicit custom URL path for remote providers instead."
         ));
     }
     Ok(())
+}
+
+fn parse_host_ip(host: &str) -> Option<IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse().ok()
 }
 
 async fn get_json(url: &str) -> Result<Value, String> {
@@ -403,7 +420,7 @@ pub fn write_provider_routes_for_config(
     let value = match explicit_config_path {
         Some(path) => {
             let raw = std::fs::read_to_string(path)?;
-            let explicit = serde_json::from_str::<Value>(&raw).map_err(io::Error::other)?;
+            let explicit = parse_explicit_router_config(path, &raw)?;
             provider_routes_json_with_explicit_config(id, base_url_v1, model, &explicit)
         }
         None => provider_routes_json(id, base_url_v1, model),
@@ -413,11 +430,30 @@ pub fn write_provider_routes_for_config(
     Ok(path)
 }
 
+fn parse_explicit_router_config(path: &Path, raw: &str) -> io::Result<Value> {
+    let explicit = serde_json::from_str::<Value>(raw).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse router config {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_value::<rayline_local_router::RouterConfig>(explicit.clone()).map_err(
+        |error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse router config {}: {error}", path.display()),
+            )
+        },
+    )?;
+    Ok(explicit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -448,6 +484,19 @@ mod tests {
             }
         }
         result
+    }
+
+    fn temp_home() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rayline-provider-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 
     #[test]
@@ -514,6 +563,20 @@ mod tests {
         with_env("OLLAMA_HOST", Some("127.0.0.1:11434"), || {
             let endpoint = provider_endpoint(ProviderId::Ollama).unwrap().unwrap();
             assert_eq!(endpoint.base_url, "http://127.0.0.1:11434");
+            assert_eq!(endpoint.source, EndpointSource::Env("OLLAMA_HOST"));
+        });
+    }
+
+    #[test]
+    fn provider_endpoint_maps_unspecified_bind_env_to_localhost() {
+        with_env("OLLAMA_HOST", Some("0.0.0.0:11434"), || {
+            let endpoint = provider_endpoint(ProviderId::Ollama).unwrap().unwrap();
+            assert_eq!(endpoint.base_url, "http://localhost:11434");
+            assert_eq!(endpoint.source, EndpointSource::Env("OLLAMA_HOST"));
+        });
+        with_env("OLLAMA_HOST", Some("[::]:11434"), || {
+            let endpoint = provider_endpoint(ProviderId::Ollama).unwrap().unwrap();
+            assert_eq!(endpoint.base_url, "http://localhost:11434");
             assert_eq!(endpoint.source, EndpointSource::Env("OLLAMA_HOST"));
         });
     }
@@ -611,6 +674,31 @@ mod tests {
             endpoints
                 .iter()
                 .any(|endpoint| endpoint["id"] == "openrouter")
+        );
+    }
+
+    #[test]
+    fn write_provider_routes_rejects_malformed_explicit_config() {
+        let home = temp_home();
+        let config_path = home.join("bad-routes.json");
+        std::fs::write(&config_path, r#"{"routes":{"subagents":["Explore"]}}"#).unwrap();
+
+        let error = write_provider_routes_for_config(
+            &home,
+            ProviderId::Ollama,
+            "http://localhost:11434/v1",
+            "qwen3-coder:30b",
+            Some(&config_path),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("parse router config"));
+        assert!(
+            !home
+                .join(crate::ROUTER_STATE_DIR)
+                .join("provider-routes.json")
+                .exists()
         );
     }
 }
