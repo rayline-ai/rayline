@@ -261,6 +261,19 @@ pub fn provider_openai_base(endpoint: &ProviderEndpoint) -> String {
     format!("{}/v1", endpoint.base_url.trim_end_matches('/'))
 }
 
+pub fn provider_from_local_config(
+    cfg: &crate::local_model::LocalModelConfig,
+) -> Option<ProviderId> {
+    if cfg.protocol.as_deref() != Some("openai_chat") {
+        return None;
+    }
+    match cfg.provider.as_deref().and_then(ProviderId::parse) {
+        Some(ProviderId::Ollama) => Some(ProviderId::Ollama),
+        Some(ProviderId::LmStudio) => Some(ProviderId::LmStudio),
+        _ => None,
+    }
+}
+
 pub fn provider_routes_json(id: ProviderId, base_url_v1: &str, model: &str) -> Value {
     let endpoint_id = id.as_str();
     let mut subagents = serde_json::Map::new();
@@ -412,6 +425,38 @@ pub fn write_provider_routes(
     model: &str,
 ) -> io::Result<PathBuf> {
     write_provider_routes_for_config(home, id, base_url_v1, model, None)
+}
+
+pub fn write_provider_routes_for_local_config(
+    home: &Path,
+    cfg: &crate::local_model::LocalModelConfig,
+    explicit_config_path: Option<&Path>,
+) -> io::Result<Option<PathBuf>> {
+    let Some(provider) = provider_from_local_config(cfg) else {
+        return Ok(None);
+    };
+    let base_url = cfg.base_url.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider config is missing base_url",
+        )
+    })?;
+    let model = cfg.model.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provider config is missing model",
+        )
+    })?;
+    let endpoint = explicit_provider_endpoint(provider, base_url)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    write_provider_routes_for_config(
+        home,
+        provider,
+        &provider_openai_base(&endpoint),
+        model,
+        explicit_config_path,
+    )
+    .map(Some)
 }
 
 pub fn write_provider_routes_for_config(

@@ -3,9 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::Read;
-#[cfg(target_os = "macos")]
-use std::io::Write;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
@@ -333,7 +331,7 @@ async fn provider_routes_for_config(
     cfg: &crate::local_model::LocalModelConfig,
     explicit_config_path: Option<&Path>,
 ) -> Result<Option<PathBuf>, RunError> {
-    let Some(provider) = provider_from_config(cfg) else {
+    let Some(provider) = crate::providers::provider_from_local_config(cfg) else {
         return Ok(None);
     };
     let base_url = cfg
@@ -369,29 +367,16 @@ async fn provider_routes_for_config(
     .map_err(|error| RunError::Router(format!("failed to write provider routes: {error}")))
 }
 
-fn provider_from_config(
-    cfg: &crate::local_model::LocalModelConfig,
-) -> Option<crate::providers::ProviderId> {
-    if cfg.protocol.as_deref() != Some("openai_chat") {
-        return None;
-    }
-    match cfg.provider.as_deref() {
-        Some("ollama") => Some(crate::providers::ProviderId::Ollama),
-        Some("lmstudio") => Some(crate::providers::ProviderId::LmStudio),
-        _ => None,
-    }
-}
-
 fn provider_config_cloud_fallback(
     request_local_router: bool,
     routing_mode: RoutingMode,
     isolated: bool,
-    enable_local_router: bool,
     local_cfg: Option<&crate::local_model::LocalModelConfig>,
 ) -> bool {
     !request_local_router
-        && local_cfg.is_some_and(|cfg| provider_from_config(cfg).is_some())
-        && implicit_local_engages(routing_mode, isolated, enable_local_router)
+        && is_proxy_routing_mode(routing_mode)
+        && !isolated
+        && local_cfg.is_some_and(|cfg| crate::providers::provider_from_local_config(cfg).is_some())
 }
 
 fn provider_unavailable_error(
@@ -545,7 +530,6 @@ async fn run_command_from_home(
         request.local_router,
         request.routing_mode,
         request.isolated,
-        enable_local_router,
         local_cfg.as_ref(),
     );
     let local_start_request = if request.local_router {
@@ -587,7 +571,7 @@ async fn run_command_from_home(
                     enable_local_router,
                 ) =>
             {
-                if provider_from_config(&cfg).is_some() {
+                if crate::providers::provider_from_local_config(&cfg).is_some() {
                     eprintln!(
                         "Warning: local routing is enabled, but the configured provider endpoint requires `{cli} claude --local`. Continuing with cloud routing.",
                         cli = crate::CLI_BIN,
@@ -2423,7 +2407,7 @@ mod local_provider_tests {
     }
 
     #[test]
-    fn provider_config_cloud_fallback_requires_implicit_shared_proxy_provider() {
+    fn provider_config_cloud_fallback_requires_shared_proxy_provider() {
         let provider_cfg = config_with_recommended_pick(crate::local_model::LocalModelMode::Custom);
         let mut non_provider_cfg = provider_cfg.clone();
         non_provider_cfg.protocol = Some("anthropic_messages".to_owned());
@@ -2432,42 +2416,36 @@ mod local_provider_tests {
             false,
             RoutingMode::Proxy,
             false,
-            true,
+            Some(&provider_cfg),
+        ));
+        assert!(provider_config_cloud_fallback(
+            false,
+            RoutingMode::ProxySubagents,
+            false,
             Some(&provider_cfg),
         ));
         assert!(!provider_config_cloud_fallback(
             true,
             RoutingMode::Proxy,
             false,
-            true,
             Some(&provider_cfg),
         ));
         assert!(!provider_config_cloud_fallback(
             false,
             RoutingMode::Override,
             false,
-            true,
             Some(&provider_cfg),
         ));
         assert!(!provider_config_cloud_fallback(
             false,
             RoutingMode::Proxy,
             true,
-            true,
             Some(&provider_cfg),
         ));
         assert!(!provider_config_cloud_fallback(
             false,
             RoutingMode::Proxy,
             false,
-            false,
-            Some(&provider_cfg),
-        ));
-        assert!(!provider_config_cloud_fallback(
-            false,
-            RoutingMode::Proxy,
-            false,
-            true,
             Some(&non_provider_cfg),
         ));
     }
