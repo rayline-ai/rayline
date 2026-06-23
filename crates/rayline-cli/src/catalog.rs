@@ -27,6 +27,63 @@ const SMALL_RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const CONTEXT_SMALL: u64 = 65_536;
 const CONTEXT_LARGE: u64 = 131_072;
 
+/// Leave ~10% of a budget for the OS / driver / runtime allocator. Applied to
+/// discrete-VRAM and CPU-RAM ceilings; the Apple ⅔ figure already bakes in the
+/// OS reserve, so it is used as-is.
+const MEMORY_HEADROOM_NUM: u64 = 9;
+const MEMORY_HEADROOM_DEN: u64 = 10;
+/// Apple Silicon caps GPU-wired memory at ~⅔ of unified RAM (the figure the old
+/// `fit()` comment cited). Conservative by default; advanced users can raise
+/// `iogpu.wired_limit_pct`.
+const APPLE_UNIFIED_GPU_NUM: u64 = 2;
+const APPLE_UNIFIED_GPU_DEN: u64 = 3;
+
+/// Two derived memory budgets for a machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Budgets {
+    /// Accelerator memory the model's working set must fit in.
+    ceiling_bytes: u64,
+    /// All memory the resident weights can occupy (host + device).
+    total_bytes: u64,
+}
+
+/// Derive the hot ceiling and total resident budget from detected hardware.
+/// `None` when no memory could be detected (no verdict possible).
+fn budgets(hw: &rayline_llama::HardwareInfo) -> Option<Budgets> {
+    let ram = hw.total_ram_bytes;
+    let vram = hw.gpu_vram_bytes;
+    if ram == 0 && vram == 0 {
+        return None;
+    }
+    let budgets = match hw.gpu_type.as_str() {
+        // Discrete GPU: the binding constraint is VRAM; weights may also spill
+        // to host RAM, so total = RAM + VRAM guards loadability.
+        "nvidia" if vram > 0 => Budgets {
+            ceiling_bytes: vram * MEMORY_HEADROOM_NUM / MEMORY_HEADROOM_DEN,
+            total_bytes: ram.saturating_add(vram),
+        },
+        // Apple Silicon: one unified pool; GPU-wired cap ~⅔ of RAM.
+        "apple-silicon" => Budgets {
+            ceiling_bytes: ram * APPLE_UNIFIED_GPU_NUM / APPLE_UNIFIED_GPU_DEN,
+            total_bytes: ram,
+        },
+        // CPU-only or an accelerator detection missed: budget against RAM.
+        _ => Budgets {
+            ceiling_bytes: ram * MEMORY_HEADROOM_NUM / MEMORY_HEADROOM_DEN,
+            total_bytes: ram,
+        },
+    };
+    Some(budgets)
+}
+
+/// Detect this machine's hardware once per process (cached), mirroring
+/// `detect_total_ram`'s `OnceLock`. Returns `None` only if a future detector
+/// signals total failure; today `detect_hardware` always returns a value.
+pub fn detect_hardware() -> Option<&'static rayline_llama::HardwareInfo> {
+    static HARDWARE: std::sync::OnceLock<rayline_llama::HardwareInfo> = std::sync::OnceLock::new();
+    Some(HARDWARE.get_or_init(rayline_llama::detect_hardware))
+}
+
 /// One curated registry entry (the subset of `ModelEntry` fields this CLI
 /// needs; unknown fields are ignored).
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +100,13 @@ pub struct CatalogModel {
     pub max_context_window: u64,
     pub quality_score: u64,
     pub description: String,
+    /// Mixture-of-Experts model. Defaults to `false` (dense) when the registry
+    /// omits it. Carried for the JSON payload + phase-2 MoE-aware sizing.
+    pub is_moe: bool,
+    /// Hot weight footprint (non-expert + active experts). Equals
+    /// `base_ram_bytes` for dense models. NOT used in the v1 verdict (the daemon
+    /// launches `-ngl 99`, so MoE savings can't be realized yet) — phase 2.
+    pub active_ram_bytes: u64,
 }
 
 /// Hardware fit at the recommended context length, matching the desktop's
@@ -152,6 +216,12 @@ fn parse_curated(body: &Value) -> Vec<CatalogModel> {
 fn parse_model(entry: &Value) -> Option<CatalogModel> {
     let revision = parse_revision(entry)?;
     let sha256 = parse_sha256(entry)?;
+    let base_ram_bytes = entry.get("baseRamBytes")?.as_u64()?;
+    let is_moe = entry.get("isMoe").and_then(Value::as_bool).unwrap_or(false);
+    let active_ram_bytes = entry
+        .get("activeRamBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(base_ram_bytes);
     Some(CatalogModel {
         id: string_field(entry, "id")?,
         name: string_field(entry, "name")?,
@@ -160,11 +230,13 @@ fn parse_model(entry: &Value) -> Option<CatalogModel> {
         revision,
         sha256,
         size_bytes: entry.get("sizeBytes")?.as_u64()?,
-        base_ram_bytes: entry.get("baseRamBytes")?.as_u64()?,
+        base_ram_bytes,
         kv_cache_bytes_per_token: entry.get("kvCacheBytesPerToken")?.as_u64()?,
         max_context_window: entry.get("maxContextWindow")?.as_u64()?,
         quality_score: entry.get("qualityScore")?.as_u64()?,
         description: entry.get("description")?.as_str()?.to_owned(),
+        is_moe,
+        active_ram_bytes,
     })
 }
 
@@ -193,35 +265,46 @@ fn parse_sha256(entry: &Value) -> Option<String> {
     rayline_hf::normalize_sha256(digest).ok()
 }
 
-/// RAM the model needs at the context length this machine would run it with.
-pub fn required_ram_bytes(model: &CatalogModel, total_ram_bytes: u64) -> u64 {
-    let context = if total_ram_bytes <= SMALL_RAM_BYTES {
+/// RAM the full (dense) weight set + KV cache needs at `context`.
+fn required_bytes(model: &CatalogModel, context: u64) -> u64 {
+    model
+        .base_ram_bytes
+        .saturating_add(model.kv_cache_bytes_per_token.saturating_mul(context))
+}
+
+/// Context tier for this machine, capped to the model's max window.
+fn context_for(budgets: Budgets, model: &CatalogModel) -> u64 {
+    let tier = if budgets.total_bytes <= SMALL_RAM_BYTES {
         CONTEXT_SMALL
     } else {
         CONTEXT_LARGE
-    }
-    .min(model.max_context_window);
-    model.base_ram_bytes + model.kv_cache_bytes_per_token * context
+    };
+    tier.min(model.max_context_window)
 }
 
-/// Coarse fit verdict against **total physical RAM**.
+/// Hardware-aware fit verdict. Budgets the model against this machine's
+/// accelerator ceiling (discrete VRAM / Apple unified ~⅔ cap / system RAM) with
+/// a hard loadability gate against total host+device memory. `Unknown` when
+/// hardware is absent or no memory could be detected.
 ///
-/// KNOWN LIMITATION (follow-up: GPU-aware fit + context autosizing): this
-/// compares against total RAM, but the real ceiling for the local model is
-/// the GPU memory budget, which is smaller — on Apple Silicon the OS caps
-/// GPU-wired memory at ~⅔ of RAM, and on discrete GPUs it is VRAM, not system
-/// RAM. It also assumes a fixed context tier that may not match the context
-/// the daemon actually loads. As a result a `green`/`amber` verdict can still
-/// OOM at llama-server warmup on memory-constrained machines (e.g. a 27B model
-/// on a 24GB Mac). `rayline_llama::detect_hardware()` already exposes gpu_type /
-/// gpu_vram_bytes; a future revision should budget against those and size the
-/// context to fit, passing the same value to the daemon as `RAYLINE_CTX_SIZE`.
-pub fn fit(model: &CatalogModel, total_ram_bytes: Option<u64>) -> Fit {
-    let Some(total) = total_ram_bytes.filter(|total| *total > 0) else {
+/// v1 budgets the full `base_ram_bytes` footprint (the daemon launches with no
+/// expert offload, so MoE active-param savings cannot be realized yet — phase 2).
+pub fn fit(model: &CatalogModel, hardware: Option<&rayline_llama::HardwareInfo>) -> Fit {
+    let Some(hw) = hardware else {
         return Fit::Unknown;
     };
-    let required = required_ram_bytes(model, total) as f64;
-    let ratio = required / total as f64;
+    let Some(budgets) = budgets(hw) else {
+        return Fit::Unknown;
+    };
+    if budgets.ceiling_bytes == 0 {
+        return Fit::Red;
+    }
+    let context = context_for(budgets, model);
+    let required = required_bytes(model, context);
+    if required > budgets.total_bytes {
+        return Fit::Red; // cannot even load into host+device memory
+    }
+    let ratio = required as f64 / budgets.ceiling_bytes as f64;
     if ratio <= 0.70 {
         Fit::Green
     } else if ratio <= 0.90 {
@@ -314,20 +397,63 @@ pub fn is_downloaded(model: &CatalogModel) -> bool {
 /// nothing is downloaded. Never downloads anything.
 pub async fn auto_select_downloaded(env_name: &str) -> Option<CatalogModel> {
     let models = fetch_curated(env_name).await;
-    let total_ram = detect_total_ram();
+    let hardware = detect_hardware();
     let downloaded = models.into_iter().filter(is_downloaded).collect::<Vec<_>>();
-    choose_auto_pick(downloaded, total_ram)
+    choose_auto_pick(downloaded, hardware)
 }
 
-/// Best of the already-downloaded curated models: hardware fit first, quality
-/// second. Pure so the policy is unit-testable.
-fn choose_auto_pick(downloaded: Vec<CatalogModel>, total_ram: Option<u64>) -> Option<CatalogModel> {
-    downloaded.into_iter().min_by_key(|model| {
+/// Pure recommendation core: rank by (fit, already-downloaded, quality) and
+/// return the best. `downloaded_ids` lists models already in the cache, which
+/// break a fit tie (prefer not re-downloading). Does NOT filter unfit models —
+/// callers decide whether a Red model is acceptable.
+fn recommend_from(
+    models: Vec<CatalogModel>,
+    downloaded_ids: &[String],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
+    models.into_iter().min_by_key(|model| {
+        let already_downloaded = downloaded_ids.iter().any(|id| id == &model.id);
         (
-            fit(model, total_ram).rank(),
+            fit(model, hardware).rank(),
+            u8::from(!already_downloaded), // downloaded (0) sorts before not (1)
             std::cmp::Reverse(model.quality_score),
         )
     })
+}
+
+/// Best curated model to *use* on this machine: the highest-quality model that
+/// fits (Green preferred, then Amber), preferring an already-downloaded one.
+/// Excludes models that won't fit (Red). `None` when nothing fits or the catalog
+/// is empty/unreachable. Never downloads anything.
+pub async fn recommend_for_hardware(
+    env_name: &str,
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
+    let models = fetch_curated(env_name).await;
+    let downloaded_ids = models
+        .iter()
+        .filter(|model| is_downloaded(model))
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let candidates = models
+        .into_iter()
+        .filter(|model| fit(model, hardware) != Fit::Red)
+        .collect::<Vec<_>>();
+    recommend_from(candidates, &downloaded_ids, hardware)
+}
+
+/// Best of the already-downloaded curated models: hardware fit first, quality
+/// second. Pure so the policy is unit-testable. All downloaded models remain
+/// eligible even when Red — a downloaded model beats nothing.
+fn choose_auto_pick(
+    downloaded: Vec<CatalogModel>,
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> Option<CatalogModel> {
+    let ids = downloaded
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    recommend_from(downloaded, &ids, hardware)
 }
 
 fn downloaded_path(model: &CatalogModel) -> Option<PathBuf> {
@@ -351,13 +477,13 @@ pub struct ModelListing {
 
 pub fn listings(
     models: Vec<CatalogModel>,
-    total_ram_bytes: Option<u64>,
+    hardware: Option<&rayline_llama::HardwareInfo>,
     selected_id: Option<&str>,
 ) -> Vec<ModelListing> {
     models
         .into_iter()
         .map(|model| ModelListing {
-            fit: fit(&model, total_ram_bytes),
+            fit: fit(&model, hardware),
             downloaded: is_downloaded(&model),
             selected: selected_id == Some(model.id.as_str()),
             model,
@@ -367,7 +493,11 @@ pub fn listings(
 
 /// Machine-readable `local models --json` payload (consumed by the menu bar
 /// app). One JSON object on stdout.
-pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+pub fn render_listings_json(
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+) -> String {
+    let total_ram_bytes = hardware.map(|hw| hw.total_ram_bytes);
     let models = listings
         .iter()
         .map(|listing| {
@@ -379,11 +509,14 @@ pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u
                 "size_bytes": listing.model.size_bytes,
                 "quality_score": listing.model.quality_score,
                 "description": listing.model.description,
-                "required_ram_bytes": total_ram_bytes
-                    .map(|total| required_ram_bytes(&listing.model, total)),
+                "required_ram_bytes": hardware
+                    .and_then(budgets)
+                    .map(|b| required_bytes(&listing.model, context_for(b, &listing.model))),
                 "fit": listing.fit.as_str(),
                 "downloaded": listing.downloaded,
                 "selected": listing.selected,
+                "is_moe": listing.model.is_moe,
+                "active_ram_bytes": listing.model.active_ram_bytes,
             })
         })
         .collect::<Vec<_>>();
@@ -394,72 +527,139 @@ pub fn render_listings_json(listings: &[ModelListing], total_ram_bytes: Option<u
     format!("{payload}\n")
 }
 
-/// Two sections: installed models (selectable, whatever their fit — they are
-/// already on disk) and suitable downloads (red-fit entries hidden as noise,
-/// with a count so the omission is visible).
-pub fn render_listings_human(listings: &[ModelListing], total_ram_bytes: Option<u64>) -> String {
+/// Compact single-line-per-model listing with 1-based selection numbers.
+/// Two sections: installed (downloaded) models first, then available
+/// downloads (red-fit entries hidden). `recommended_id` highlights the
+/// recommended model with a `★` marker. `color` gates all ANSI output —
+/// callers decide based on the target fd and `NO_COLOR`.
+pub fn render_listings_human(
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+    recommended_id: Option<&str>,
+    color: bool,
+) -> String {
     let cli = crate::CLI_BIN;
     let mut output = String::new();
-    match total_ram_bytes {
-        Some(total) => output.push_str(&format!(
-            "Recommended local models (this machine: {} RAM):\n",
-            format_bytes(total)
-        )),
-        None => output.push_str("Recommended local models:\n"),
-    }
 
-    let fit_label = |fit: Fit| match fit {
-        Fit::Green => "fits well",
-        Fit::Amber => "tight fit",
-        Fit::Red => "too large for this machine",
-        Fit::Unknown => "fit unknown",
-    };
-    let entry = |listing: &ModelListing| {
-        format!(
-            "{marker} {id}\n    {name} — {size}, {fit}\n    {description}\n",
-            marker = if listing.selected { "*" } else { " " },
-            id = listing.model.id,
-            name = listing.model.name,
-            size = format_bytes(listing.model.size_bytes),
-            fit = fit_label(listing.fit),
-            description = listing.model.description,
-        )
-    };
-
-    output.push_str("\nInstalled:\n");
-    let installed = listings.iter().filter(|l| l.downloaded).collect::<Vec<_>>();
-    if installed.is_empty() {
-        output.push_str("  (none yet)\n");
+    // Header
+    match hardware.map(|hw| hw.total_ram_bytes) {
+        Some(total) => {
+            let dim_part = paint(
+                &format!(" · this machine: {} RAM", format_bytes(total)),
+                "2",
+                color,
+            );
+            output.push_str(&format!("Local models{dim_part}\n"));
+        }
+        None => output.push_str("Local models\n"),
     }
-    for listing in installed {
-        output.push_str(&entry(listing));
-    }
+    output.push('\n');
 
-    output.push_str("\nAvailable to download:\n");
-    let available = listings
+    // Compute selectable order and max name width for column alignment.
+    let selectable = ordered_selectable(listings);
+    let max_name_w = selectable
         .iter()
-        .filter(|l| !l.downloaded && l.fit != Fit::Red)
-        .collect::<Vec<_>>();
+        .map(|l| l.model.name.len())
+        .max()
+        .unwrap_or(0);
+    let max_id_w = selectable
+        .iter()
+        .map(|l| l.model.id.len())
+        .max()
+        .unwrap_or(0);
+
+    // Assign 1-based numbers from ordered_selectable.
+    let indexed: Vec<(usize, &ModelListing)> = selectable
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .collect();
+    let (installed_items, available_items): (Vec<_>, Vec<_>) =
+        indexed.iter().partition(|(_, l)| l.downloaded);
+
+    // Render one model line: "  {n:>3}  {name<pad>}  {size:>8}{markers}".
+    let render_line = |(n, listing): &(usize, &ModelListing)| -> String {
+        let num_str = paint(&format!("{n:>3}"), "36", color);
+        let name = &listing.model.name;
+        let pad = max_name_w.saturating_sub(name.len());
+        let padded_name = format!("{name}{}", " ".repeat(pad));
+        let size_str = paint(
+            &format!("{:>8}", format_bytes(listing.model.size_bytes)),
+            "2",
+            color,
+        );
+        // Model id (dim) — the token for `local use <model-id>` and scripts.
+        let id = &listing.model.id;
+        let id_pad = max_id_w.saturating_sub(id.len());
+        let id_str = paint(&format!("{id}{}", " ".repeat(id_pad)), "2", color);
+
+        let mut markers = String::new();
+        if recommended_id == Some(listing.model.id.as_str()) {
+            markers.push_str(&format!("  {}", paint("★ recommended", "32", color)));
+        }
+        if listing.selected {
+            markers.push_str(&format!("  {}", paint("● selected", "36", color)));
+        }
+        match listing.fit {
+            Fit::Amber => {
+                markers.push_str(&format!("  {}", paint("· tight fit", "33", color)));
+            }
+            Fit::Red if listing.downloaded => {
+                // Red only appears in the Installed section; available filters it out.
+                markers.push_str(&format!("  {}", paint("· too large", "31", color)));
+            }
+            _ => {}
+        }
+
+        format!("  {num_str}  {padded_name}  {size_str}  {id_str}{markers}\n")
+    };
+
+    // Installed section
+    output.push_str(&format!("{}\n", paint("Installed", "2", color)));
+    if installed_items.is_empty() {
+        output.push_str(&format!("  {}\n", paint("(none yet)", "2", color)));
+    } else {
+        for item in &installed_items {
+            output.push_str(&render_line(item));
+        }
+    }
+
+    output.push('\n');
+
+    // Available to download section
+    output.push_str(&format!("{}\n", paint("Available to download", "2", color)));
     let hidden = listings
         .iter()
         .filter(|l| !l.downloaded && l.fit == Fit::Red)
         .count();
-    if available.is_empty() {
+    if available_items.is_empty() {
         output.push_str("  No models suitable to download for this machine.\n");
-    }
-    for listing in available {
-        output.push_str(&entry(listing));
+    } else {
+        for item in &available_items {
+            output.push_str(&render_line(item));
+        }
     }
     if hidden > 0 {
         output.push_str(&format!(
-            "  ({hidden} larger model{s} hidden — too large for this machine)\n",
-            s = if hidden == 1 { "" } else { "s" },
+            "  {}\n",
+            paint(
+                &format!(
+                    "({hidden} larger model{s} hidden — too large)",
+                    s = if hidden == 1 { "" } else { "s" }
+                ),
+                "2",
+                color
+            )
         ));
     }
 
-    output.push_str(&format!(
-        "\nSelect (downloading first if needed) with `{cli} local use <model-id>`.\n"
-    ));
+    // Footer
+    output.push('\n');
+    let footer = format!(
+        "Pick a number to use it (downloads first if needed) — or  {cli} local use <number|id>"
+    );
+    output.push_str(&format!("{}\n", paint(&footer, "2", color)));
+
     output
 }
 
@@ -472,6 +672,48 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.0} MB", bytes / MB)
     }
+}
+
+/// Wrap `text` in the given ANSI SGR code when `on` is true; return the text
+/// unchanged when `on` is false (e.g. non-TTY, `NO_COLOR`).
+/// Codes used: dim=2, cyan=36, green=32, yellow=33, red=31.
+fn paint(text: &str, ansi: &str, on: bool) -> String {
+    if on {
+        format!("\x1b[{ansi}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Ordered list of selectable models: installed (downloaded) models first,
+/// then available downloads (`!downloaded && fit != Red`), each group in
+/// original `listings` order. The 1-based index into this slice is the
+/// selection number shown in `render_listings_human`.
+pub fn ordered_selectable(listings: &[ModelListing]) -> Vec<&ModelListing> {
+    let installed = listings.iter().filter(|l| l.downloaded);
+    let available = listings
+        .iter()
+        .filter(|l| !l.downloaded && l.fit != Fit::Red);
+    installed.chain(available).collect()
+}
+
+/// Resolve a user-supplied selection token to a catalog model.
+/// If `token` parses as a `usize` in range `[1, ordered.len()]`, returns
+/// `ordered[n-1].model`; if it parses as a number but is out of range,
+/// returns `None`. Otherwise looks up by model id. Returns `None` when
+/// neither a valid number nor a known id.
+pub fn resolve_selection(ordered: &[&ModelListing], token: &str) -> Option<CatalogModel> {
+    if let Ok(n) = token.parse::<usize>() {
+        if n >= 1 && n <= ordered.len() {
+            return Some(ordered[n - 1].model.clone());
+        }
+        return None; // parsed as number but out of range
+    }
+    // Not a number — resolve by model id
+    ordered
+        .iter()
+        .find(|l| l.model.id == token)
+        .map(|l| l.model.clone())
 }
 
 /// Download `model` into the HF hub cache, reporting progress. With
@@ -562,12 +804,17 @@ pub async fn download(model: &CatalogModel, json: bool) -> Result<PathBuf, Strin
     Ok(path)
 }
 
-/// `<cli> local models [--json]`.
-pub async fn models_command(env_name: Option<&str>, json: bool) -> Result<String, String> {
+/// `<cli> local models [--json]`. `color` is determined by the caller based
+/// on the output fd and `NO_COLOR`; ignored when `json=true`.
+pub async fn models_command(
+    env_name: Option<&str>,
+    json: bool,
+    color: bool,
+) -> Result<String, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
     let env_name = crate::status::resolve_env(env_name, Some(&home));
     let models = fetch_curated(&env_name).await;
-    let total_ram = detect_total_ram();
+    let hardware = detect_hardware();
     // Only a Recommended-mode pick counts as the selected catalog model. In
     // Custom mode `model_id` is still populated (preserved for switching back),
     // but the active selection is the custom endpoint, not this row.
@@ -576,11 +823,26 @@ pub async fn models_command(env_name: Option<&str>, json: bool) -> Result<String
             .then_some(config.model_id)
             .flatten()
     });
-    let listings = listings(models, total_ram, selected_id.as_deref());
+    let listings = listings(models, hardware, selected_id.as_deref());
     Ok(if json {
-        render_listings_json(&listings, total_ram)
+        render_listings_json(&listings, hardware)
     } else {
-        render_listings_human(&listings, total_ram)
+        // Compute recommended_id: same policy as recommend_for_hardware —
+        // best non-Red model by (fit, already-downloaded, quality) — pure,
+        // no extra network call.
+        let downloaded_ids: Vec<String> = listings
+            .iter()
+            .filter(|l| l.downloaded)
+            .map(|l| l.model.id.clone())
+            .collect();
+        let candidates: Vec<CatalogModel> = listings
+            .iter()
+            .filter(|l| l.fit != Fit::Red)
+            .map(|l| l.model.clone())
+            .collect();
+        let recommended = recommend_from(candidates, &downloaded_ids, hardware);
+        let recommended_id = recommended.as_ref().map(|m| m.id.as_str());
+        render_listings_human(&listings, hardware, recommended_id, color)
     })
 }
 
@@ -713,10 +975,26 @@ fn should_auto_select(
     !endpoints_added && downloaded_ids == [just_downloaded]
 }
 
-/// `<cli> local use <model-id>`: download if missing, then select.
-pub async fn use_command(env_name: Option<&str>, model_id: &str) -> Result<String, String> {
+/// `<cli> local use <number|model-id>`: resolve by 1-based selection number
+/// (from `rayline local models`) or model id, download if missing, then select.
+pub async fn use_command(env_name: Option<&str>, selection: &str) -> Result<String, String> {
     let (_, models) = fetch_for_command(env_name).await?;
-    let model = find_in(&models, model_id)?;
+    let hardware = detect_hardware();
+    let listing_vec = listings(models, hardware, None);
+    let ordered = ordered_selectable(&listing_vec);
+    let model = resolve_selection(&ordered, selection).ok_or_else(|| {
+        let range = if ordered.is_empty() {
+            "no models available".to_owned()
+        } else {
+            format!("1–{}", ordered.len())
+        };
+        let ids = ordered
+            .iter()
+            .map(|l| l.model.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Unknown selection `{selection}`. Valid numbers: {range}. Valid ids: {ids}")
+    })?;
     download(&model, false).await?;
     crate::local_model::set_recommended(&model)?;
     let cli = crate::CLI_BIN;
@@ -775,6 +1053,49 @@ fn render_progress_bar(progress: &rayline_hf::DownloadProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hw(
+        total_ram_bytes: u64,
+        gpu_type: &str,
+        gpu_vram_bytes: u64,
+    ) -> rayline_llama::HardwareInfo {
+        rayline_llama::HardwareInfo {
+            total_ram_bytes,
+            gpu_type: gpu_type.to_owned(),
+            gpu_model: String::new(),
+            gpu_vram_bytes,
+            os: "test".to_owned(),
+            arch: "test".to_owned(),
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn budgets_apple_unified_caps_at_two_thirds_of_ram() {
+        let b = budgets(&hw(24 * GIB, "apple-silicon", 0)).unwrap();
+        assert_eq!(b.ceiling_bytes, 24 * GIB * 2 / 3);
+        assert_eq!(b.total_bytes, 24 * GIB);
+    }
+
+    #[test]
+    fn budgets_discrete_gpu_uses_vram_ceiling_and_summed_total() {
+        let b = budgets(&hw(32 * GIB, "nvidia", 8 * GIB)).unwrap();
+        assert_eq!(b.ceiling_bytes, 8 * GIB * 9 / 10); // 10% headroom
+        assert_eq!(b.total_bytes, 32 * GIB + 8 * GIB);
+    }
+
+    #[test]
+    fn budgets_cpu_only_uses_ram_with_headroom() {
+        let b = budgets(&hw(32 * GIB, "none", 0)).unwrap();
+        assert_eq!(b.ceiling_bytes, 32 * GIB * 9 / 10);
+        assert_eq!(b.total_bytes, 32 * GIB);
+    }
+
+    #[test]
+    fn budgets_unknown_when_no_memory_detected() {
+        assert!(budgets(&hw(0, "none", 0)).is_none());
+    }
 
     fn registry_model(id: &str, base_ram_bytes: u64) -> Value {
         json!({
@@ -911,5 +1232,400 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "qwen3.5-9b-q4km");
         assert_eq!(models[0].filename, "new.gguf");
+    }
+
+    #[test]
+    fn parse_curated_defaults_moe_fields_to_dense() {
+        let body = json!({ "models": [registry_model("dense-7b", 7)] });
+        let models = parse_curated(&body);
+        assert_eq!(models.len(), 1);
+        assert!(!models[0].is_moe);
+        assert_eq!(models[0].active_ram_bytes, models[0].base_ram_bytes);
+    }
+
+    #[test]
+    fn parse_curated_reads_moe_fields_when_present() {
+        let mut entry = registry_model("moe-35b-a3b", 35);
+        let object = entry.as_object_mut().unwrap();
+        object.insert("isMoe".to_owned(), json!(true));
+        object.insert("activeRamBytes".to_owned(), json!(3u64));
+        let body = json!({ "models": [entry] });
+        let models = parse_curated(&body);
+        assert_eq!(models.len(), 1);
+        assert!(models[0].is_moe);
+        assert_eq!(models[0].active_ram_bytes, 3);
+    }
+
+    fn fit_model(
+        base_ram_bytes: u64,
+        kv_per_token: u64,
+        max_ctx: u64,
+        quality: u64,
+    ) -> CatalogModel {
+        CatalogModel {
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            repo: "r".to_owned(),
+            filename: "f.gguf".to_owned(),
+            revision: "f".repeat(40),
+            sha256: "b".repeat(64),
+            size_bytes: base_ram_bytes,
+            base_ram_bytes,
+            kv_cache_bytes_per_token: kv_per_token,
+            max_context_window: max_ctx,
+            quality_score: quality,
+            description: "d".to_owned(),
+            is_moe: false,
+            active_ram_bytes: base_ram_bytes,
+        }
+    }
+
+    #[test]
+    fn fit_apple_unified_red_when_over_two_thirds_even_if_under_total_ram() {
+        // 20 GB model on a 24 GiB Mac: ~78% of total RAM (old verdict = Green),
+        // but > the ~16 GiB GPU-wired ceiling → Red. Regression for the false-green OOM.
+        let model = fit_model(20 * GIB, 0, 4096, 50);
+        assert_eq!(
+            fit(&model, Some(&hw(24 * GIB, "apple-silicon", 0))),
+            Fit::Red
+        );
+    }
+
+    #[test]
+    fn fit_discrete_gpu_red_when_over_vram_despite_ample_ram() {
+        let model = fit_model(12 * GIB, 0, 4096, 50);
+        assert_eq!(
+            fit(&model, Some(&hw(64 * GIB, "nvidia", 8 * GIB))),
+            Fit::Red
+        );
+    }
+
+    #[test]
+    fn fit_cpu_only_green_when_comfortably_under_ram() {
+        let model = fit_model(10 * GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, Some(&hw(64 * GIB, "none", 0))), Fit::Green);
+    }
+
+    #[test]
+    fn fit_red_when_total_footprint_exceeds_total_memory() {
+        let model = fit_model(100 * GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, Some(&hw(16 * GIB, "none", 0))), Fit::Red);
+    }
+
+    #[test]
+    fn fit_unknown_without_hardware() {
+        let model = fit_model(GIB, 0, 4096, 50);
+        assert_eq!(fit(&model, None), Fit::Unknown);
+        assert_eq!(fit(&model, Some(&hw(0, "none", 0))), Fit::Unknown);
+    }
+
+    #[test]
+    fn recommend_from_prefers_fit_then_downloaded_then_quality() {
+        let hardware = hw(64 * GIB, "none", 0);
+        let small_hi = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 90);
+            m.id = "small-hi".into();
+            m
+        };
+        let small_lo = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 50);
+            m.id = "small-lo".into();
+            m
+        };
+        let huge = {
+            let mut m = fit_model(100 * GIB, 0, 4096, 99);
+            m.id = "huge".into();
+            m
+        };
+        // Nothing downloaded → among the two green fits, higher quality wins; the
+        // red `huge` ranks last despite top quality.
+        let pick = recommend_from(
+            vec![huge.clone(), small_lo.clone(), small_hi.clone()],
+            &[],
+            Some(&hardware),
+        );
+        assert_eq!(pick.unwrap().id, "small-hi");
+    }
+
+    #[test]
+    fn recommend_from_prefers_already_downloaded_on_a_fit_tie() {
+        let hardware = hw(64 * GIB, "none", 0);
+        let a = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 70);
+            m.id = "a".into();
+            m
+        };
+        let b = {
+            let mut m = fit_model(8 * GIB, 0, 4096, 70);
+            m.id = "b".into();
+            m
+        };
+        // Same fit + quality; `b` is downloaded → preferred (avoids a download).
+        let pick = recommend_from(vec![a, b], &["b".to_owned()], Some(&hardware));
+        assert_eq!(pick.unwrap().id, "b");
+    }
+
+    // ── Compact listing (render_listings_human) ───────────────────────────
+
+    fn test_listing(
+        id: &str,
+        name: &str,
+        size_bytes: u64,
+        fit: Fit,
+        downloaded: bool,
+        selected: bool,
+    ) -> ModelListing {
+        ModelListing {
+            model: CatalogModel {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                repo: "r".to_owned(),
+                filename: "f.gguf".to_owned(),
+                revision: "f".repeat(40),
+                sha256: "b".repeat(64),
+                size_bytes,
+                base_ram_bytes: size_bytes,
+                kv_cache_bytes_per_token: 0,
+                max_context_window: 4096,
+                quality_score: 50,
+                description: "test description — should not appear in human output".to_owned(),
+                is_moe: false,
+                active_ram_bytes: size_bytes,
+            },
+            fit,
+            downloaded,
+            selected,
+        }
+    }
+
+    #[test]
+    fn render_listings_human_single_line_per_model_no_description() {
+        let listings = vec![
+            test_listing(
+                "model-a",
+                "Model Alpha",
+                4_500_000_000,
+                Fit::Green,
+                true,
+                false,
+            ),
+            test_listing(
+                "model-b",
+                "Model Beta",
+                7_200_000_000,
+                Fit::Green,
+                false,
+                false,
+            ),
+        ];
+        let output = render_listings_human(&listings, None, None, false);
+
+        // Each model has exactly one output line that contains its name AND size.
+        let line_a = output
+            .lines()
+            .find(|l| l.contains("Model Alpha"))
+            .expect("Model Alpha line");
+        assert!(
+            line_a.contains("4.5 GB"),
+            "size must be on same line as name"
+        );
+
+        let line_b = output
+            .lines()
+            .find(|l| l.contains("Model Beta"))
+            .expect("Model Beta line");
+        assert!(
+            line_b.contains("7.2 GB"),
+            "size must be on same line as name"
+        );
+
+        // The model id is shown on the same line (the token for
+        // `local use <model-id>` and scripts).
+        assert!(
+            line_a.contains("model-a"),
+            "id must be on same line as name"
+        );
+        assert!(
+            line_b.contains("model-b"),
+            "id must be on same line as name"
+        );
+
+        // Exactly one line per model (no duplicated rows).
+        assert_eq!(
+            output.lines().filter(|l| l.contains("Model Alpha")).count(),
+            1,
+            "exactly one line per model"
+        );
+
+        // Selection numbers are present on the same lines.
+        assert!(line_a.contains("  1  ") || line_a.trim_start().starts_with("1 "));
+        assert!(line_b.contains("  2  ") || line_b.trim_start().starts_with("2 "));
+
+        // No description text in human output.
+        assert!(
+            !output.contains("test description"),
+            "descriptions must not appear in human listing"
+        );
+
+        // Footer references <number|id>.
+        assert!(
+            output.contains("<number|id>"),
+            "footer must mention number|id selection"
+        );
+    }
+
+    #[test]
+    fn render_listings_human_recommended_marker() {
+        let listings = vec![
+            test_listing("model-a", "Model A", 4_000_000_000, Fit::Green, true, false),
+            test_listing(
+                "model-b",
+                "Model B",
+                8_000_000_000,
+                Fit::Green,
+                false,
+                false,
+            ),
+        ];
+        let output = render_listings_human(&listings, None, Some("model-a"), false);
+
+        let line_a = output.lines().find(|l| l.contains("Model A")).unwrap();
+        assert!(
+            line_a.contains("★ recommended"),
+            "recommended marker on model-a"
+        );
+        assert!(
+            !line_a.contains("● selected"),
+            "no selected marker on model-a"
+        );
+
+        let line_b = output.lines().find(|l| l.contains("Model B")).unwrap();
+        assert!(
+            !line_b.contains("★ recommended"),
+            "no recommended marker on model-b"
+        );
+    }
+
+    #[test]
+    fn render_listings_human_selected_marker() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            true,
+            true,
+        )];
+        let output = render_listings_human(&listings, None, None, false);
+        let line_a = output.lines().find(|l| l.contains("Model A")).unwrap();
+        assert!(line_a.contains("● selected"), "selected marker present");
+    }
+
+    #[test]
+    fn render_listings_human_color_true_contains_ansi() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            true,
+            false,
+        )];
+        let output = render_listings_human(&listings, None, None, true);
+        assert!(
+            output.contains("\x1b["),
+            "color=true must emit ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn render_listings_human_color_false_no_ansi() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            true,
+            false,
+        )];
+        let output = render_listings_human(&listings, None, None, false);
+        assert!(
+            !output.contains("\x1b["),
+            "color=false must not emit ANSI escapes"
+        );
+    }
+
+    // ── ordered_selectable ────────────────────────────────────────────────
+
+    #[test]
+    fn ordered_selectable_installed_first_then_available_red_excluded() {
+        let listings = vec![
+            test_listing("avail-green", "Avail Green", 1, Fit::Green, false, false),
+            test_listing("installed", "Installed", 1, Fit::Amber, true, false),
+            test_listing("red-unavail", "Red", 1, Fit::Red, false, false),
+        ];
+        let sel = ordered_selectable(&listings);
+        assert_eq!(sel.len(), 2, "red unavailable excluded");
+        assert_eq!(sel[0].model.id, "installed", "installed first");
+        assert_eq!(sel[1].model.id, "avail-green", "available second");
+    }
+
+    #[test]
+    fn ordered_selectable_downloaded_red_still_included() {
+        // A downloaded model with Red fit must still appear (it's on disk).
+        let listings = vec![test_listing(
+            "red-inst",
+            "Red Inst",
+            1,
+            Fit::Red,
+            true,
+            false,
+        )];
+        let sel = ordered_selectable(&listings);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].model.id, "red-inst");
+    }
+
+    // ── resolve_selection ─────────────────────────────────────────────────
+
+    fn sel_listings() -> Vec<ModelListing> {
+        vec![
+            test_listing("model-a", "Model A", 1, Fit::Green, true, false),
+            test_listing("model-b", "Model B", 1, Fit::Green, false, false),
+        ]
+    }
+
+    #[test]
+    fn resolve_selection_by_number_returns_correct_model() {
+        let ls = sel_listings();
+        let sel = ordered_selectable(&ls);
+        assert_eq!(resolve_selection(&sel, "1").unwrap().id, "model-a");
+        assert_eq!(resolve_selection(&sel, "2").unwrap().id, "model-b");
+    }
+
+    #[test]
+    fn resolve_selection_by_id_returns_correct_model() {
+        let ls = sel_listings();
+        let sel = ordered_selectable(&ls);
+        assert_eq!(resolve_selection(&sel, "model-b").unwrap().id, "model-b");
+        assert_eq!(resolve_selection(&sel, "model-a").unwrap().id, "model-a");
+    }
+
+    #[test]
+    fn resolve_selection_out_of_range_number_returns_none() {
+        let ls = sel_listings();
+        let sel = ordered_selectable(&ls);
+        assert!(resolve_selection(&sel, "0").is_none(), "0 is out of range");
+        assert!(
+            resolve_selection(&sel, "99").is_none(),
+            "99 is out of range"
+        );
+    }
+
+    #[test]
+    fn resolve_selection_unknown_id_returns_none() {
+        let ls = sel_listings();
+        let sel = ordered_selectable(&ls);
+        assert!(resolve_selection(&sel, "no-such-model").is_none());
     }
 }

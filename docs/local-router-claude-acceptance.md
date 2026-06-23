@@ -113,6 +113,94 @@ The proxy log should include:
 target=Router reason=selective_subagent_header
 ```
 
+---
+
+## `--local` Onboarding Acceptance
+
+These steps require a real machine with a TTY (no headless runner). Run them after
+the automated gate (`fmt` / `clippy` / `test`) is green.
+
+### Prerequisites
+
+```bash
+# Confirm the binary is fresh (should match current branch build)
+rayline --version
+```
+
+### Step 2: First-run onboarding (interactive wizard)
+
+```bash
+# Reset to a clean slate
+rayline local clear
+# Also remove the "onboarding" marker so the first-run wizard re-triggers.
+# (portable; macOS has no `sponge`)
+tmp=$(mktemp) && jq 'del(.onboarding)' ~/.config/rayline/settings.json > "$tmp" && mv "$tmp" ~/.config/rayline/settings.json
+
+rayline claude --local
+# (Tip: `rayline local onboard` re-runs the wizard directly, no settings edit needed.)
+```
+
+**Expected:**
+- The wizard prints the recommendation headline + 4 choices: `[Y] download & use recommended (default) / [m] see all models / [o] use my own server (Ollama / LM Studio / llama.cpp) / [s] skip — stay on cloud`
+- Choosing `[Y]` downloads and selects the recommended model
+- `cat ~/.config/rayline/settings.json | jq .local_model` shows a `local_model` block (endpoint, model_id)
+- `cat ~/.config/rayline/settings.json | jq .onboarding` shows `schema: 1`, `outcome: "local-model"`, a `completed_at` timestamp, and `cli_version`
+- After the wizard, Claude routes only `Explore`/`codebase-*` subagents locally; main thread and other agents stay cloud
+- Verify: `rayline router top` shows `policy=subagent:Explore target=local` rows; main rows stay `target=cloud`
+- Or: `grep 'policy=subagent:Explore' ~/.rayline/rld/rl-rld.log`
+
+### Step 3: Re-run + `--reset`
+
+```bash
+rayline local onboard            # wizard re-runs; keeps local_model unless changed
+rayline local onboard --reset    # clears local_model first, then wizard
+```
+
+**Expected:**
+- After `rayline local onboard`: `.onboarding.completed_at` in settings.json is updated to a newer timestamp
+- After `rayline local onboard --reset`: `.local_model` is cleared before the wizard starts, then re-filled on `[Y]`
+
+### Step 4: Non-interactive fallback
+
+```bash
+rayline local clear
+echo "" | rayline claude --local -p 'hello'
+```
+
+**Expected:**
+- No wizard prompt appears
+- A clear "No local model configured…" (or similar) message is printed
+- Non-zero exit code (`echo $?` should be non-zero)
+- `cat ~/.config/rayline/settings.json | jq .onboarding` is `null` (no marker written)
+
+### Step 5: Skipped → re-prompt
+
+```bash
+rayline local clear
+rayline claude --local        # when prompted, choose [s] (skip) → outcome "skipped"
+rayline claude --local        # MUST re-prompt even though a skip marker was recorded
+```
+
+**Expected:**
+- First run writes `.onboarding.outcome = "skipped"` to settings.json
+- Second run (with explicit `--local`) shows the wizard again — skip is not sticky for explicit `--local`
+
+### Step 6: `--route all` widens past the allowlist
+
+```bash
+rayline local clear
+rayline local use <some-model>   # configure a model without going through onboarding
+rayline claude --local --route all
+```
+
+**Expected:**
+- All subagents (not just the read-only allowlist) route locally
+- Main thread stays cloud
+- The materialized `local-default-routes.json` (written at launch under `~/.rayline/rld/`) is NOT applied — `--route all` (Proxy mode) bypasses it
+- Verify via `rayline router top`: subagent rows show `target=local`, main rows show `target=cloud`
+
+---
+
 ## Troubleshooting
 
 If Claude reports a non-Rayline Local daemon conflict, stop only the isolated

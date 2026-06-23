@@ -21,7 +21,6 @@ pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
 /// shared `rayline_metrics::DEFAULT_METRICS_PORT` (20813) so an isolated and a
 /// non-isolated cloud-only session can both expose metrics at once.
 const DEFAULT_ISOLATED_METRICS_PORT: u16 = 20814;
-pub const DEFAULT_LOCAL_ROUTER_MODEL_ID: &str = "qwen3.6-35b-a3b-q4km";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_TIMEOUT_SECONDS: u64 = 240;
 const HEALTH_TIMEOUT_DOWNLOAD_SECONDS: u64 = 3600;

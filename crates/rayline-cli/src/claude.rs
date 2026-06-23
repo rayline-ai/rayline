@@ -218,6 +218,7 @@ async fn explicit_local_router_start_request(
     env_name: &str,
     request: &RunRequest,
     local_cfg: Option<&crate::local_model::LocalModelConfig>,
+    home: &Path,
 ) -> Result<crate::router::RouterStartRequest, RunError> {
     let injector_port = resolve_injector_port(request.local_injector_port)?;
     let mut start_request =
@@ -226,40 +227,28 @@ async fn explicit_local_router_start_request(
     start_request.injector_port = injector_port;
     start_request.router_config_path = request.router_config_path.clone();
 
-    if let Some(cfg) = local_cfg.filter(|cfg| cfg.is_engageable()) {
-        return Ok(crate::router::RouterStartRequest::from_local_model(
-            cfg,
-            start_request,
-        ));
+    // Default `--local` (subagents scope) routes only the conservative read-only
+    // allowlist; materialize it as the proxy's selective config when the user
+    // didn't supply their own. `--route all` (RoutingMode::Proxy) skips this and
+    // routes all subagents to local.
+    if start_request.router_config_path.is_none()
+        && request.routing_mode == RoutingMode::ProxySubagents
+    {
+        start_request.router_config_path = Some(
+            crate::onboarding::write_default_local_routes(home).map_err(|error| {
+                RunError::Router(format!("failed to write default local routes: {error}"))
+            })?,
+        );
     }
 
-    let Some(model) = crate::catalog::fetch_curated(env_name)
-        .await
-        .into_iter()
-        .find(|model| model.id == crate::router::DEFAULT_LOCAL_ROUTER_MODEL_ID)
-    else {
-        return Err(RunError::Router(format!(
-            "No registry-pinned default local model found for `{}`. Publish it with `revision` and `sha256` in the model registry, or configure a custom endpoint with `{} local custom --url <URL> --model <NAME>`.",
-            crate::router::DEFAULT_LOCAL_ROUTER_MODEL_ID,
+    let cfg = local_cfg.filter(|cfg| cfg.is_engageable()).ok_or_else(|| {
+        RunError::Router(format!(
+            "No local model configured. Run `{} local onboard`.",
             crate::CLI_BIN
-        )));
-    };
-
-    let cfg = crate::local_model::LocalModelConfig {
-        mode: crate::local_model::LocalModelMode::Recommended,
-        base_url: local_cfg.and_then(|cfg| cfg.base_url.clone()),
-        model: local_cfg.and_then(|cfg| cfg.model.clone()),
-        model_id: Some(model.id),
-        model_repo: Some(model.repo),
-        model_file: Some(model.filename),
-        model_revision: Some(model.revision),
-        model_sha256: Some(model.sha256),
-        custom_endpoints: local_cfg
-            .map(|cfg| cfg.custom_endpoints.clone())
-            .unwrap_or_default(),
-    };
+        ))
+    })?;
     Ok(crate::router::RouterStartRequest::from_local_model(
-        &cfg,
+        cfg,
         start_request,
     ))
 }
@@ -326,23 +315,40 @@ async fn run_command_from_home(
         None
     };
 
-    // Engage implicit account-local routing when a `local_model` config exists,
-    // the account toggle is on, and the configured model is usable. This implicit
-    // path stays off under `--isolated` and under env (`Override`) mode, which is
-    // cloud-only by contract — see `implicit_local_engages`. Explicit
-    // `--local-router --isolated` takes the local path below and uses an isolated
+    // Explicit `--local` branch (request.local_router == true): runs first-run
+    // onboarding via `ensure_local_model`, which may download the chosen model.
+    // Returns a hard error (`NotConfigured → Err`) when no model is configured
+    // so the user gets an actionable message instead of silently falling back.
+    //
+    // Implicit account-local branch (else): engages when a `local_model` config
+    // exists, the account toggle is on, and the configured model is usable. This
+    // implicit path stays off under `--isolated` and under env (`Override`) mode,
+    // which is cloud-only by contract — see `implicit_local_engages`. Explicit
+    // `--local-router --isolated` takes the local path above and uses an isolated
     // proxy sidecar. A failed settings fetch defaults the toggle to false (stay
     // cloud). The model always comes from the config (recommended pick, or the
     // user's custom endpoint); when none is picked yet, the best
-    // already-downloaded curated model is adopted as the pick — `claude` itself
-    // never downloads anything, and an unusable config warns + launches with
+    // already-downloaded curated model is adopted as the pick — this implicit
+    // path never downloads anything, and an unusable config warns + launches with
     // cloud routing instead of blocking.
     let enable_local_router = settings
         .as_ref()
         .map(enable_local_router_from_router_settings)
         .unwrap_or(false);
     let local_start_request = if request.local_router {
-        Some(explicit_local_router_start_request(&env_name, request, local_cfg.as_ref()).await?)
+        let cfg = match crate::onboarding::ensure_local_model(home, &env_name)
+            .await
+            .map_err(|error| RunError::Router(error.to_string()))?
+        {
+            crate::onboarding::LocalModelReadiness::Ready(cfg) => cfg,
+            crate::onboarding::LocalModelReadiness::NotConfigured => {
+                return Err(RunError::Router(format!(
+                    "No local model configured for `{cli} claude --local`. Run `{cli} local onboard` to set one up, or run `{cli} claude` for cloud routing.",
+                    cli = crate::CLI_BIN,
+                )));
+            }
+        };
+        Some(explicit_local_router_start_request(&env_name, request, Some(&cfg), home).await?)
     } else {
         match local_cfg {
             Some(cfg)

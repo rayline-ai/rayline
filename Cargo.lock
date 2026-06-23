@@ -1431,6 +1431,7 @@ dependencies = [
  "opener",
  "rand",
  "rayline-hf",
+ "rayline-llama",
  "rayline-metrics",
  "reqwest",
  "serde_json",

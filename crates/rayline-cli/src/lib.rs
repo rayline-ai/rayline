@@ -1,11 +1,13 @@
 use std::env;
 use std::ffi::OsString;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 pub mod catalog;
 pub mod claude;
 pub mod local_model;
+pub mod onboarding;
 pub mod router;
 pub mod status;
 pub mod update;
@@ -177,6 +179,7 @@ Commands:
   clear     Remove the local model configuration
   on        Turn local routing on for your account
   off       Turn local routing off for your account
+  onboard   Set up or re-pick a local model for `rayline claude --local`
 ";
 
 const LOCAL_MODELS_HELP: &str = "\
@@ -192,9 +195,10 @@ Download a recommended model into the local cache without selecting it.
 ";
 
 const LOCAL_USE_HELP: &str = "\
-Usage: rayline local use <model-id>
+Usage: rayline local use <number|model-id>
 
 Select a recommended model for the built-in llama server.
+Numbers come from `rayline local models`.
 ";
 
 const LOCAL_REMOVE_HELP: &str = "\
@@ -237,6 +241,15 @@ const LOCAL_OFF_HELP: &str = "\
 Usage: rayline local off
 
 Turn local routing off for your account.
+";
+
+const LOCAL_ONBOARD_HELP: &str = "\
+Usage: rayline local onboard [--reset]
+
+Set up (or re-pick) a local model for `rayline claude --local`.
+
+Options:
+  --reset    Clear the current local model first, then run the wizard
 ";
 
 const UPDATE_HELP: &str = "\
@@ -370,7 +383,9 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::LocalModels { env_name, json } => {
-            match catalog::models_command(env_name.as_deref(), json).await {
+            let color =
+                !json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            match catalog::models_command(env_name.as_deref(), json, color).await {
                 Ok(message) => {
                     print!("{message}");
                     ExitCode::SUCCESS
@@ -490,6 +505,15 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 }
             }
         }
+        RaylineDispatch::LocalOnboard { env_name, reset } => {
+            match onboarding::run_onboard_command(env_name.as_deref(), reset).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         RaylineDispatch::Update(request) => match update::run(&request).await {
             Ok(result) => {
                 if result.stderr {
@@ -564,6 +588,10 @@ pub enum RaylineDispatch {
     LocalOff {
         env_name: Option<String>,
         auth_token: Option<String>,
+    },
+    LocalOnboard {
+        env_name: Option<String>,
+        reset: bool,
     },
     Update(update::UpdateRequest),
     Unavailable,
@@ -1329,6 +1357,10 @@ where
             env_name: root_env,
             auth_token: root_auth_token,
         }),
+        "onboard" => parse_local_onboard(args).map(|reset| RaylineDispatch::LocalOnboard {
+            env_name: root_env,
+            reset,
+        }),
         _ => None,
     }
 }
@@ -1338,6 +1370,21 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     args.next().is_none().then_some(())
+}
+
+fn parse_local_onboard<'a, I>(mut args: std::iter::Peekable<I>) -> Option<bool>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut reset = false;
+    for arg in args.by_ref() {
+        match arg.to_str()? {
+            "--reset" => reset = true,
+            "--help" => return None,
+            _ => return None,
+        }
+    }
+    Some(reset)
 }
 
 fn parse_local_json_flag<'a, I>(mut args: std::iter::Peekable<I>) -> Option<bool>
@@ -1519,6 +1566,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["local", "clear"] => Some(LOCAL_CLEAR_HELP),
         ["local", "on"] => Some(LOCAL_ON_HELP),
         ["local", "off"] => Some(LOCAL_OFF_HELP),
+        ["local", "onboard"] => Some(LOCAL_ONBOARD_HELP),
         ["router"] => Some(ROUTER_HELP),
         ["router", "status"] => Some(ROUTER_STATUS_HELP),
         ["router", "logs"] => Some(ROUTER_LOGS_HELP),
@@ -1986,6 +2034,29 @@ mod tests {
                 "{env_name:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn public_parser_accepts_local_onboard() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "local", "onboard"])),
+            RaylineDispatch::LocalOnboard {
+                env_name: None,
+                reset: false
+            }
+        );
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "local", "onboard", "--reset"])),
+            RaylineDispatch::LocalOnboard {
+                env_name: None,
+                reset: true
+            }
+        );
+    }
+
+    #[test]
+    fn local_onboard_has_native_help() {
+        assert!(rayline_help_for_argv(&argv(&["rayline", "local", "onboard", "--help"])).is_some());
     }
 
     #[test]
