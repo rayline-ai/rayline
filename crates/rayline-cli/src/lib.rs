@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 
 pub mod catalog;
 pub mod claude;
+pub(crate) mod claude_daemon;
 pub mod local_model;
 pub mod onboarding;
 pub mod router;
