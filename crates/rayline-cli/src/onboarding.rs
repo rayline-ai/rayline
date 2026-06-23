@@ -316,16 +316,28 @@ async fn run_wizard(home: &Path, env_name: &str) -> io::Result<OnboardingOutcome
             outcome,
         },
     )?;
+
+    // Now that a model is configured, offer to map which subagents route to it.
+    // Skipped when the user stayed on cloud — there's nothing to route to yet.
+    if outcome != OnboardingOutcome::Skipped {
+        crate::discover::offer_subagent_mapping(home);
+    }
     Ok(outcome)
 }
 
 /// Write the managed default routes under the router state dir and return its
 /// path. Regenerated idempotently each launch so anchor changes roll forward.
+/// When the user has saved a per-subagent mapping (`<cli> local subagents`),
+/// that mapping is materialized instead of the hardcoded read-only allowlist.
 pub fn write_default_local_routes(home: &Path) -> io::Result<PathBuf> {
     let dir = home.join(crate::ROUTER_STATE_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("local-default-routes.json");
-    let body = serde_json::to_vec_pretty(&default_local_routes_json()).map_err(io::Error::other)?;
+    let value = match crate::discover::read_subagent_routes(home) {
+        Some(routes) if !routes.routes.is_empty() => crate::discover::routes_config_json(&routes),
+        _ => default_local_routes_json(),
+    };
+    let body = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
     Ok(path)
 }
