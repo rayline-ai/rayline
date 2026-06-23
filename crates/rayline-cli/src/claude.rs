@@ -474,21 +474,6 @@ fn resolve_provider_model(
         .ok_or_else(|| RunError::Router(format!("Unknown provider model `{token}`.")))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonState {
-    pid: u32,
-    env_vars: std::collections::BTreeMap<String, String>,
-    env_unreadable: bool,
-    spawned_by_pid: Option<u32>,
-    started_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DaemonOwner {
-    Rayline { env_name: String, mode: RoutingMode },
-    NonRayline,
-}
-
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
     let home = dirs::home_dir().ok_or(RunError::HomeNotFound)?;
     let claude_bin = find_claude_bin(&home).ok_or(RunError::ClaudeMissing)?;
