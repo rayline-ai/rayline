@@ -28,6 +28,7 @@ bytes.workspace = true
 futures.workspace = true
 tokio-stream = "0.1"
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-authcache = { path = "../rayline-authcache" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

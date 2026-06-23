@@ -42,6 +42,11 @@ pub struct RouterTotals {
     pub remote_requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Incremented each time an `agent-id` header was present but `agentType`
+    /// resolution exhausted all retries without finding the meta file.
+    /// Non-zero means Claude Code's internal schema may have changed (or a
+    /// timing/path issue). Surface in `rld status` so operators notice.
+    pub routing_uncertain: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -134,6 +139,11 @@ pub enum MetricsUpdate {
         error: String,
     },
     LlamaPerf(LlamaPerfSnapshot),
+    /// Emitted when an `agent-id` header was present but `agentType` resolution
+    /// exhausted all retries. Increments the `routing_uncertain` counter.
+    RoutingUncertain {
+        agent_id: String,
+    },
 }
 
 pub struct RouterMetrics {
@@ -369,6 +379,10 @@ impl RouterMetrics {
                 }
                 merged.updated_at_unix_ms = snapshot.updated_at_unix_ms;
                 *llama_perf = Some(merged);
+            }
+            MetricsUpdate::RoutingUncertain { .. } => {
+                let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
+                totals.routing_uncertain = totals.routing_uncertain.saturating_add(1);
             }
         }
         let _ = self.updates.send(update);

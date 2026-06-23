@@ -25,6 +25,15 @@ pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".config/rayline/claude-daemon-launches
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
 pub const RAYLINE_CHANNEL: &str = env!("RAYLINE_CHANNEL");
 
+// Production minisign public key(s) for release / self-update signature verification.
+// The matching secret key lives only in the GitHub `release` environment secret
+// MINISIGN_SECRET_KEY (see RELEASING-SIGNING.md). Rotation: add the next public key
+// alongside the current one (verification accepts any listed key), ship a release, then
+// retire the old key after users have updated.
+pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
+    "RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1", // rayline production signing key (2026-06)
+];
+
 const ROOT_HELP: &str = "\
 Usage: rayline [OPTIONS] COMMAND [ARGS]...
 

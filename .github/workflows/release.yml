@@ -125,10 +125,60 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  sign:
+    name: Sign release checksums
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 10
+    # Gate on the protected 'release' environment so signing requires human
+    # approval (configure required reviewers in repo Settings → Environments).
+    environment: release
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS SHA256SUMS.minisig
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\n' \
+            | sort \
+            | xargs sha256sum > SHA256SUMS
+
+      - name: Sign SHA256SUMS with minisign
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          # Install minisign
+          sudo apt-get install -y minisign
+          # Write the secret key to a temp file (no passphrase — set -W at key-gen time)
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
+          # Sign SHA256SUMS
+          minisign -S -s "$key_file" -m dist/SHA256SUMS
+
+      - name: Upload signed checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-checksums-signed
+          path: |
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
     runs-on: ubuntu-latest
-    needs: build
+    needs: sign
     timeout-minutes: 15
 
     steps:
@@ -152,14 +202,6 @@ jobs:
           fi
           version="${RELEASE_TAG#v}"
 
-          (
-            cd dist
-            rm -f SHA256SUMS
-            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
-              | sort \
-              | xargs sha256sum > SHA256SUMS
-          )
-
           cat > release-notes.md <<EOF
           Rayline ${version}
 
@@ -167,6 +209,7 @@ jobs:
           - \`rayline-<platform>\` and \`rld-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
           - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain both binaries plus license/readme files.
           - \`SHA256SUMS\` covers every uploaded binary and archive.
+          - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
           EOF
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

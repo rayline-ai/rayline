@@ -8,8 +8,13 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+
+pub use rayline_authcache::{
+    AuthCache, MAX_AUTH_CACHE_ENTRIES, evict_auth_cache_overflow, new_auth_cache,
+    stash_auth_headers,
+};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -26,44 +31,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub const DEFAULT_PORT: u16 = 20809;
-const MAX_AUTH_CACHE_ENTRIES: usize = 512;
-
-/// Shared map `usage_doc_id → auth headers`. Populated by the injector when the
-/// cloud router 307s; read by the adapter when it fires `/v1/usage/update`.
-/// HTTP clients strip `Authorization` across cross-origin redirects, so the
-/// adapter cannot recover the user's auth from the inbound request alone.
-pub type AuthCache = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
-
-pub fn new_auth_cache() -> AuthCache {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-fn stash_auth_headers(cache: &AuthCache, doc_id: String, auth_headers: HashMap<String, String>) {
-    if let Ok(mut guard) = cache.lock() {
-        evict_auth_cache_overflow(&mut guard, &doc_id);
-        guard.insert(doc_id, auth_headers);
-    }
-}
-
-fn evict_auth_cache_overflow(
-    cache: &mut HashMap<String, HashMap<String, String>>,
-    incoming_doc_id: &str,
-) {
-    if cache.contains_key(incoming_doc_id) {
-        return;
-    }
-    let overflow = cache
-        .len()
-        .saturating_add(1)
-        .saturating_sub(MAX_AUTH_CACHE_ENTRIES);
-    if overflow == 0 {
-        return;
-    }
-    let keys: Vec<String> = cache.keys().take(overflow).cloned().collect();
-    for key in keys {
-        cache.remove(&key);
-    }
-}
 
 #[derive(Clone)]
 pub struct InjectorOptions {
@@ -375,24 +342,5 @@ mod tests {
         assert!(is_hop_by_hop_str("transfer-encoding"));
         assert!(!is_hop_by_hop_str("authorization"));
         assert!(!is_hop_by_hop_str("x-rayline-local-hint"));
-    }
-
-    #[test]
-    fn auth_cache_is_size_bounded_on_insert() {
-        let cache = new_auth_cache();
-        for idx in 0..(MAX_AUTH_CACHE_ENTRIES + 10) {
-            let mut headers = HashMap::new();
-            headers.insert("Authorization".to_string(), format!("Bearer {idx}"));
-            stash_auth_headers(&cache, format!("doc-{idx}"), headers);
-        }
-
-        let guard = cache.lock().unwrap();
-        assert!(guard.len() <= MAX_AUTH_CACHE_ENTRIES);
-        assert_eq!(
-            guard
-                .get(&format!("doc-{}", MAX_AUTH_CACHE_ENTRIES + 9))
-                .and_then(|headers| headers.get("Authorization")),
-            Some(&format!("Bearer {}", MAX_AUTH_CACHE_ENTRIES + 9))
-        );
     }
 }

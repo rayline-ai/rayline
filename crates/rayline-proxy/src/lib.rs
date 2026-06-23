@@ -20,9 +20,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+pub use rayline_authcache::{
+    AuthCache, MAX_AUTH_CACHE_ENTRIES, evict_auth_cache_overflow, new_auth_cache,
+    stash_auth_headers,
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -52,7 +57,6 @@ pub const DEFAULT_PORT: u16 = 20810;
 pub const ANTHROPIC_HOST: &str = "api.anthropic.com";
 pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
-const MAX_AUTH_CACHE_ENTRIES: usize = 512;
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
@@ -63,45 +67,6 @@ const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// and unresolved, so main-thread traffic is never delayed.
 const AGENT_TYPE_RESOLVE_MAX_ATTEMPTS: usize = 6;
 const AGENT_TYPE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(40);
-
-/// Shared map `usage_doc_id -> auth headers`.
-///
-/// In local proxy mode, the cloud router returns a plain HTTP localhost 307.
-/// The proxy consumes that redirect internally, so it must stash router auth
-/// before calling the adapter. The adapter reads the same cache when it reports
-/// usage back to the router.
-pub type AuthCache = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
-
-pub fn new_auth_cache() -> AuthCache {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-fn stash_auth_headers(cache: &AuthCache, doc_id: String, auth_headers: HashMap<String, String>) {
-    if let Ok(mut guard) = cache.lock() {
-        evict_auth_cache_overflow(&mut guard, &doc_id);
-        guard.insert(doc_id, auth_headers);
-    }
-}
-
-fn evict_auth_cache_overflow(
-    cache: &mut HashMap<String, HashMap<String, String>>,
-    incoming_doc_id: &str,
-) {
-    if cache.contains_key(incoming_doc_id) {
-        return;
-    }
-    let overflow = cache
-        .len()
-        .saturating_add(1)
-        .saturating_sub(MAX_AUTH_CACHE_ENTRIES);
-    if overflow == 0 {
-        return;
-    }
-    let keys: Vec<String> = cache.keys().take(overflow).cloned().collect();
-    for key in keys {
-        cache.remove(&key);
-    }
-}
 
 #[derive(Clone)]
 pub struct ProxyOptions {
@@ -538,6 +503,33 @@ async fn handle_anthropic_request(state: AppState, req: Request<Incoming>) -> Re
     }
 }
 
+/// Detect the "agent-id present but type unresolved" state, emit a `warn!`,
+/// and increment the `routing_uncertain` counter.  Extracted from
+/// `forward_anthropic_request` so the branch can be unit-tested without
+/// standing up the full async HTTP machinery.
+///
+/// Returns `true` when the uncertain branch fired (i.e. the counter was
+/// incremented), `false` otherwise.
+fn emit_if_agent_type_unresolved(
+    agent_id_present: bool,
+    agent_type: Option<&str>,
+    agent_id: String,
+    metrics: Option<&SharedMetricsSink>,
+) -> bool {
+    let unresolved = agent_id_present && agent_type.is_none();
+    if unresolved {
+        warn!(
+            "proxy agent-type resolution exhausted retries: agent_id={} — \
+             Claude Code meta file not found; routing uncertain",
+            agent_id
+        );
+        if let Some(metrics) = metrics {
+            metrics.record(MetricsUpdate::RoutingUncertain { agent_id });
+        }
+    }
+    unresolved
+}
+
 async fn forward_anthropic_request(
     state: AppState,
     req: Request<Incoming>,
@@ -552,11 +544,22 @@ async fn forward_anthropic_request(
     let agent_id = claude_code_agent_id(&parts.headers)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "<none>".to_owned());
-    let agent_type = if agent_id != "<none>" {
+    let agent_id_present = agent_id != "<none>";
+    let agent_type = if agent_id_present {
         resolve_claude_code_agent_type_with_retry(&agent_id).await
     } else {
         None
     };
+    // When agent-id was present but resolution exhausted all retries the
+    // meta file was never found. This most likely means Claude Code changed
+    // its schema or path layout. Emit a warning and bump the counter so
+    // operators notice rather than silently degrading.
+    let agent_type_unresolved = emit_if_agent_type_unresolved(
+        agent_id_present,
+        agent_type.as_deref(),
+        agent_id.clone(),
+        state.opts.metrics.as_ref(),
+    );
     let routed = prepare_anthropic_route_with_subagent_filter(
         &parts.method,
         parts.uri.path(),
@@ -577,13 +580,20 @@ async fn forward_anthropic_request(
         .unwrap_or_else(|| "<none>".to_owned());
     let agent_type = routed.agent_type.clone();
     let proxy_owns_metrics = proxy_owns_metrics_for_route(&state.opts, decision.target);
+    // Distinguish "<unresolved>" (agent-id present but meta not found) from
+    // "<none>" (no agent-id header at all) in the decision log.
+    let agent_type_log = if agent_type_unresolved {
+        "<unresolved>".to_owned()
+    } else {
+        agent_type.as_deref().unwrap_or("<none>").to_owned()
+    };
     info!(
         "proxy route decision method={} path={} model={} agent_id={} agent_type={} target={:?} reason={} selective_subagents=[{}] local_available={} local_custom={}",
         parts.method.as_str(),
         path_and_query,
         body_model.as_deref().unwrap_or("<none>"),
         agent_id,
-        agent_type.as_deref().unwrap_or("<none>"),
+        agent_type_log,
         decision.target,
         decision.reason,
         state.opts.selective_subagent_ids.join(","),
@@ -1006,24 +1016,13 @@ async fn response_from_reqwest(
             }
         }
         if observe_response {
-            let decoded_body = match decode_body_for_metrics(&body, content_encoding.as_deref()) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    warn!(
-                        "failed to decode proxied response for metrics content_encoding={}: {error}",
-                        content_encoding.as_deref().unwrap_or("<none>")
-                    );
-                    body.clone()
-                }
-            };
+            let decoded_body = decode_body_for_metrics(&body, content_encoding.as_deref());
             if !parse_chunks_live {
-                if let Some(capture) = sse_capture.as_ref() {
+                if let (Some(capture), Some(decoded)) =
+                    (sse_capture.as_ref(), decoded_body.as_deref())
+                {
                     let mut decoded_capture_buffer = String::new();
-                    capture_anthropic_sse_chunk(
-                        &decoded_body,
-                        &mut decoded_capture_buffer,
-                        capture,
-                    );
+                    capture_anthropic_sse_chunk(decoded, &mut decoded_capture_buffer, capture);
                     capture_anthropic_sse_chunk(b"\n\n", &mut decoded_capture_buffer, capture);
                 }
             }
@@ -1031,12 +1030,14 @@ async fn response_from_reqwest(
             let previous_output_tokens = output_tokens;
             let previous_prompt_cache_tokens = prompt_cache_tokens;
             let previous_prompt_processed_tokens = prompt_processed_tokens;
-            usage_from_anthropic_body(&decoded_body).merge_into(
-                &mut input_tokens,
-                &mut output_tokens,
-                &mut prompt_cache_tokens,
-                &mut prompt_processed_tokens,
-            );
+            if let Some(decoded) = decoded_body.as_deref() {
+                usage_from_anthropic_body(decoded).merge_into(
+                    &mut input_tokens,
+                    &mut output_tokens,
+                    &mut prompt_cache_tokens,
+                    &mut prompt_processed_tokens,
+                );
+            }
             if let Some(capture) = sse_capture.as_ref() {
                 let raw_path = capture.raw_path();
                 if let Err(error) = write_sse_capture_raw(&raw_path, &body) {
@@ -1085,7 +1086,7 @@ async fn response_from_reqwest(
                             if parse_chunks_live {
                                 sse_buffer.len()
                             } else {
-                                decoded_body.len()
+                                decoded_body.as_deref().map(|b| b.len()).unwrap_or(0)
                             }
                         );
                     }
@@ -1660,48 +1661,162 @@ fn normalized_content_encodings(content_encoding: Option<&str>) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>> {
+/// Maximum number of bytes allowed when decompressing an upstream response body
+/// for metrics extraction. Prevents a gzip/brotli/zstd bomb from an upstream
+/// server (buggy, compromised, or MITM'd) from OOM-ing the daemon.
+/// On exceeding this cap, metrics are silently skipped for that request only;
+/// the raw downstream stream is never affected.
+const MAX_DECODE_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+
+/// Decompress `body` according to `content_encoding` for metrics extraction.
+///
+/// Returns `Some(decoded)` when decompression succeeds within `MAX_DECODE_BYTES`.
+/// Returns `None` when:
+/// - The decoded output would exceed `MAX_DECODE_BYTES` (cap exceeded; emits one `warn!`).
+/// - The encoding is unsupported or decompression fails (emits one `warn!`).
+///
+/// Returning `None` means "skip metrics for this request" — never an error to the caller.
+fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Option<Vec<u8>> {
     let encodings = normalized_content_encodings(content_encoding);
     if encodings.is_empty() || encodings.iter().all(|encoding| encoding == "identity") {
-        return Ok(body.to_vec());
+        return Some(body.to_vec());
     }
 
     let mut decoded = body.to_vec();
     for encoding in encodings.iter().rev() {
         decoded = match encoding.as_str() {
             "identity" => decoded,
-            "gzip" | "x-gzip" => read_all(flate2::read::GzDecoder::new(Cursor::new(decoded)))
-                .with_context(|| "decode gzip response body for metrics")?,
+            "gzip" | "x-gzip" => {
+                match read_bounded(
+                    flate2::read::GzDecoder::new(Cursor::new(decoded)),
+                    MAX_DECODE_BYTES,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream gzip response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!("failed to decode gzip response body for metrics: {error}");
+                        return None;
+                    }
+                }
+            }
             "deflate" => decode_deflate_body(decoded)?,
-            "br" => read_all(brotli::Decompressor::new(Cursor::new(decoded), 4096))
-                .with_context(|| "decode brotli response body for metrics")?,
+            "br" => {
+                match read_bounded(
+                    brotli::Decompressor::new(Cursor::new(decoded), 4096),
+                    MAX_DECODE_BYTES,
+                ) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream brotli response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!("failed to decode brotli response body for metrics: {error}");
+                        return None;
+                    }
+                }
+            }
             "zstd" => {
-                let decoder = zstd::stream::read::Decoder::new(Cursor::new(decoded))
-                    .with_context(|| "initialize zstd response decoder for metrics")?;
-                read_all(decoder).with_context(|| "decode zstd response body for metrics")?
+                let decoder = match zstd::stream::read::Decoder::new(Cursor::new(decoded)) {
+                    Ok(d) => d,
+                    Err(error) => {
+                        warn!("failed to initialize zstd decoder for metrics: {error}");
+                        return None;
+                    }
+                };
+                match read_bounded(decoder, MAX_DECODE_BYTES) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        warn!(
+                            "upstream zstd response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                             skipping metrics for this request",
+                            MAX_DECODE_BYTES / (1024 * 1024)
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        warn!("failed to decode zstd response body for metrics: {error}");
+                        return None;
+                    }
+                }
             }
             other => {
-                return Err(anyhow!("unsupported content-encoding {other:?}"));
+                warn!(
+                    "unsupported content-encoding {other:?} for metrics decode; skipping metrics"
+                );
+                return None;
             }
         };
     }
-    Ok(decoded)
+    Some(decoded)
 }
 
-fn decode_deflate_body(body: Vec<u8>) -> Result<Vec<u8>> {
-    match read_all(flate2::read::ZlibDecoder::new(Cursor::new(body.clone()))) {
-        Ok(decoded) => Ok(decoded),
-        Err(zlib_error) => read_all(flate2::read::DeflateDecoder::new(Cursor::new(body)))
-            .with_context(|| {
-                format!("decode deflate response body for metrics (zlib failed: {zlib_error})")
-            }),
+fn decode_deflate_body(body: Vec<u8>) -> Option<Vec<u8>> {
+    match read_bounded(
+        flate2::read::ZlibDecoder::new(Cursor::new(body.clone())),
+        MAX_DECODE_BYTES,
+    ) {
+        Ok(Some(decoded)) => Some(decoded),
+        Ok(None) => {
+            warn!(
+                "upstream deflate (zlib) response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                 skipping metrics for this request",
+                MAX_DECODE_BYTES / (1024 * 1024)
+            );
+            None
+        }
+        Err(zlib_error) => {
+            match read_bounded(
+                flate2::read::DeflateDecoder::new(Cursor::new(body)),
+                MAX_DECODE_BYTES,
+            ) {
+                Ok(Some(decoded)) => Some(decoded),
+                Ok(None) => {
+                    warn!(
+                        "upstream deflate response body exceeded MAX_DECODE_BYTES ({} MiB); \
+                         skipping metrics for this request",
+                        MAX_DECODE_BYTES / (1024 * 1024)
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to decode deflate response body for metrics \
+                         (zlib failed: {zlib_error}): {error}"
+                    );
+                    None
+                }
+            }
+        }
     }
 }
 
-fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+/// Read from `reader` up to `limit` bytes.
+///
+/// Returns:
+/// - `Ok(Some(bytes))` when the reader reaches EOF before `limit` bytes.
+/// - `Ok(None)` when more than `limit` bytes would be produced (cap exceeded).
+/// - `Err(e)` on an I/O error.
+fn read_bounded(reader: impl Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
+    // Read up to limit+1 bytes so we can detect if the output exceeds the cap.
+    let read = reader.take(limit + 1).read_to_end(&mut output)?;
+    if read as u64 > limit {
+        Ok(None)
+    } else {
+        Ok(Some(output))
+    }
 }
 
 /// The router's per-turn decision, captured from the `X-Rayline-*` response
@@ -2388,6 +2503,18 @@ impl LocalCa {
                     .with_context(|| format!("read CA key {}", key_path.display()))?,
             };
             if ca.is_valid_existing_pair() {
+                // Tighten permissions on the happy-load path so that a CA
+                // directory/key created by an older release at 0755/0644 is
+                // repaired on next load, keeping the SECURITY.md guarantee true
+                // for existing installs.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(parent) = cert_path.parent() {
+                        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                    }
+                    let _ = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600));
+                }
                 return Ok(ca);
             }
             warn!(
@@ -2398,10 +2525,20 @@ impl LocalCa {
         if let Some(parent) = cert_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create CA cert dir {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
         if let Some(parent) = key_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create CA key dir {}", parent.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
 
         let ca = Self::generate()?;
@@ -2413,6 +2550,8 @@ impl LocalCa {
     }
 
     fn generate() -> Result<Self> {
+        use time::{Duration, OffsetDateTime};
+
         let mut params = CertificateParams::new(vec!["Rayline Local Proxy CA".to_string()])?;
         params.subject_alt_names.clear();
         let mut dn = DistinguishedName::new();
@@ -2425,6 +2564,12 @@ impl LocalCa {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
+        // Backdate not_before by 5 minutes to absorb clock-skew across machines.
+        // Cap not_after at 180 days so a leaked or forgotten CA key has a bounded
+        // lifetime; load_or_generate regenerates automatically on expiry.
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::minutes(5);
+        params.not_after = now + Duration::days(180);
         let key_pair = KeyPair::generate()?;
         let cert = params.self_signed(&key_pair)?;
         Ok(Self {
@@ -2476,8 +2621,36 @@ impl LocalCa {
 
     fn validate_existing_pair(&self) -> Result<()> {
         self.validate_key_matches_cert()?;
+        self.validate_not_expired()?;
         self.server_config_for_host(ANTHROPIC_HOST)
             .context("generate leaf server config from CA")?;
+        Ok(())
+    }
+
+    /// Return an error if the CA cert is already expired or will expire within 7 days.
+    fn validate_not_expired(&self) -> Result<()> {
+        let certs = certs_from_pem(&self.cert_pem)?;
+        let der = certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("CA PEM did not contain a certificate"))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|error| anyhow!("parse CA certificate for expiry check: {error}"))?;
+        let validity = &cert.tbs_certificate.validity;
+        if !validity.is_valid() {
+            return Err(anyhow!("CA certificate is expired"));
+        }
+        // Also regenerate when the CA expires within 7 days so clients aren't
+        // surprised by a sudden TLS failure.
+        let secs_remaining = validity
+            .time_to_expiration()
+            .map(|d| d.whole_seconds())
+            .unwrap_or(0);
+        if secs_remaining < 7 * 24 * 3600 {
+            return Err(anyhow!(
+                "CA certificate expires in less than 7 days ({secs_remaining}s remaining)"
+            ));
+        }
         Ok(())
     }
 
@@ -2616,6 +2789,7 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayline_metrics::MetricsSink as _;
 
     fn observe_test_sse_chunk(
         bytes: &[u8],
@@ -2753,6 +2927,42 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(17));
         assert_eq!(usage.prompt_cache_tokens, Some(30));
         assert_eq!(usage.prompt_processed_tokens, Some(12));
+    }
+
+    /// Verifies that a gzip-compressed payload that expands beyond MAX_DECODE_BYTES
+    /// causes decode_body_for_metrics to return None (skip metrics) rather than OOM.
+    /// RED: before fix, decode_body_for_metrics returns Result<Vec<u8>> (no Option variant).
+    #[test]
+    fn decompression_is_capped_and_skips_metrics_on_bomb() {
+        // 64 MiB of zeros compresses to a tiny gzip stream — a classic gzip bomb pattern.
+        let plaintext = vec![0u8; 64 * 1024 * 1024];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all(&plaintext).unwrap();
+        let bomb = encoder.finish().unwrap();
+
+        // Must return None (cap exceeded) — never OOM.
+        assert!(
+            decode_body_for_metrics(&bomb, Some("gzip")).is_none(),
+            "expected decode_body_for_metrics to return None for oversized decompressed output"
+        );
+    }
+
+    /// Verifies that a small gzip body still decodes successfully (cap is not over-aggressive).
+    #[test]
+    fn decompression_succeeds_for_small_gzip_body() {
+        let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        encoder.write_all(body).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let decoded = decode_body_for_metrics(&compressed, Some("gzip"));
+        assert!(
+            decoded.is_some(),
+            "expected small gzip body to decode successfully"
+        );
+        assert_eq!(decoded.unwrap(), body);
     }
 
     #[test]
@@ -3574,5 +3784,283 @@ mod tests {
         write_task.await.unwrap();
 
         assert!(!path.exists(), "stale generation should not write status");
+    }
+
+    /// Golden contract: the PRODUCTION resolver (`resolve_claude_code_agent_type_from_roots`)
+    /// must find `agentType` in a real captured Claude Code agent meta file.
+    ///
+    /// This test FAILS if Claude Code renames the field, restructures the JSON, or changes
+    /// the path layout — that is the intent.  The fixture at
+    /// `tests/fixtures/agent-test.meta.json` was sanitized from an actual capture
+    /// (description scrubbed; agentType value kept verbatim).
+    ///
+    /// Path layout written to a temp dir:
+    ///   <projects_root>/<project-dir>/<session-dir>/subagents/agent-<id>.meta.json
+    ///
+    /// The agent-id header sent by Claude Code is `x-claude-code-agent-id`.
+    #[test]
+    fn golden_contract_pins_cc_agent_metadata_shape() {
+        // The header name Claude Code uses to identify the subagent.
+        assert_eq!(
+            CLAUDE_CODE_AGENT_ID_HEADER, "x-claude-code-agent-id",
+            "header constant must match the documented CC header name"
+        );
+
+        let fixture_content = include_str!("../tests/fixtures/agent-test.meta.json");
+        let agent_id = "aaea8a9732b057638";
+        let filename = format!("agent-{agent_id}.meta.json");
+
+        // Build the path layout the production resolver walks:
+        //   <projects_root>/<project-dir>/<session-dir>/subagents/agent-<id>.meta.json
+        let tmp = std::env::temp_dir().join(format!(
+            "rayline-golden-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects_root = tmp.clone();
+        let project_dir = projects_root.join("some-project-dir");
+        let session_dir = project_dir.join("some-session-dir");
+        let subagents_dir = session_dir.join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create temp fixture dir");
+        let meta_path = subagents_dir.join(&filename);
+        fs::write(&meta_path, fixture_content).expect("write fixture");
+
+        // Call the PRODUCTION resolver — not raw JSON parsing.
+        let result = resolve_claude_code_agent_type_from_roots(&filename, &[projects_root], None);
+
+        // Clean up before asserting so failure doesn't leave temp files.
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            result,
+            Some("general-purpose".to_owned()),
+            "production resolver must find agentType=general-purpose from fixture; \
+             update fixture if CC changes the field name or value"
+        );
+    }
+
+    /// When `RouterMetrics` receives a `RoutingUncertain` event the
+    /// `routing_uncertain` counter must be incremented. This pins the metrics
+    /// plumbing without requiring the full proxy HTTP machinery.
+    #[test]
+    fn routing_uncertain_counter_increments_on_event() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+        metrics.record(MetricsUpdate::RoutingUncertain {
+            agent_id: "abc123".to_owned(),
+        });
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 1);
+        metrics.record(MetricsUpdate::RoutingUncertain {
+            agent_id: "def456".to_owned(),
+        });
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 2);
+    }
+
+    /// Pins the behavior of the extracted helper `emit_if_agent_type_unresolved`:
+    /// when `agent_id` was present but type resolution exhausted, it warns and
+    /// increments `routing_uncertain`.
+    ///
+    /// Coverage gap (known residual): this test does NOT pin the helper's
+    /// *invocation* from `forward_anthropic_request` — deleting that call site
+    /// in the async path would not fail any unit test here. Pinning it would
+    /// require async/mock-server integration infrastructure, deferred as
+    /// out-of-scope for this observability task.
+    ///
+    /// Scenario: `agent_id` was present in the request (agent_id_present=true)
+    /// but resolution exhausted all retries (agent_type=None).
+    #[test]
+    fn proxy_branch_increments_routing_uncertain_when_agent_type_unresolved() {
+        let metrics = rayline_metrics::RouterMetrics::new("test-proxy-branch");
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+
+        // agent_id present, type not resolved → must warn and increment.
+        let incremented = emit_if_agent_type_unresolved(
+            true,
+            None,
+            "agent-xyz".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(
+            incremented,
+            "must return true when the uncertain branch fires"
+        );
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must increment via the proxy branch helper"
+        );
+
+        // agent_id present, type resolved → must NOT increment.
+        let incremented = emit_if_agent_type_unresolved(
+            true,
+            Some("Explore"),
+            "agent-xyz".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(!incremented, "must return false when type is resolved");
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must not increment when type is resolved"
+        );
+
+        // agent_id absent → must NOT increment even if type is also absent.
+        let incremented = emit_if_agent_type_unresolved(
+            false,
+            None,
+            "<none>".to_owned(),
+            Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
+        );
+        assert!(!incremented, "must return false when agent_id is absent");
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "counter must not increment when agent_id is absent"
+        );
+    }
+
+    /// CA validity window must be ≤ 180 days.  rcgen's default is ~2100 years;
+    /// we need to see a bounded window so TLS interception doesn't silently
+    /// "work forever" after the CA is compromised or forgotten.
+    #[test]
+    fn ca_has_bounded_validity() {
+        use x509_parser::parse_x509_certificate;
+
+        let ca = LocalCa::generate().unwrap();
+        let certs = certs_from_pem(&ca.cert_pem).unwrap();
+        let der = certs.into_iter().next().unwrap();
+        let (_, cert) = parse_x509_certificate(&der).unwrap();
+        let validity = cert.tbs_certificate.validity;
+
+        let not_before = validity.not_before.timestamp();
+        let not_after = validity.not_after.timestamp();
+        let window_secs = not_after - not_before;
+
+        // Window must be positive and at most 180 days + 10 min (5 min skew each side).
+        let max_secs: i64 = 180 * 24 * 3600 + 600;
+        assert!(
+            window_secs > 0,
+            "CA validity window must be positive, got {window_secs}s"
+        );
+        assert!(
+            window_secs <= max_secs,
+            "CA validity window {window_secs}s exceeds 180 days + 10 min ({max_secs}s); \
+             rcgen default is unbounded — set params.not_after"
+        );
+    }
+
+    /// `load_or_generate` must regenerate the CA when the cert on disk is expired.
+    /// This prevents the 180-day time-bomb: after expiry TLS interception would
+    /// silently break without this check.
+    #[test]
+    fn load_or_generate_regenerates_expired_ca() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
+        use time::{Duration, OffsetDateTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("ca.pem");
+        let key_path = dir.path().join("ca-key.pem");
+
+        // Generate a CA that expired 1 second ago.
+        let mut params = CertificateParams::new(vec!["Expired Test CA".to_string()]).unwrap();
+        params.subject_alt_names.clear();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Expired Test CA");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::hours(1);
+        params.not_after = now - Duration::seconds(1); // already expired
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        // load_or_generate must detect the expiry and regenerate a valid CA.
+        let ca = LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+        let certs = certs_from_pem(&ca.cert_pem).unwrap();
+        let der = certs.into_iter().next().unwrap();
+        let (_, cert_parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
+        assert!(
+            cert_parsed.tbs_certificate.validity.is_valid(),
+            "regenerated CA must be currently valid"
+        );
+    }
+
+    /// `load_or_generate` must create the CA directory with mode 0700 so that
+    /// other users on a shared machine cannot read the local CA private key.
+    #[cfg(unix)]
+    #[test]
+    fn ca_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+        let cert_path = ca_dir.join("proxy-ca.pem");
+        let key_path = ca_dir.join("proxy-ca-key.pem");
+
+        // Directory doesn't exist yet; load_or_generate must create it with 0700.
+        LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+
+        let mode = std::fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "CA dir must be 0700, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    /// `load_or_generate` must repair loose permissions (0755 dir / 0644 key)
+    /// on the happy-load path (valid existing CA, no regeneration).
+    /// Before the fix this test fails: perms stay 0755/0644.
+    /// After the fix it passes: load_or_generate tightens to 0700/0600.
+    #[cfg(unix)]
+    #[test]
+    fn load_or_generate_tightens_loose_perms_on_existing_ca() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("ca");
+        let cert_path = ca_dir.join("proxy-ca.pem");
+        let key_path = ca_dir.join("proxy-ca-key.pem");
+
+        // Create a valid CA on disk (generates with correct perms).
+        LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+
+        // Deliberately loosen permissions to simulate an older install.
+        std::fs::set_permissions(&ca_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Reload — must reuse the existing CA (not regenerate) and tighten perms.
+        let loaded = LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
+        // Sanity: the reused CA must still be valid.
+        loaded.validate_existing_pair().unwrap();
+
+        let dir_mode = std::fs::metadata(&ca_dir).unwrap().permissions().mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "CA dir must be tightened to 0700 on load, got 0o{:o}",
+            dir_mode & 0o777
+        );
+        let key_mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(
+            key_mode & 0o777,
+            0o600,
+            "CA key must be tightened to 0600 on load, got 0o{:o}",
+            key_mode & 0o777
+        );
     }
 }

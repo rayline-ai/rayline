@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 
 const UPDATE_BASE_URL_ENV: &str = "RAYLINE_UPDATE_BASE_URL";
@@ -33,6 +34,7 @@ pub enum UpdateError {
     InvalidVersion(String),
     Install(String),
     Network(String),
+    Signature(String),
     UnsupportedPlatform(String),
 }
 
@@ -47,6 +49,7 @@ impl std::fmt::Display for UpdateError {
             Self::Checksum(message)
             | Self::Install(message)
             | Self::Network(message)
+            | Self::Signature(message)
             | Self::UnsupportedPlatform(message) => formatter.write_str(message),
             Self::InvalidVersion(version) => write!(formatter, "invalid --version '{version}'"),
         }
@@ -339,6 +342,50 @@ fn checksums_url_for(version: &str) -> String {
     format!("{}/cli/v{version}/SHA256SUMS", base_url())
 }
 
+fn checksums_sig_url_for(version: &str) -> String {
+    format!("{}/cli/v{version}/SHA256SUMS.minisig", base_url())
+}
+
+/// Verify that `sums` is signed by at least one of the pinned `pubkeys`.
+///
+/// Fails closed: returns `Err` if `sig_bytes` is empty, malformed, or no
+/// pinned key validates the signature. The caller must call this BEFORE
+/// trusting any checksum from `sums`.
+pub fn verify_signature(
+    sums: &[u8],
+    sig_bytes: &[u8],
+    pubkeys: &[&str],
+) -> Result<(), UpdateError> {
+    if sig_bytes.is_empty() {
+        return Err(UpdateError::Signature(
+            "SHA256SUMS.minisig is empty — refusing to install unsigned update".to_owned(),
+        ));
+    }
+
+    let sig =
+        Signature::decode(std::str::from_utf8(sig_bytes).map_err(|_| {
+            UpdateError::Signature("SHA256SUMS.minisig is not valid UTF-8".to_owned())
+        })?)
+        .map_err(|error| {
+            UpdateError::Signature(format!("malformed SHA256SUMS.minisig: {error}"))
+        })?;
+
+    for pubkey_str in pubkeys {
+        let pk = PublicKey::from_base64(pubkey_str).map_err(|error| {
+            UpdateError::Signature(format!("invalid pinned public key: {error}"))
+        })?;
+        if pk.verify(sums, &sig, true).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(UpdateError::Signature(
+        "SHA256SUMS signature could not be verified against any pinned public key — \
+         refusing to install"
+            .to_owned(),
+    ))
+}
+
 pub(crate) fn base_url() -> String {
     std::env::var(UPDATE_BASE_URL_ENV)
         .ok()
@@ -372,6 +419,21 @@ async fn download_and_verify(
     let launcher_path = dest_dir.join(&launcher_name);
     let daemon_path = dest_dir.join(&daemon_name);
     let sums_path = dest_dir.join("SHA256SUMS");
+    let sig_path = dest_dir.join("SHA256SUMS.minisig");
+
+    // Download checksums and its signature first so we can verify before
+    // trusting any artifact bytes.
+    download_to(&checksums_url_for(version), &sums_path).await?;
+    download_to(&checksums_sig_url_for(version), &sig_path).await?;
+
+    // Verify signature BEFORE reading or trusting the checksums file.
+    // Fail closed: missing or invalid signature aborts the update.
+    let sums_bytes = fs::read(&sums_path).map_err(UpdateError::from)?;
+    let sig_bytes = fs::read(&sig_path).map_err(UpdateError::from)?;
+    verify_signature(&sums_bytes, &sig_bytes, crate::MINISIGN_PUBLIC_KEYS)?;
+
+    let sums = String::from_utf8(sums_bytes)
+        .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
 
     download_to(&artifact_url_for(version, platform_tag), &launcher_path).await?;
     download_to(
@@ -379,9 +441,7 @@ async fn download_and_verify(
         &daemon_path,
     )
     .await?;
-    download_to(&checksums_url_for(version), &sums_path).await?;
 
-    let sums = fs::read_to_string(&sums_path).map_err(UpdateError::from)?;
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &daemon_name, &daemon_path)?;
 
@@ -970,5 +1030,135 @@ mod tests {
             install_path,
             tools_dir
         ));
+    }
+
+    // ── Signature verification tests ─────────────────────────────────────────
+
+    // Test public key (matches the .minisig in tests/fixtures/SHA256SUMS.minisig)
+    // Generated for testing only — NOT the production key.
+    const TEST_PUBKEY: &str = "RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP";
+
+    // Untrusted public key (different keypair, not in the pinned set)
+    const UNTRUSTED_PUBKEY: &str = "RWQR3fP7y6Yexmbshr2vDmkWJeKelP8y80oyaUgE9AjMymImLFrUu0Dy";
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name} unreadable: {e}"))
+    }
+
+    /// (a) Valid sig + matching pinned key → Ok
+    #[test]
+    fn verify_signature_valid_key_accepts() {
+        let sums = fixture("SHA256SUMS");
+        let sig = fixture("SHA256SUMS.minisig");
+        assert!(
+            verify_signature(&sums, &sig, &[TEST_PUBKEY]).is_ok(),
+            "valid signature must verify against pinned key"
+        );
+    }
+
+    /// (b) Tampered SHA256SUMS → Err (signature won't match different content)
+    #[test]
+    fn verify_signature_tampered_content_rejects() {
+        let sums = fixture("SHA256SUMS.tampered");
+        let sig = fixture("SHA256SUMS.minisig");
+        let result = verify_signature(&sums, &sig, &[TEST_PUBKEY]);
+        assert!(
+            result.is_err(),
+            "tampered content must not verify against original signature"
+        );
+        assert!(matches!(result, Err(UpdateError::Signature(_))));
+    }
+
+    /// (c) Signature from an unpinned key → Err
+    #[test]
+    fn verify_signature_unpinned_key_rejects() {
+        let sums = fixture("SHA256SUMS");
+        let sig = fixture("SHA256SUMS.minisig");
+        // Only the UNTRUSTED key is in the pinned set — it didn't sign this file
+        let result = verify_signature(&sums, &sig, &[UNTRUSTED_PUBKEY]);
+        assert!(
+            result.is_err(),
+            "signature under unpinned key must be rejected"
+        );
+        assert!(matches!(result, Err(UpdateError::Signature(_))));
+    }
+
+    /// (d) Empty sig_bytes → Err (fail closed — no .minisig means reject)
+    #[test]
+    fn verify_signature_empty_sig_fails_closed() {
+        let sums = fixture("SHA256SUMS");
+        let result = verify_signature(&sums, &[], &[TEST_PUBKEY]);
+        assert!(result.is_err(), "absent/empty signature must fail closed");
+        let Err(UpdateError::Signature(msg)) = result else {
+            panic!("expected Signature error");
+        };
+        assert!(
+            msg.contains("empty"),
+            "error message should mention empty: {msg}"
+        );
+    }
+
+    /// (e) Multiple pinned keys — succeeds when at least one matches
+    #[test]
+    fn verify_signature_accepts_when_one_of_multiple_keys_matches() {
+        let sums = fixture("SHA256SUMS");
+        let sig = fixture("SHA256SUMS.minisig");
+        // List has the untrusted key first, then the real test key
+        assert!(
+            verify_signature(&sums, &sig, &[UNTRUSTED_PUBKEY, TEST_PUBKEY]).is_ok(),
+            "must succeed when any pinned key matches"
+        );
+    }
+
+    // ── Integration tests for download_and_verify ─────────────────────────────
+
+    /// download_and_verify returns Err when SHA256SUMS.minisig is absent from
+    /// the release directory. The pipeline must fail closed: no signature means
+    /// no installation, even if SHA256SUMS itself is present.
+    ///
+    /// Setup: a `file://` release server with SHA256SUMS but no .minisig.
+    /// The `file://` short-circuit in `download_to` makes this a pure I/O test
+    /// with no network dependency.
+    #[tokio::test]
+    async fn self_update_fails_closed_without_minisig() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let test_root = std::env::temp_dir().join(format!("rayline-test-no-minisig-{unique}"));
+        let dest_dir = std::env::temp_dir().join(format!("rayline-test-dest-{unique}"));
+
+        // Create the release directory structure that download_and_verify expects.
+        // checksums_url_for("1.0.0") → "<base>/cli/v1.0.0/SHA256SUMS"
+        let release_dir = test_root.join("cli").join("v1.0.0");
+        fs::create_dir_all(&release_dir).expect("create release dir");
+        fs::create_dir_all(&dest_dir).expect("create dest dir");
+
+        // SHA256SUMS is present — intentionally NO SHA256SUMS.minisig.
+        fs::write(
+            release_dir.join("SHA256SUMS"),
+            b"abc123  rayline-macosx_11_0_arm64\ndef456  rld-macosx_11_0_arm64\n",
+        )
+        .expect("write SHA256SUMS");
+
+        // Point download_and_verify at the local file tree.
+        let base_url = format!("file://{}", test_root.display());
+        // SAFETY: test binary is single-threaded (tokio::test with default
+        // worker count 1); no other test reads RAYLINE_UPDATE_BASE_URL.
+        unsafe { std::env::set_var(UPDATE_BASE_URL_ENV, &base_url) };
+        let result = download_and_verify("1.0.0", "macosx_11_0_arm64", &dest_dir).await;
+        unsafe { std::env::remove_var(UPDATE_BASE_URL_ENV) };
+
+        // Cleanup best-effort (test trees are small)
+        let _ = fs::remove_dir_all(&test_root);
+        let _ = fs::remove_dir_all(&dest_dir);
+
+        assert!(
+            result.is_err(),
+            "download_and_verify must return Err when SHA256SUMS.minisig is absent"
+        );
     }
 }

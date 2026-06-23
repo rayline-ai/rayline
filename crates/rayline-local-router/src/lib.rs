@@ -539,7 +539,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed);
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(header_str)
@@ -640,8 +640,16 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
         .and_then(header_str);
     let agent_type = headers.get(RAYLINE_AGENT_TYPE_HEADER).and_then(header_str);
-    let is_subagent =
-        agent_type.is_some() || agent_id.is_some() || requested_model == DEFAULT_SUBAGENT_MODEL;
+    // Guard: a bare `agent_id` header on a main-virtual-model request is
+    // treated as stray and does NOT trigger subagent classification. Only a
+    // confirmed `agent_type` (set by the proxy after successful meta-file
+    // resolution) or the explicit `DEFAULT_SUBAGENT_MODEL` model name is a
+    // reliable subagent signal when the main virtual model is requested.
+    // This prevents CC from wrongly downgrading main-thread traffic to a
+    // local/subagent endpoint when a stray agent-id header leaks through.
+    let is_subagent = agent_type.is_some()
+        || requested_model == DEFAULT_SUBAGENT_MODEL
+        || (agent_id.is_some() && requested_model != DEFAULT_VIRTUAL_MODEL);
     let mut policy = if is_subagent { "subagent" } else { "main" }.to_owned();
     let mut route = if let Some(route) = state.config.routes.model_routes.get(&requested_model) {
         policy = format!("model:{requested_model}");
@@ -714,6 +722,34 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         },
         route_id,
     }
+}
+
+/// Thin wrapper around `select_route` that detects the inconsistent state where
+/// `is_subagent` resolved to `true` but no `agent_id` header was present.
+/// When that happens the function emits a `warn!` and increments the
+/// `routing_uncertain` counter so operators notice rather than silently
+/// degrading.  This state should be impossible in normal operation — its
+/// occurrence means the `agent_type` header was set by some external caller
+/// without a corresponding `agent_id`, or the subagent model name was used
+/// without an `agent_id` header.
+fn select_route_with_warn(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
+    let decision = select_route(state, headers, body);
+    let agent_id = headers
+        .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .and_then(header_str);
+    if decision.task_class == "subagent" && agent_id.is_none() {
+        warn!(
+            "local router: subagent flagged with no agent id — \
+             agent_type header set without agent_id or DEFAULT_SUBAGENT_MODEL \
+             used without agent_id header; routing uncertain"
+        );
+        if let Some(metrics) = state.opts.metrics.as_ref() {
+            metrics.record(MetricsUpdate::RoutingUncertain {
+                agent_id: "<none>".to_owned(),
+            });
+        }
+    }
+    decision
 }
 
 fn header_str(value: &HeaderValue) -> Option<&str> {
@@ -965,6 +1001,9 @@ async fn response_from_reqwest(
     let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
     let body_out: BoxBody = stream_body.boxed();
     let selected_model = decision.map(|decision| decision.selected_model.clone());
+    // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
+    // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
+    let has_metrics = metrics.is_some() && request_id.is_some();
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
@@ -972,6 +1011,7 @@ async fn response_from_reqwest(
         let mut sse_buffer = String::new();
         let mut input_tokens = estimated_input_tokens;
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         let mut saw_first_token = false;
         let mut downstream_open = true;
         let mut stream_error = None;
@@ -1002,6 +1042,7 @@ async fn response_from_reqwest(
                         &mut sse_buffer,
                         &mut input_tokens,
                         &mut output_tokens,
+                        &mut prompt_cache_tokens,
                     );
                     if input_tokens != previous_input_tokens
                         || output_tokens != previous_output_tokens
@@ -1014,7 +1055,7 @@ async fn response_from_reqwest(
                             selected_model.clone(),
                         );
                     }
-                    body.extend_from_slice(&bytes);
+                    retain_for_metrics(has_metrics, &mut body, &bytes);
                     if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         downstream_open = false;
                     }
@@ -1035,6 +1076,7 @@ async fn response_from_reqwest(
             &mut sse_buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
         if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
             record_remote_token_usage(
@@ -1047,7 +1089,11 @@ async fn response_from_reqwest(
         }
         let previous_input_tokens = input_tokens;
         let previous_output_tokens = output_tokens;
-        usage_from_anthropic_body(&body).merge_into(&mut input_tokens, &mut output_tokens);
+        usage_from_anthropic_body(&body).merge_into(
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
         if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
             record_remote_token_usage(
                 metrics.as_ref(),
@@ -1082,13 +1128,15 @@ async fn response_from_reqwest(
                         sse_buffer.len()
                     );
                 }
-                metrics.record(MetricsUpdate::RequestCompleted {
-                    request_id: request_id.clone(),
-                    status_code: Some(status.as_u16()),
+                emit_completed_metrics(
+                    metrics,
+                    request_id,
+                    status.as_u16(),
                     input_tokens,
                     output_tokens,
+                    prompt_cache_tokens,
                     selected_model,
-                });
+                );
             }
         }
     });
@@ -1100,11 +1148,20 @@ async fn response_from_reqwest(
     Ok(builder.body(body_out).unwrap())
 }
 
+/// Accumulates `chunk` into `buf` only when `has_metrics` is true.
+/// Extracted so tests can verify the gate without driving a full async streaming pipeline.
+fn retain_for_metrics(has_metrics: bool, buf: &mut Vec<u8>, chunk: &[u8]) {
+    if has_metrics {
+        buf.extend_from_slice(chunk);
+    }
+}
+
 fn observe_anthropic_sse_chunk(
     bytes: &[u8],
     buffer: &mut String,
     input_tokens: &mut Option<u64>,
     output_tokens: &mut Option<u64>,
+    prompt_cache_tokens: &mut Option<u64>,
 ) {
     buffer.push_str(&String::from_utf8_lossy(bytes));
     while let Some(event) = drain_sse_event(buffer) {
@@ -1119,7 +1176,7 @@ fn observe_anthropic_sse_chunk(
             let Ok(value) = serde_json::from_str::<Value>(payload) else {
                 continue;
             };
-            usage_from_value(&value).merge_into(input_tokens, output_tokens);
+            usage_from_value(&value).merge_into(input_tokens, output_tokens, prompt_cache_tokens);
         }
     }
 }
@@ -1154,15 +1211,24 @@ fn usage_u64(value: &Value, key: &str) -> Option<u64> {
 struct ObservedUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    prompt_cache_tokens: Option<u64>,
 }
 
 impl ObservedUsage {
-    fn merge_into(self, input_tokens: &mut Option<u64>, output_tokens: &mut Option<u64>) {
+    fn merge_into(
+        self,
+        input_tokens: &mut Option<u64>,
+        output_tokens: &mut Option<u64>,
+        prompt_cache_tokens: &mut Option<u64>,
+    ) {
         if self.input_tokens.is_some() {
             *input_tokens = self.input_tokens;
         }
         if self.output_tokens.is_some() {
             *output_tokens = self.output_tokens;
+        }
+        if self.prompt_cache_tokens.is_some() {
+            *prompt_cache_tokens = self.prompt_cache_tokens;
         }
     }
 }
@@ -1181,7 +1247,11 @@ fn usage_from_anthropic_body(body: &[u8]) -> ObservedUsage {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            usage_from_value(&value).merge_into(&mut usage.input_tokens, &mut usage.output_tokens);
+            usage_from_value(&value).merge_into(
+                &mut usage.input_tokens,
+                &mut usage.output_tokens,
+                &mut usage.prompt_cache_tokens,
+            );
         }
     }
     usage
@@ -1198,6 +1268,10 @@ fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
         Value::Object(map) => {
             if let Some(input) = total_input_tokens_from_object(map) {
                 usage.input_tokens = Some(input);
+            }
+            // Read cache tokens regardless of whether total input tokens are present.
+            if let Some(cache) = cache_read_tokens_from_object(map) {
+                usage.prompt_cache_tokens = Some(cache);
             }
             if let Some(output) = map
                 .get("output_tokens")
@@ -1217,6 +1291,15 @@ fn collect_usage_from_value(value: &Value, usage: &mut ObservedUsage) {
         }
         _ => {}
     }
+}
+
+fn cache_read_tokens_from_object(map: &serde_json::Map<String, Value>) -> Option<u64> {
+    if let Some(tokens) = map.get("cache_read_input_tokens").and_then(Value::as_u64) {
+        return Some(tokens);
+    }
+    map.get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn total_input_tokens_from_object(map: &serde_json::Map<String, Value>) -> Option<u64> {
@@ -1276,6 +1359,37 @@ fn record_request_error(
         status_code,
         error: error.to_string(),
     });
+}
+
+/// Emit `RequestCompleted` and, when cache tokens are present, `PromptCache`.
+/// Mirrors the proxy's end-of-stream emission pattern.
+fn emit_completed_metrics(
+    metrics: &SharedMetricsSink,
+    request_id: &str,
+    status_code: u16,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    prompt_cache_tokens: Option<u64>,
+    selected_model: Option<String>,
+) {
+    metrics.record(MetricsUpdate::RequestCompleted {
+        request_id: request_id.to_owned(),
+        status_code: Some(status_code),
+        input_tokens,
+        output_tokens,
+        selected_model,
+    });
+    // Mirror the proxy's PromptCache emission so cache-token accounting works.
+    if input_tokens.is_some() || prompt_cache_tokens.is_some() {
+        metrics.record(MetricsUpdate::PromptCache {
+            request_id: request_id.to_owned(),
+            prompt_tokens: input_tokens,
+            cache_tokens: prompt_cache_tokens,
+            processed_tokens: None,
+            prompt_ms: None,
+            prompt_tps: None,
+        });
+    }
 }
 
 fn record_remote_token_usage(
@@ -1728,6 +1842,7 @@ fn chrono_like_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayline_metrics::MetricsSink as _;
 
     fn state(config: RouterConfig) -> AppState {
         AppState {
@@ -1743,12 +1858,19 @@ mod tests {
     }
 
     #[test]
-    fn routes_subagent_header_to_local_by_default() {
+    fn routes_confirmed_subagent_to_local_by_default() {
+        // A confirmed subagent (agent_type resolved by the proxy from meta file)
+        // is routed to the local model even when using the main virtual model name.
+        // Bare agent_id alone is NOT sufficient — see the stray-agent-id test below.
         let state = state(default_config("local-model"));
         let mut headers = HeaderMap::new();
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
             HeaderValue::from_static("explore"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
@@ -1911,6 +2033,8 @@ mod tests {
 
     #[test]
     fn named_subagent_overrides_default_subagent_route() {
+        // A confirmed subagent (agent_type resolved) whose type matches a named
+        // route overrides the default subagent route.
         let mut config = default_config("local-model");
         config.routes.subagents.insert(
             "reviewer".to_owned(),
@@ -1923,6 +2047,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("abc123"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
             HeaderValue::from_static("reviewer"),
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
@@ -2047,11 +2175,13 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -2063,11 +2193,13 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -2080,15 +2212,23 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
         assert_eq!(output_tokens, None);
 
-        observe_anthropic_sse_chunk(b"\n\n", &mut buffer, &mut input_tokens, &mut output_tokens);
+        observe_anthropic_sse_chunk(
+            b"\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
         assert_eq!(output_tokens, Some(17));
         assert!(buffer.is_empty());
     }
@@ -2098,15 +2238,18 @@ mod tests {
         let mut buffer = String::new();
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
         observe_anthropic_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
+            &mut prompt_cache_tokens,
         );
 
         assert_eq!(input_tokens, Some(42));
         assert_eq!(output_tokens, Some(17));
+        assert_eq!(prompt_cache_tokens, Some(30));
     }
 
     #[test]
@@ -2117,5 +2260,150 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(42));
         assert_eq!(usage.output_tokens, Some(17));
+    }
+
+    /// Verifies that `retain_for_metrics` (the helper called inside the streaming loop of
+    /// `response_from_reqwest`) accumulates bytes iff `has_metrics` is true.
+    ///
+    /// This test WILL FAIL if the guard is removed (i.e. if `retain_for_metrics` is made
+    /// unconditional), because `buf` would then be non-empty even when `has_metrics=false`.
+    #[test]
+    fn local_router_body_retention_gated_on_has_metrics() {
+        // When has_metrics is false, the buffer must stay empty regardless of how many
+        // chunks are fed through.
+        let mut buf = Vec::new();
+        retain_for_metrics(false, &mut buf, b"hello");
+        retain_for_metrics(false, &mut buf, b" world");
+        assert!(
+            buf.is_empty(),
+            "body must not be retained when has_metrics=false (guard is missing or broken)"
+        );
+
+        // When has_metrics is true, all chunks must be accumulated.
+        let mut buf = Vec::new();
+        retain_for_metrics(true, &mut buf, b"hello");
+        retain_for_metrics(true, &mut buf, b" world");
+        assert_eq!(
+            buf, b"hello world",
+            "body must be retained in full when has_metrics=true"
+        );
+    }
+
+    /// A stray `agent_id` header on a request that explicitly asks for the
+    /// main virtual model must NOT reclassify the request as a subagent.
+    /// This guards against the dangerous downgrade: CC sometimes forwards
+    /// agent-id headers even on main-model requests.
+    #[test]
+    fn main_virtual_model_with_stray_agent_id_is_not_downgraded_to_subagent() {
+        let state = state(default_config("local-model"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("stray-agent-xyz"),
+        );
+        // Explicitly requesting the main virtual model
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        let decision = select_route(&state, &headers, &body);
+
+        assert_eq!(
+            decision.task_class, "main",
+            "main virtual model request must be classified as main, not subagent, \
+             even when a stray agent_id header is present"
+        );
+    }
+
+    /// When `is_subagent` is true but `agent_id` is None (e.g. because
+    /// `agent_type` header is present without an `agent_id` header, or the
+    /// request uses `DEFAULT_SUBAGENT_MODEL` with no agent_id header),
+    /// `select_route_with_warn` must increment the `routing_uncertain` counter
+    /// and emit a warning.  This is an inconsistent/impossible state in normal
+    /// operation, so surfacing it makes schema changes observable.
+    #[test]
+    fn subagent_without_agent_id_increments_routing_uncertain_counter() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let opts = LocalRouterOptions {
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        };
+        let app_state = AppState {
+            opts: Arc::new(opts),
+            config: Arc::new(default_config("local-model")),
+            http: reqwest::Client::new(),
+            route_counter: Arc::new(AtomicU64::new(1)),
+            started_at: "0".to_owned(),
+        };
+
+        // agent_type header is set but NO agent_id header — this triggers
+        // is_subagent=true while agent_id=None.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
+        );
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+
+        assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
+        select_route_with_warn(&app_state, &headers, &body);
+        assert_eq!(
+            metrics.snapshot().totals.routing_uncertain,
+            1,
+            "routing_uncertain must increment when is_subagent=true but agent_id is None"
+        );
+    }
+
+    /// Regression test: local-router must track cache-read tokens in ObservedUsage.
+    /// Before the fix, `prompt_cache_tokens` was missing from ObservedUsage and
+    /// cache-read tokens were silently dropped.
+    #[test]
+    fn local_router_tracks_prompt_cache_tokens() {
+        let mut buffer = String::new();
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut prompt_cache_tokens = None;
+        // SSE with cache_read_input_tokens=1234 — the bug was that this field was lost.
+        observe_anthropic_sse_chunk(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1234,\"output_tokens\":0}}}\n\n",
+            &mut buffer,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut prompt_cache_tokens,
+        );
+        assert_eq!(prompt_cache_tokens, Some(1234)); // was lost before the fix
+    }
+
+    /// Regression test: `emit_completed_metrics` must emit a `PromptCache` update
+    /// to the metrics sink so cache-token accounting is not silently dropped.
+    /// This test FAILS if the `PromptCache` emission is removed from
+    /// `emit_completed_metrics`.
+    #[test]
+    fn emit_completed_metrics_records_prompt_cache_in_sink() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        // Register the request so RequestCompleted can move it to recent.
+        metrics.record(rayline_metrics::MetricsUpdate::RequestStarted {
+            request_id: "req-cache-1".to_owned(),
+            source: "local-router".to_owned(),
+            requested_model: Some("claude-opus".to_owned()),
+            agent_id: None,
+            agent_type: None,
+        });
+
+        emit_completed_metrics(
+            &(metrics.clone() as SharedMetricsSink),
+            "req-cache-1",
+            200,
+            Some(10),
+            Some(5),
+            Some(1234), // cache tokens — must reach the sink
+            Some("claude-opus-4-5".to_owned()),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.recent.len(), 1, "request must appear in recent");
+        assert_eq!(
+            snapshot.recent[0].prompt_cache_tokens,
+            Some(1234),
+            "PromptCache emission missing: prompt_cache_tokens not recorded in sink"
+        );
     }
 }
