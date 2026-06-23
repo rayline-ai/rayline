@@ -10,10 +10,11 @@ use std::process::Command;
 use std::process::Stdio;
 #[cfg(target_os = "macos")]
 use std::thread;
+use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::claude_daemon::{LaunchPreflight, LaunchRecord, PreflightOutcome, RequestSpec};
 use serde_json::Value;
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
@@ -31,16 +32,13 @@ const DEFAULT_PROXY_PORT: u16 = 20810;
 /// may be using. Override with `RAYLINE_ISOLATED_PROXY_PORT`.
 const DEFAULT_ISOLATED_PROXY_PORT: u16 = 20812;
 const NODE_CA_BUNDLE_FILENAME: &str = "node-ca-bundle.pem";
-const ROUTING_MODE_PROXY: &str = "proxy";
-const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
+pub(crate) const ROUTING_MODE_PROXY: &str = "proxy";
+pub(crate) const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
 const ROUTING_MODE_OVERRIDE: &str = "override";
-const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
-const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
-const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
-const STOP_COMMAND: &str = "claude daemon stop --any";
-const RAYLINE_CLAUDE_LAUNCH_TTL_SECONDS: i64 = 24 * 60 * 60;
-const DAEMON_SPAWN_MAX_DELAY_SECONDS: i64 = 60;
+pub(crate) const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
 const DIAG_PROBE_TIMEOUT_SECONDS: u64 = 8;
 const LEGACY_STATUSLINE_MARKERS: [&str; 2] = ["wksp-route-statusline", "rl-route-statusline"];
 const SHELL_COMPOSE_OPERATORS: [&str; 7] = ["&&", "||", ";", "|", "\n", "`", "$("];
@@ -118,7 +116,7 @@ pub enum RoutingMode {
     ProxySubagents,
 }
 
-fn is_proxy_routing_mode(mode: RoutingMode) -> bool {
+pub(crate) fn is_proxy_routing_mode(mode: RoutingMode) -> bool {
     matches!(mode, RoutingMode::Proxy | RoutingMode::ProxySubagents)
 }
 
@@ -251,21 +249,6 @@ async fn explicit_local_router_start_request(
         cfg,
         start_request,
     ))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonState {
-    pid: u32,
-    env_vars: std::collections::BTreeMap<String, String>,
-    env_unreadable: bool,
-    spawned_by_pid: Option<u32>,
-    started_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DaemonOwner {
-    Rayline { env_name: String, mode: RoutingMode },
-    NonRayline,
 }
 
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
@@ -422,58 +405,56 @@ async fn run_command_from_home(
         None
     };
     let mut inspect_dir = claude_config_dir(home, isolated);
-    let mut state = if claude_agent_view_disabled() {
-        None
-    } else {
-        inspect_running_daemon(&inspect_dir)
-    };
-    if warn_or_block_on_daemon_conflict(
-        state.as_ref(),
-        &env_name,
-        request.routing_mode,
-        &auto_compact_window,
-        &request.args,
+    let mut daemon_request = RequestSpec {
+        env_name: &env_name,
+        routing_mode: request.routing_mode,
+        auto_compact_window: &auto_compact_window,
+        args: &request.args,
         requested_local_port,
         requested_proxy_port,
+    };
+    let preflight = LaunchPreflight {
         home,
-        &claude_bin,
-        &inspect_dir,
+        config_dir: &inspect_dir,
+        request: &daemon_request,
+        claude_bin: &claude_bin,
         // Do not switch an implicit account-local run into isolation from the
         // conflict prompt. Users who want that shape should request it directly
         // with `--local-router --isolated` so the isolated proxy sidecar is
         // configured deliberately.
-        !isolated && local_start_request.is_none(),
-    )? == ConflictOutcome::SwitchToIsolated
-    {
-        // The user chose to run isolated: re-resolve the proxy port and re-check
-        // the isolated config dir, which may already host a daemon for a
-        // different env/mode. No further isolated escape from here.
-        isolated = true;
-        requested_proxy_port = if is_proxy_routing_mode(request.routing_mode) {
-            Some(resolve_proxy_port(true)?)
-        } else {
-            None
-        };
-        inspect_dir = claude_config_dir(home, true);
-        state = if claude_agent_view_disabled() {
-            None
-        } else {
-            inspect_running_daemon(&inspect_dir)
-        };
-        warn_or_block_on_daemon_conflict(
-            state.as_ref(),
-            &env_name,
-            request.routing_mode,
-            &auto_compact_window,
-            &request.args,
-            requested_local_port,
-            requested_proxy_port,
-            home,
-            &claude_bin,
-            &inspect_dir,
-            false,
-        )?;
+        allow_isolated: !isolated && local_start_request.is_none(),
     }
+    .resolve()?;
+    let preserve_spawned_by_pid = match preflight {
+        PreflightOutcome::Proceed(preflight) => preflight.preserve_spawned_by_pid,
+        PreflightOutcome::SwitchToIsolated => {
+            // The user chose to run isolated: re-resolve the proxy port and re-check
+            // the isolated config dir, which may already host a daemon for a
+            // different env/mode. No further isolated escape from here.
+            isolated = true;
+            requested_proxy_port = if is_proxy_routing_mode(request.routing_mode) {
+                Some(resolve_proxy_port(true)?)
+            } else {
+                None
+            };
+            inspect_dir = claude_config_dir(home, true);
+            daemon_request.requested_proxy_port = requested_proxy_port;
+            let isolated_preflight = LaunchPreflight {
+                home,
+                config_dir: &inspect_dir,
+                request: &daemon_request,
+                claude_bin: &claude_bin,
+                allow_isolated: false,
+            }
+            .resolve()?;
+            match isolated_preflight {
+                PreflightOutcome::Proceed(preflight) => preflight.preserve_spawned_by_pid,
+                PreflightOutcome::SwitchToIsolated => {
+                    unreachable!("isolated re-check cannot isolate")
+                }
+            }
+        }
+    };
     if request.diagnose {
         diag_print_preamble(&env_name, &router_url, request.routing_mode, home).await;
     }
@@ -566,22 +547,12 @@ async fn run_command_from_home(
         }
     }
 
-    let preserve_pid = state
-        .as_ref()
-        .and_then(|state| state.spawned_by_pid)
-        .or_else(|| {
-            read_daemon_lock(&inspect_dir).and_then(|(_, spawned_by_pid, _)| spawned_by_pid)
-        });
-    record_rayline_claude_launch(
+    crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
         home,
-        std::process::id(),
-        &env_name,
-        request.routing_mode,
-        requested_proxy_port,
-        requested_local_port,
-        &auto_compact_window,
-        preserve_pid,
-    );
+        pid: std::process::id(),
+        request: &daemon_request,
+        preserve_spawned_by_pid,
+    });
     Ok(command)
 }
 
@@ -1188,7 +1159,7 @@ fn inject_claude_debug(args: &[OsString]) -> Vec<OsString> {
         .collect()
 }
 
-fn claude_agent_view_disabled() -> bool {
+pub(crate) fn claude_agent_view_disabled() -> bool {
     env::var(CLAUDE_DISABLE_AGENT_VIEW_ENV).is_ok_and(|value| {
         !matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -1211,7 +1182,7 @@ fn claude_config_dir(home: &Path, isolated: bool) -> PathBuf {
 }
 
 /// The brand-private Claude config dir used by `--isolated` (e.g. `~/.rayline/cc`).
-fn isolated_cc_dir(home: &Path) -> PathBuf {
+pub(crate) fn isolated_cc_dir(home: &Path) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR).join("cc")
 }
 
@@ -1579,632 +1550,7 @@ fn make_symlink(_source: &Path, _link: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn read_daemon_lock(config_dir: &Path) -> Option<(u32, Option<u32>, Option<i64>)> {
-    let raw = fs::read_to_string(config_dir.join("daemon.lock")).ok()?;
-    let lock = serde_json::from_str::<Value>(&raw).ok()?;
-    let pid = lock.get("pid")?.as_u64()?;
-    let pid = u32::try_from(pid).ok().filter(|pid| *pid > 0)?;
-    if !pid_is_alive(pid) {
-        return None;
-    }
-    let spawned_by_pid = lock
-        .get("spawnedBy")
-        .and_then(Value::as_object)
-        .and_then(|spawned_by| spawned_by.get("pid"))
-        .and_then(Value::as_u64)
-        .and_then(|pid| u32::try_from(pid).ok())
-        .filter(|pid| *pid > 0);
-    let started_at_ms = lock.get("startedAt").and_then(Value::as_i64);
-    Some((pid, spawned_by_pid, started_at_ms))
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return true;
-        }
-        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-fn inspect_running_daemon(config_dir: &Path) -> Option<DaemonState> {
-    let (pid, spawned_by_pid, started_at_ms) = read_daemon_lock(config_dir)?;
-    match read_process_env(pid) {
-        Some(env_vars) => Some(DaemonState {
-            pid,
-            env_vars,
-            env_unreadable: false,
-            spawned_by_pid,
-            started_at_ms,
-        }),
-        None => Some(DaemonState {
-            pid,
-            env_vars: std::collections::BTreeMap::new(),
-            env_unreadable: true,
-            spawned_by_pid,
-            started_at_ms,
-        }),
-    }
-}
-
-fn read_process_env(pid: u32) -> Option<std::collections::BTreeMap<String, String>> {
-    #[cfg(target_os = "linux")]
-    {
-        return read_proc_environ(pid);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return read_ps_environ(pid);
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn read_proc_environ(pid: u32) -> Option<std::collections::BTreeMap<String, String>> {
-    let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let mut values = std::collections::BTreeMap::new();
-    for entry in raw.split(|byte| *byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let decoded = String::from_utf8_lossy(entry);
-        if let Some((key, value)) = decoded.split_once('=') {
-            if !key.is_empty() {
-                values.insert(key.to_owned(), value.to_owned());
-            }
-        }
-    }
-    Some(values)
-}
-
-#[cfg(target_os = "macos")]
-fn read_ps_environ(pid: u32) -> Option<std::collections::BTreeMap<String, String>> {
-    let output = Command::new("/bin/ps")
-        .arg("eww")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("command=")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&output.stdout);
-    parse_ps_environ_line(line.trim())
-}
-
-#[cfg(target_os = "macos")]
-fn parse_ps_environ_line(line: &str) -> Option<std::collections::BTreeMap<String, String>> {
-    if line.is_empty() {
-        return None;
-    }
-    let mut values = std::collections::BTreeMap::new();
-    for token in line.split(' ') {
-        let Some((key, value)) = token.split_once('=') else {
-            continue;
-        };
-        if is_upper_env_key(key) {
-            values.insert(key.to_owned(), value.to_owned());
-        }
-    }
-    Some(values)
-}
-
-#[cfg(target_os = "macos")]
-fn is_upper_env_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_uppercase()) {
-        return false;
-    }
-    chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
-}
-
-fn classify_daemon_owner(state: &DaemonState) -> DaemonOwner {
-    let explicit_env_name = state
-        .env_vars
-        .get(RAYLINE_ENV_NAME_ENV)
-        .filter(|env_name| crate::status::is_valid_root_env(env_name))
-        .cloned();
-    if let Some(proxy_mode) = state
-        .env_vars
-        .get("RAYLINE_CLAUDE_ROUTING_MODE")
-        .and_then(|mode| proxy_routing_mode_from_env(mode))
-    {
-        if daemon_proxy_port(&state.env_vars).is_none() {
-            return DaemonOwner::NonRayline;
-        }
-        if let Some(env_name) = explicit_env_name.as_ref() {
-            return DaemonOwner::Rayline {
-                env_name: env_name.clone(),
-                mode: proxy_mode,
-            };
-        }
-        let router_url = state
-            .env_vars
-            .get("RAYLINE_ROUTER_URL")
-            .map(|url| url.trim_end_matches('/'))
-            .unwrap_or_default();
-        for (env_name, expected_url) in router_urls() {
-            if router_url == expected_url.trim_end_matches('/') {
-                return DaemonOwner::Rayline {
-                    env_name: env_name.to_owned(),
-                    mode: proxy_mode,
-                };
-            }
-        }
-        return DaemonOwner::NonRayline;
-    }
-
-    let base_url = state
-        .env_vars
-        .get("ANTHROPIC_BASE_URL")
-        .map(|url| url.trim_end_matches('/'))
-        .unwrap_or_default();
-    if let Some(env_name) = explicit_env_name {
-        if !base_url.is_empty() {
-            return DaemonOwner::Rayline {
-                env_name,
-                mode: RoutingMode::Override,
-            };
-        }
-    }
-    for (env_name, expected_url) in router_urls() {
-        if base_url == expected_url.trim_end_matches('/') {
-            return DaemonOwner::Rayline {
-                env_name: env_name.to_owned(),
-                mode: RoutingMode::Override,
-            };
-        }
-    }
-    DaemonOwner::NonRayline
-}
-
-fn daemon_proxy_port(env_vars: &std::collections::BTreeMap<String, String>) -> Option<u16> {
-    let proxy_url = env_vars
-        .get("HTTPS_PROXY")
-        .or_else(|| env_vars.get("https_proxy"))?;
-    let parsed = url::Url::parse(proxy_url).ok()?;
-    if parsed.scheme() != "http" {
-        return None;
-    }
-    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-        return None;
-    }
-    parsed.port()
-}
-
-fn proxy_routing_mode_from_env(value: &str) -> Option<RoutingMode> {
-    match value {
-        ROUTING_MODE_PROXY => Some(RoutingMode::Proxy),
-        ROUTING_MODE_PROXY_SUBAGENTS => Some(RoutingMode::ProxySubagents),
-        _ => None,
-    }
-}
-
-fn daemon_owner_matches_request(
-    state: &DaemonState,
-    owner: &DaemonOwner,
-    requested_env: &str,
-    requested_mode: RoutingMode,
-    requested_auto_compact_window: &str,
-    requested_proxy_port: Option<u16>,
-) -> bool {
-    let DaemonOwner::Rayline { env_name, mode } = owner else {
-        return false;
-    };
-    if env_name != requested_env || *mode != requested_mode {
-        return false;
-    }
-    if state
-        .env_vars
-        .get(AUTO_COMPACT_WINDOW_ENV)
-        .map(String::as_str)
-        != Some(requested_auto_compact_window)
-    {
-        return false;
-    }
-    if !is_proxy_routing_mode(requested_mode) {
-        return true;
-    }
-    daemon_proxy_port(&state.env_vars) == requested_proxy_port
-}
-
-/// Whether a detected daemon conflict was resolved by stopping the other daemon
-/// (continue normally) or by switching this run into an isolated config dir.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConflictOutcome {
-    Continue,
-    SwitchToIsolated,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn warn_or_block_on_daemon_conflict(
-    state: Option<&DaemonState>,
-    requested_env: &str,
-    requested_mode: RoutingMode,
-    requested_auto_compact_window: &str,
-    args: &[OsString],
-    requested_local_port: Option<u16>,
-    requested_proxy_port: Option<u16>,
-    home: &Path,
-    claude_bin: &Path,
-    config_dir: &Path,
-    allow_isolated: bool,
-) -> Result<ConflictOutcome, RunError> {
-    let Some(state) = state else {
-        return Ok(ConflictOutcome::Continue);
-    };
-    if state.env_unreadable {
-        let isolated_hint = if allow_isolated {
-            format!(
-                ", or run isolated with `{} claude --isolated`",
-                crate::CLI_BIN
-            )
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "Warning: A Claude Code daemon is running (PID {}) but its configuration could not be verified.\nIf background sessions bypass the {} router, stop the daemon with `{STOP_COMMAND}`{isolated_hint} and re-run.",
-            state.pid,
-            crate::DISPLAY_NAME
-        );
-        return Ok(ConflictOutcome::Continue);
-    }
-    let owner = classify_daemon_owner(state);
-    // A `--local` launch reconfigures the proxy to route on-device, but in proxy
-    // mode the daemon's env vars are identical to a non-local proxy daemon, so the
-    // env-based owner match cannot prove a running daemon is the matching local
-    // one. Defer to launch-log attribution for local requests, so a cloud daemon
-    // is treated as a conflict (prompt to stop it first) rather than being silently
-    // hijacked when the local serve takes over its proxy port.
-    let owner_matches = requested_local_port.is_none()
-        && daemon_owner_matches_request(
-            state,
-            &owner,
-            requested_env,
-            requested_mode,
-            requested_auto_compact_window,
-            requested_proxy_port,
-        );
-    if !owner_matches
-        && !daemon_was_launched_by_wksp(
-            state,
-            home,
-            requested_env,
-            requested_mode,
-            requested_auto_compact_window,
-            requested_local_port,
-            requested_proxy_port,
-        )
-    {
-        let message = format_daemon_conflict_error(
-            requested_env,
-            requested_mode,
-            args,
-            state,
-            &owner,
-            allow_isolated,
-        );
-        return resolve_daemon_conflict(
-            state.pid,
-            &message,
-            claude_bin,
-            config_dir,
-            allow_isolated,
-        );
-    }
-    Ok(ConflictOutcome::Continue)
-}
-
-/// Choice from the interactive daemon-conflict prompt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConflictChoice {
-    StopAndContinue,
-    RunIsolated,
-    Cancel,
-}
-
-fn parse_conflict_choice(answer: &str, allow_isolated: bool) -> ConflictChoice {
-    let answer = answer.trim();
-    if allow_isolated
-        && (answer.eq_ignore_ascii_case("i") || answer.eq_ignore_ascii_case("isolated"))
-    {
-        return ConflictChoice::RunIsolated;
-    }
-    if answer.is_empty()
-        || answer.eq_ignore_ascii_case("s")
-        || answer.eq_ignore_ascii_case("y")
-        || answer.eq_ignore_ascii_case("yes")
-    {
-        ConflictChoice::StopAndContinue
-    } else {
-        ConflictChoice::Cancel
-    }
-}
-
-/// Resolve a daemon conflict interactively. We offer to stop the conflicting
-/// daemon (continue normally) and, when this run is not already isolated, to run
-/// in a separate config dir that gets its own supervisor. Declining, or any
-/// non-terminal session, surfaces the full manual instructions and aborts so
-/// scripts and CI keep the prior hard-error behavior.
-fn resolve_daemon_conflict(
-    pid: u32,
-    message: &str,
-    claude_bin: &Path,
-    config_dir: &Path,
-    allow_isolated: bool,
-) -> Result<ConflictOutcome, RunError> {
-    // Only prompt for a genuinely interactive session. Print-mode pipelines
-    // (`claude -p ... | cmd`) keep stdin/stderr on the terminal but pipe stdout;
-    // there we must keep the prior hard error rather than block the pipeline or
-    // let a stray Enter stop the shared daemon.
-    if !(io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal()) {
-        return Err(RunError::DaemonConflict(message.to_owned()));
-    }
-
-    let brand = crate::DISPLAY_NAME;
-    if allow_isolated {
-        let isolated_dir = dirs::home_dir()
-            .map(|home| isolated_cc_dir(&home).display().to_string())
-            .unwrap_or_else(|| format!("~/{}/cc", crate::DOT_CONFIG_DIR));
-        eprintln!(
-            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped or bypassed before this {brand} session can start.\n\n  [s] Stop it and start a {brand} daemon here  ({STOP_COMMAND})\n  [i] Run isolated  (separate daemon under {isolated_dir}; leaves the other running)\n  [c] Cancel"
-        );
-        eprint!("Choose [s/i/c] (s): ");
-    } else {
-        eprintln!(
-            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped before this {brand} session can start."
-        );
-        eprint!("Stop it and continue? [Y/n] ");
-    }
-    if io::stderr().flush().is_err() {
-        return Err(RunError::DaemonConflict(message.to_owned()));
-    }
-
-    let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        return Err(RunError::DaemonConflict(message.to_owned()));
-    }
-
-    match parse_conflict_choice(&answer, allow_isolated) {
-        ConflictChoice::StopAndContinue => {
-            stop_conflicting_daemon(claude_bin, config_dir).map(|()| ConflictOutcome::Continue)
-        }
-        ConflictChoice::RunIsolated => Ok(ConflictOutcome::SwitchToIsolated),
-        // Declined: print the full instructions so the user can switch by hand.
-        ConflictChoice::Cancel => Err(RunError::DaemonConflict(message.to_owned())),
-    }
-}
-
-/// Run `claude daemon stop --any` against `config_dir`, inheriting stdio so its
-/// output is visible. The caller then proceeds with the normal launch, which
-/// spawns a fresh router-configured daemon, equivalent to re-running by hand.
-/// Setting `CLAUDE_CONFIG_DIR` is what makes the stop target the right daemon:
-/// for an isolated conflict it must stop the daemon in `isolated_cc_dir`, not
-/// the default (or inherited) config dir.
-fn stop_conflicting_daemon(claude_bin: &Path, config_dir: &Path) -> Result<(), RunError> {
-    eprintln!("Stopping the current daemon ({STOP_COMMAND})...");
-    match Command::new(claude_bin)
-        .args(["daemon", "stop", "--any"])
-        .env(CLAUDE_CONFIG_DIR_ENV, config_dir)
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(RunError::DaemonConflict(format!(
-            "`{STOP_COMMAND}` exited with code {}. Stop the daemon manually and re-run.",
-            status.code().unwrap_or(-1)
-        ))),
-        Err(error) => Err(RunError::DaemonConflict(format!(
-            "Could not run `{STOP_COMMAND}`: {error}. Stop the daemon manually and re-run."
-        ))),
-    }
-}
-
-fn daemon_was_launched_by_wksp(
-    state: &DaemonState,
-    home: &Path,
-    requested_env: &str,
-    requested_mode: RoutingMode,
-    requested_auto_compact_window: &str,
-    requested_local_port: Option<u16>,
-    requested_proxy_port: Option<u16>,
-) -> bool {
-    let Some(spawned_by_pid) = state.spawned_by_pid else {
-        return false;
-    };
-    let Some(started_at_ms) = state.started_at_ms else {
-        return false;
-    };
-    for entry in read_rayline_claude_launches(home) {
-        if entry.get("pid").and_then(Value::as_u64) != Some(u64::from(spawned_by_pid)) {
-            continue;
-        }
-        if entry.get("env").and_then(Value::as_str) != Some(requested_env) {
-            continue;
-        }
-        if entry.get("routing_mode").and_then(Value::as_str)
-            != Some(routing_mode_name(requested_mode))
-        {
-            continue;
-        }
-        if entry.get("auto_compact_window").and_then(Value::as_str)
-            != Some(requested_auto_compact_window)
-        {
-            continue;
-        }
-        if is_proxy_routing_mode(requested_mode)
-            && entry.get("proxy_port").and_then(Value::as_u64)
-                != requested_proxy_port.map(u64::from)
-        {
-            continue;
-        }
-        if entry.get("local_injector_port").and_then(Value::as_u64)
-            != requested_local_port.map(u64::from)
-        {
-            continue;
-        }
-        let Some(ts) = entry.get("ts").and_then(Value::as_i64) else {
-            continue;
-        };
-        let delta_ms = started_at_ms - (ts * 1000);
-        if (0..=DAEMON_SPAWN_MAX_DELAY_SECONDS * 1000).contains(&delta_ms) {
-            return true;
-        }
-    }
-    false
-}
-
-fn format_daemon_conflict_error(
-    requested_env: &str,
-    requested_mode: RoutingMode,
-    args: &[OsString],
-    state: &DaemonState,
-    owner: &DaemonOwner,
-    allow_isolated: bool,
-) -> String {
-    let env_flag = String::new();
-    let arg_str = if args.is_empty() {
-        "agents".to_owned()
-    } else {
-        args.iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    // Proxy is the default routing mode, so only spell out non-default modes.
-    let mode_flag = match requested_mode {
-        RoutingMode::Proxy => String::new(),
-        RoutingMode::Override | RoutingMode::ProxySubagents => {
-            format!("--routing-mode {} ", routing_mode_name(requested_mode))
-        }
-    };
-    let rerun = format!("{} {env_flag}claude {mode_flag}{arg_str}", crate::CLI_BIN)
-        .trim_end()
-        .to_owned();
-    // When isolation is available, surface it as a third path that keeps the
-    // other daemon running instead of stopping it.
-    let isolated_alt = if allow_isolated {
-        let rerun_isolated = format!(
-            "{} {env_flag}claude --isolated {mode_flag}{arg_str}",
-            crate::CLI_BIN
-        )
-        .trim_end()
-        .to_owned();
-        format!(
-            "\n\nOr run alongside it in an isolated config dir (~/{}/cc):\n  {rerun_isolated}",
-            crate::DOT_CONFIG_DIR
-        )
-    } else {
-        String::new()
-    };
-    match owner {
-        DaemonOwner::Rayline { env_name, mode } => {
-            let existing_mode = routing_mode_name(*mode);
-            let requested_mode = routing_mode_name(requested_mode);
-            format!(
-                "A {} {env_name} {existing_mode}-mode daemon is running (PID {}).\n\nCannot start a {requested_env} {requested_mode}-mode daemon while the {env_name} {existing_mode}-mode daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
-                crate::DISPLAY_NAME,
-                state.pid
-            )
-        }
-        DaemonOwner::NonRayline => format!(
-            "A non-{} Claude Code daemon is running (PID {}).\n\n{} claude needs to start a daemon configured for the\n{} router, but cannot do so while another daemon is active.\nThe current daemon's API calls go directly to Anthropic, not the\n{} router.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
-            crate::DISPLAY_NAME,
-            state.pid,
-            crate::CLI_BIN,
-            crate::DISPLAY_NAME,
-            crate::DISPLAY_NAME
-        ),
-    }
-}
-
-fn read_rayline_claude_launches(home: &Path) -> Vec<Value> {
-    let raw = match fs::read_to_string(rayline_claude_launches_path(home)) {
-        Ok(raw) => raw,
-        Err(_) => return Vec::new(),
-    };
-    serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(Value::is_object)
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_rayline_claude_launch(
-    home: &Path,
-    pid: u32,
-    env_name: &str,
-    routing_mode: RoutingMode,
-    proxy_port: Option<u16>,
-    local_injector_port: Option<u16>,
-    auto_compact_window: &str,
-    preserve_pid: Option<u32>,
-) {
-    let now = unix_now_secs();
-    let mut pruned = Vec::new();
-    for entry in read_rayline_claude_launches(home) {
-        if preserve_pid
-            .is_some_and(|pid| entry.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
-        {
-            pruned.push(entry);
-            continue;
-        }
-        let Some(ts) = entry.get("ts").and_then(Value::as_i64) else {
-            continue;
-        };
-        if now - ts < RAYLINE_CLAUDE_LAUNCH_TTL_SECONDS {
-            pruned.push(entry);
-        }
-    }
-    pruned.push(serde_json::json!({
-        "pid": pid,
-        "env": env_name,
-        "routing_mode": routing_mode_name(routing_mode),
-        "auto_compact_window": auto_compact_window,
-        "proxy_port": proxy_port,
-        "local_injector_port": local_injector_port,
-        "ts": now,
-    }));
-    let path = rayline_claude_launches_path(home);
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    let Ok(contents) = serde_json::to_string(&pruned) else {
-        return;
-    };
-    if fs::write(&tmp_path, contents).is_err() {
-        return;
-    }
-    let _ = fs::rename(tmp_path, path);
-}
-
-fn rayline_claude_launches_path(home: &Path) -> PathBuf {
-    default_home_path(Some(home), crate::CLAUDE_LAUNCHES_SUFFIX)
-}
-
-fn routing_mode_name(mode: RoutingMode) -> &'static str {
+pub(crate) fn routing_mode_name(mode: RoutingMode) -> &'static str {
     match mode {
         RoutingMode::Override => ROUTING_MODE_OVERRIDE,
         RoutingMode::Proxy => ROUTING_MODE_PROXY,
@@ -2221,13 +1567,6 @@ fn proxy_routing_mode_name(mode: RoutingMode) -> &'static str {
         // in `run` where `Override` takes the `configure_override_env` branch.
         RoutingMode::Override => unreachable!("override mode does not start a proxy"),
     }
-}
-
-fn unix_now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
 }
 
 async fn diag_print_preamble(
@@ -2435,10 +1774,6 @@ fn error_kind(error: &reqwest::Error) -> &'static str {
     } else {
         "Http"
     }
-}
-
-fn router_urls() -> [(&'static str, &'static str); 1] {
-    [("prod", crate::ROUTER_PROD_URL)]
 }
 
 fn diag_probe_hosts(router_url: &str) -> Vec<String> {
