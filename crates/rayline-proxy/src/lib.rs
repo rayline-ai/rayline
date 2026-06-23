@@ -20,8 +20,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use rayline_authcache::{
@@ -1701,17 +1701,12 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                         return None;
                     }
                     Err(error) => {
-                        warn!(
-                            "failed to decode gzip response body for metrics: {error}"
-                        );
+                        warn!("failed to decode gzip response body for metrics: {error}");
                         return None;
                     }
                 }
             }
-            "deflate" => match decode_deflate_body(decoded) {
-                Some(bytes) => bytes,
-                None => return None,
-            },
+            "deflate" => decode_deflate_body(decoded)?,
             "br" => {
                 match read_bounded(
                     brotli::Decompressor::new(Cursor::new(decoded), 4096),
@@ -1727,9 +1722,7 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                         return None;
                     }
                     Err(error) => {
-                        warn!(
-                            "failed to decode brotli response body for metrics: {error}"
-                        );
+                        warn!("failed to decode brotli response body for metrics: {error}");
                         return None;
                     }
                 }
@@ -1738,9 +1731,7 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                 let decoder = match zstd::stream::read::Decoder::new(Cursor::new(decoded)) {
                     Ok(d) => d,
                     Err(error) => {
-                        warn!(
-                            "failed to initialize zstd decoder for metrics: {error}"
-                        );
+                        warn!("failed to initialize zstd decoder for metrics: {error}");
                         return None;
                     }
                 };
@@ -1755,15 +1746,15 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                         return None;
                     }
                     Err(error) => {
-                        warn!(
-                            "failed to decode zstd response body for metrics: {error}"
-                        );
+                        warn!("failed to decode zstd response body for metrics: {error}");
                         return None;
                     }
                 }
             }
             other => {
-                warn!("unsupported content-encoding {other:?} for metrics decode; skipping metrics");
+                warn!(
+                    "unsupported content-encoding {other:?} for metrics decode; skipping metrics"
+                );
                 return None;
             }
         };
@@ -2520,15 +2511,9 @@ impl LocalCa {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     if let Some(parent) = cert_path.parent() {
-                        let _ = fs::set_permissions(
-                            parent,
-                            fs::Permissions::from_mode(0o700),
-                        );
+                        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
                     }
-                    let _ = fs::set_permissions(
-                        key_path,
-                        fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600));
                 }
                 return Ok(ca);
             }
@@ -2951,8 +2936,7 @@ mod tests {
     fn decompression_is_capped_and_skips_metrics_on_bomb() {
         // 64 MiB of zeros compresses to a tiny gzip stream — a classic gzip bomb pattern.
         let plaintext = vec![0u8; 64 * 1024 * 1024];
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         use std::io::Write;
         encoder.write_all(&plaintext).unwrap();
         let bomb = encoder.finish().unwrap();
@@ -2968,8 +2952,7 @@ mod tests {
     #[test]
     fn decompression_succeeds_for_small_gzip_body() {
         let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         use std::io::Write;
         encoder.write_all(body).unwrap();
         let compressed = encoder.finish().unwrap();
@@ -3900,7 +3883,10 @@ mod tests {
             "agent-xyz".to_owned(),
             Some(&(metrics.clone() as Arc<dyn rayline_metrics::MetricsSink>)),
         );
-        assert!(incremented, "must return true when the uncertain branch fires");
+        assert!(
+            incremented,
+            "must return true when the uncertain branch fires"
+        );
         assert_eq!(
             metrics.snapshot().totals.routing_uncertain,
             1,
@@ -3971,9 +3957,11 @@ mod tests {
     /// silently break without this check.
     #[test]
     fn load_or_generate_regenerates_expired_ca() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+            KeyUsagePurpose,
+        };
         use time::{Duration, OffsetDateTime};
-        use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa,
-                    KeyPair, KeyUsagePurpose};
 
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("ca.pem");
@@ -4003,8 +3991,7 @@ mod tests {
         let ca = LocalCa::load_or_generate(&cert_path, &key_path).unwrap();
         let certs = certs_from_pem(&ca.cert_pem).unwrap();
         let der = certs.into_iter().next().unwrap();
-        let (_, cert_parsed) =
-            x509_parser::parse_x509_certificate(&der).unwrap();
+        let (_, cert_parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
         assert!(
             cert_parsed.tbs_certificate.validity.is_valid(),
             "regenerated CA must be currently valid"

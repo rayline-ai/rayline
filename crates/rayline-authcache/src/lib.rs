@@ -16,7 +16,11 @@ pub fn new_auth_cache() -> AuthCache {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-pub fn stash_auth_headers(cache: &AuthCache, doc_id: String, auth_headers: HashMap<String, String>) {
+pub fn stash_auth_headers(
+    cache: &AuthCache,
+    doc_id: String,
+    auth_headers: HashMap<String, String>,
+) {
     if let Ok(mut guard) = cache.lock() {
         evict_auth_cache_overflow(&mut guard, &doc_id);
         guard.insert(doc_id, auth_headers);

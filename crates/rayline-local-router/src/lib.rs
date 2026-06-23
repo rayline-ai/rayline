@@ -1130,7 +1130,7 @@ async fn response_from_reqwest(
                 }
                 emit_completed_metrics(
                     metrics,
-                    &request_id,
+                    request_id,
                     status.as_u16(),
                     input_tokens,
                     output_tokens,
@@ -2284,8 +2284,7 @@ mod tests {
         retain_for_metrics(true, &mut buf, b"hello");
         retain_for_metrics(true, &mut buf, b" world");
         assert_eq!(
-            buf,
-            b"hello world",
+            buf, b"hello world",
             "body must be retained in full when has_metrics=true"
         );
     }
@@ -2323,8 +2322,10 @@ mod tests {
     #[test]
     fn subagent_without_agent_id_increments_routing_uncertain_counter() {
         let metrics = rayline_metrics::RouterMetrics::new("test");
-        let mut opts = LocalRouterOptions::default();
-        opts.metrics = Some(metrics.clone());
+        let opts = LocalRouterOptions {
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        };
         let app_state = AppState {
             opts: Arc::new(opts),
             config: Arc::new(default_config("local-model")),

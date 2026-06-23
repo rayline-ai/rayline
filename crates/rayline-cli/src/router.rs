@@ -963,30 +963,25 @@ fn draw_top_summary(
             TOP_REFRESH_INTERVAL.as_millis(),
         ),
     )?;
-    draw_line(
-        stdout,
-        y,
-        width,
-        &{
-            let uncertain = totals_u64(totals, "routing_uncertain");
-            let uncertain_label = if uncertain > 0 {
-                format!("  routing_uncertain={uncertain}")
-            } else {
-                String::new()
-            };
-            format!(
-                "overall completed={}  errors={}  local={}  remote={}  input={}  output={}{}  {}",
-                totals_u64(totals, "completed_requests"),
-                totals_u64(totals, "errored_requests"),
-                totals_u64(totals, "local_requests"),
-                totals_u64(totals, "remote_requests"),
-                totals_u64(totals, "input_tokens"),
-                totals_u64(totals, "output_tokens"),
-                uncertain_label,
-                llama_perf_summary(snapshot),
-            )
-        },
-    )
+    draw_line(stdout, y, width, &{
+        let uncertain = totals_u64(totals, "routing_uncertain");
+        let uncertain_label = if uncertain > 0 {
+            format!("  routing_uncertain={uncertain}")
+        } else {
+            String::new()
+        };
+        format!(
+            "overall completed={}  errors={}  local={}  remote={}  input={}  output={}{}  {}",
+            totals_u64(totals, "completed_requests"),
+            totals_u64(totals, "errored_requests"),
+            totals_u64(totals, "local_requests"),
+            totals_u64(totals, "remote_requests"),
+            totals_u64(totals, "input_tokens"),
+            totals_u64(totals, "output_tokens"),
+            uncertain_label,
+            llama_perf_summary(snapshot),
+        )
+    })
 }
 
 fn llama_perf_summary(snapshot: &Value) -> String {
@@ -1735,8 +1730,8 @@ async fn start_from_home_with_client(
         if let Some(existing) = read_pid(&paths.pid_file) {
             if process_exists(existing) {
                 let meta = read_meta(&paths.meta_file);
-                let health_port = parse_optional_port(meta.get("injector_port"))
-                    .unwrap_or(request.injector_port);
+                let health_port =
+                    parse_optional_port(meta.get("injector_port")).unwrap_or(request.injector_port);
                 let health = healthz(client, health_port).await;
                 let is_rld = is_rld_process(existing, &meta, RldMode::Serve, client).await;
                 let metadata_matches = metadata_matches_config(&meta, &requested_meta);
@@ -3606,11 +3601,7 @@ mod tests {
             // Either old or new content is fine, but it must not be empty
             // and every line must be parseable as key=value.
             for line in text.lines() {
-                assert!(
-                    line.contains('='),
-                    "torn meta line (no '='): {:?}",
-                    line
-                );
+                assert!(line.contains('='), "torn meta line (no '='): {line:?}");
             }
         }
         writer.join().unwrap();
@@ -4469,9 +4460,7 @@ fn atomic_write(dest: &Path, content: &[u8]) -> io::Result<()> {
     // filesystem (cross-filesystem rename is not atomic on Linux).
     let tmp_path = dir.join(format!(
         ".tmp-{}-{}",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("write"),
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("write"),
         std::process::id()
     ));
     std::fs::write(&tmp_path, content)?;
@@ -4535,8 +4524,8 @@ impl RouterPaths {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let data_dir = std::env::temp_dir()
-            .join(format!("rayline-lock-test-{}-{nanos}", std::process::id()));
+        let data_dir =
+            std::env::temp_dir().join(format!("rayline-lock-test-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&data_dir).expect("could not create temp test dir");
         Self::in_dir(data_dir)
     }

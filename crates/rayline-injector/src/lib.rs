@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use rayline_authcache::{
     AuthCache, MAX_AUTH_CACHE_ENTRIES, evict_auth_cache_overflow, new_auth_cache,
@@ -343,5 +343,4 @@ mod tests {
         assert!(!is_hop_by_hop_str("authorization"));
         assert!(!is_hop_by_hop_str("x-rayline-local-hint"));
     }
-
 }

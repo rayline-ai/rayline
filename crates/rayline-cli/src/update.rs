@@ -351,22 +351,29 @@ fn checksums_sig_url_for(version: &str) -> String {
 /// Fails closed: returns `Err` if `sig_bytes` is empty, malformed, or no
 /// pinned key validates the signature. The caller must call this BEFORE
 /// trusting any checksum from `sums`.
-pub fn verify_signature(sums: &[u8], sig_bytes: &[u8], pubkeys: &[&str]) -> Result<(), UpdateError> {
+pub fn verify_signature(
+    sums: &[u8],
+    sig_bytes: &[u8],
+    pubkeys: &[&str],
+) -> Result<(), UpdateError> {
     if sig_bytes.is_empty() {
         return Err(UpdateError::Signature(
             "SHA256SUMS.minisig is empty — refusing to install unsigned update".to_owned(),
         ));
     }
 
-    let sig = Signature::decode(
-        std::str::from_utf8(sig_bytes)
-            .map_err(|_| UpdateError::Signature("SHA256SUMS.minisig is not valid UTF-8".to_owned()))?,
-    )
-    .map_err(|error| UpdateError::Signature(format!("malformed SHA256SUMS.minisig: {error}")))?;
+    let sig =
+        Signature::decode(std::str::from_utf8(sig_bytes).map_err(|_| {
+            UpdateError::Signature("SHA256SUMS.minisig is not valid UTF-8".to_owned())
+        })?)
+        .map_err(|error| {
+            UpdateError::Signature(format!("malformed SHA256SUMS.minisig: {error}"))
+        })?;
 
     for pubkey_str in pubkeys {
-        let pk = PublicKey::from_base64(pubkey_str)
-            .map_err(|error| UpdateError::Signature(format!("invalid pinned public key: {error}")))?;
+        let pk = PublicKey::from_base64(pubkey_str).map_err(|error| {
+            UpdateError::Signature(format!("invalid pinned public key: {error}"))
+        })?;
         if pk.verify(sums, &sig, true).is_ok() {
             return Ok(());
         }
@@ -425,9 +432,8 @@ async fn download_and_verify(
     let sig_bytes = fs::read(&sig_path).map_err(UpdateError::from)?;
     verify_signature(&sums_bytes, &sig_bytes, crate::MINISIGN_PUBLIC_KEYS)?;
 
-    let sums = String::from_utf8(sums_bytes).map_err(|_| {
-        UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned())
-    })?;
+    let sums = String::from_utf8(sums_bytes)
+        .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
 
     download_to(&artifact_url_for(version, platform_tag), &launcher_path).await?;
     download_to(
@@ -1085,10 +1091,7 @@ mod tests {
     fn verify_signature_empty_sig_fails_closed() {
         let sums = fixture("SHA256SUMS");
         let result = verify_signature(&sums, &[], &[TEST_PUBKEY]);
-        assert!(
-            result.is_err(),
-            "absent/empty signature must fail closed"
-        );
+        assert!(result.is_err(), "absent/empty signature must fail closed");
         let Err(UpdateError::Signature(msg)) = result else {
             panic!("expected Signature error");
         };
