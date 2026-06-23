@@ -287,6 +287,9 @@ labeled 0-9a-f cycle that row's target; n/p page; k cycles the kind filter
 (all / read-only / has-edit / unknown); / searches by agent name; L/C send the
 whole filtered set to local/cloud; s (or Enter) saves; q (or Esc) quits.
 
+Settings stay compact: only agents that differ from the default (cloud) are
+saved, so a long tail of rarely-used agents costs nothing.
+
 Options:
   --json    Print discovered agents and their default target as JSON; no prompt
   --all     Include rarely-used agents (otherwise the long tail is hidden)

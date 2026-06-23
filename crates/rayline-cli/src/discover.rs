@@ -130,10 +130,46 @@ impl SubagentTarget {
     }
 }
 
-/// The persisted per-subagent routing decisions (agent type → target).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// The persisted per-subagent routing decisions. Stored compactly: a single
+/// `default` target for every subagent, plus `routes` holding ONLY the agents
+/// whose target differs from the default. With the usual `cloud` default this
+/// is a handful of entries even for users with hundreds of long-tail agents.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubagentRoutes {
+    pub default: SubagentTarget,
     pub routes: BTreeMap<String, SubagentTarget>,
+}
+
+impl Default for SubagentRoutes {
+    fn default() -> Self {
+        Self {
+            default: SubagentTarget::Cloud,
+            routes: BTreeMap::new(),
+        }
+    }
+}
+
+impl SubagentRoutes {
+    /// The effective target for an agent: its explicit exception, else the default.
+    fn effective(&self, agent: &str) -> SubagentTarget {
+        self.routes
+            .get(agent)
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
+
+    /// Compact a full agent→target map: keep only entries that differ from the
+    /// default. Used at save time so the stored file stays small.
+    fn compact(
+        default: SubagentTarget,
+        full: impl IntoIterator<Item = (String, SubagentTarget)>,
+    ) -> Self {
+        let routes = full
+            .into_iter()
+            .filter(|(_, target)| target != &default)
+            .collect();
+        Self { default, routes }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,14 +416,25 @@ fn default_target(agent_type: &str, capability: Capability) -> SubagentTarget {
 
 pub fn read_subagent_routes(home: &Path) -> Option<SubagentRoutes> {
     let entry = status::read_settings(home)?.get("subagent_routes")?.clone();
-    let routes_obj = entry.get("routes")?.as_object()?;
+    // `default` is the fallback for any unlisted agent; absent (legacy files)
+    // means cloud. `routes` then holds only the exceptions.
+    let default = entry
+        .get("default")
+        .and_then(SubagentTarget::from_json)
+        .unwrap_or(SubagentTarget::Cloud);
     let mut routes = BTreeMap::new();
-    for (agent, target) in routes_obj {
-        if let Some(target) = SubagentTarget::from_json(target) {
-            routes.insert(agent.clone(), target);
+    if let Some(routes_obj) = entry.get("routes").and_then(Value::as_object) {
+        for (agent, target) in routes_obj {
+            if let Some(target) = SubagentTarget::from_json(target) {
+                // Drop any entry that merely restates the default (keeps legacy
+                // verbose files compact once re-read).
+                if target != default {
+                    routes.insert(agent.clone(), target);
+                }
+            }
         }
     }
-    Some(SubagentRoutes { routes })
+    Some(SubagentRoutes { default, routes })
 }
 
 pub fn write_subagent_routes_in_home(home: &Path, routes: &SubagentRoutes) -> io::Result<()> {
@@ -399,12 +446,17 @@ pub fn write_subagent_routes_in_home(home: &Path, routes: &SubagentRoutes) -> io
         .expect("settings is an object by construction");
     let mut routes_json = serde_json::Map::new();
     for (agent, target) in &routes.routes {
-        routes_json.insert(agent.clone(), target.to_json());
+        // Never persist an entry equal to the default — that's what keeps the
+        // file compact for users with a long tail of agents.
+        if target != &routes.default {
+            routes_json.insert(agent.clone(), target.to_json());
+        }
     }
     object.insert(
         "subagent_routes".to_owned(),
         json!({
             "schema": SUBAGENT_ROUTES_SCHEMA,
+            "default": routes.default.to_json(),
             "routes": Value::Object(routes_json),
         }),
     );
@@ -589,20 +641,30 @@ pub struct Row {
 
 /// Assemble the editable rows: discovered agents (filtered to the meaningful set
 /// unless `include_all`), plus any anchor or previously-decided agent that
-/// wasn't discovered, so prior choices stay visible. Existing decisions win over
-/// computed defaults.
+/// wasn't discovered, so prior choices stay visible.
+///
+/// `configured` is the saved mapping, or `None` on the very first run. On first
+/// run each agent gets the read-only heuristic (read-only/anchor → local) to
+/// seed sensible exceptions; once configured, an agent's target is its stored
+/// exception, else the configured default (so the long tail follows the default
+/// predictably rather than re-applying the heuristic).
 pub fn build_rows(
     discovered: &[DiscoveredAgent],
     index: &HashMap<String, Capability>,
-    existing: &SubagentRoutes,
+    configured: Option<&SubagentRoutes>,
     include_all: bool,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    let target_for = |agent: &str, capability: Capability| match configured {
+        Some(config) => config.effective(agent),
+        None => default_target(agent, capability),
+    };
+
     for agent in discovered {
         let capability = capability_of(&agent.agent_type, index);
-        let decided = existing.routes.contains_key(&agent.agent_type);
+        let decided = configured.is_some_and(|c| c.routes.contains_key(&agent.agent_type));
         let anchored = crate::onboarding::LOCAL_DEFAULT_SUBAGENTS
             .iter()
             .any(|anchor| anchor.eq_ignore_ascii_case(&agent.agent_type));
@@ -614,42 +676,35 @@ pub fn build_rows(
         if !meaningful {
             continue;
         }
-        let target = existing
-            .routes
-            .get(&agent.agent_type)
-            .cloned()
-            .unwrap_or_else(|| default_target(&agent.agent_type, capability));
         seen.insert(agent.agent_type.clone());
         rows.push(Row {
             agent_type: agent.agent_type.clone(),
             uses: agent.uses,
             capability,
-            target,
+            target: target_for(&agent.agent_type, capability),
         });
     }
 
     // Anchors that never appeared in history still deserve a row (the default
     // read-only allowlist), as does any previously-decided agent.
+    let decided_keys = configured
+        .into_iter()
+        .flat_map(|c| c.routes.keys().cloned());
     let extras = crate::onboarding::LOCAL_DEFAULT_SUBAGENTS
         .iter()
         .map(|anchor| (*anchor).to_owned())
-        .chain(existing.routes.keys().cloned());
+        .chain(decided_keys);
     for agent in extras {
         if seen.contains(&agent) {
             continue;
         }
         seen.insert(agent.clone());
         let capability = capability_of(&agent, index);
-        let target = existing
-            .routes
-            .get(&agent)
-            .cloned()
-            .unwrap_or_else(|| default_target(&agent, capability));
         rows.push(Row {
-            agent_type: agent,
+            agent_type: agent.clone(),
             uses: 0,
             capability,
-            target,
+            target: target_for(&agent, capability),
         });
     }
     rows
@@ -744,6 +799,9 @@ pub enum PickerAction {
 /// row regardless of the active filter.
 pub struct PickerState {
     pub rows: Vec<Row>,
+    /// The fallback target for unlisted agents; only rows differing from it are
+    /// persisted (keeps the saved file compact).
+    pub default: SubagentTarget,
     pub filter: KindFilter,
     /// Lowercased substring filter on the agent name; empty = no name filter.
     pub query: String,
@@ -751,9 +809,10 @@ pub struct PickerState {
 }
 
 impl PickerState {
-    pub fn new(rows: Vec<Row>) -> Self {
+    pub fn new(rows: Vec<Row>, default: SubagentTarget) -> Self {
         Self {
             rows,
+            default,
             filter: KindFilter::All,
             query: String::new(),
             page: 0,
@@ -836,13 +895,12 @@ impl PickerState {
     }
 }
 
-fn rows_to_routes(rows: &[Row]) -> SubagentRoutes {
-    SubagentRoutes {
-        routes: rows
-            .iter()
-            .map(|row| (row.agent_type.clone(), row.target.clone()))
-            .collect(),
-    }
+fn rows_to_routes(rows: &[Row], default: SubagentTarget) -> SubagentRoutes {
+    SubagentRoutes::compact(
+        default,
+        rows.iter()
+            .map(|row| (row.agent_type.clone(), row.target.clone())),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -858,10 +916,14 @@ pub async fn run_subagents_command(json: bool, include_all: bool) -> Result<(), 
     eprintln!("Scanning your Claude Code history for subagents…");
     let discovered = discover_agents(&claude_projects_roots(&home));
     let index = load_agent_definitions(&agent_definition_dirs(&home, &cwd));
-    let existing = read_subagent_routes(&home).unwrap_or_default();
+    let existing = read_subagent_routes(&home);
+    let default = existing
+        .as_ref()
+        .map(|e| e.default.clone())
+        .unwrap_or(SubagentTarget::Cloud);
 
     if json {
-        print_inventory_json(&discovered, &index, &existing);
+        print_inventory_json(&discovered, &index, existing.as_ref());
         return Ok(());
     }
 
@@ -875,7 +937,7 @@ pub async fn run_subagents_command(json: bool, include_all: bool) -> Result<(), 
     }
 
     let menu = target_menu(&home);
-    let rows = build_rows(&discovered, &index, &existing, include_all);
+    let rows = build_rows(&discovered, &index, existing.as_ref(), include_all);
     if rows.is_empty() {
         eprintln!(
             "No subagents discovered in your history. The read-only default ({} agents) applies under `--local`.",
@@ -884,7 +946,12 @@ pub async fn run_subagents_command(json: bool, include_all: bool) -> Result<(), 
         return Ok(());
     }
 
-    run_picker(&home, &menu, PickerState::new(rows), discovered.len())
+    run_picker(
+        &home,
+        &menu,
+        PickerState::new(rows, default),
+        discovered.len(),
+    )
 }
 
 /// RAII guard: enter raw mode + alternate screen, restore on drop so a panic or
@@ -982,7 +1049,8 @@ fn run_picker(
         return Ok(());
     }
 
-    let routes = rows_to_routes(&state.rows);
+    let routes = rows_to_routes(&state.rows, state.default.clone());
+    let stored = routes.routes.len();
     write_subagent_routes_in_home(home, &routes).map_err(|e| e.to_string())?;
     // Refresh the managed router config so the change takes effect next launch.
     crate::onboarding::write_default_local_routes(home).map_err(|e| e.to_string())?;
@@ -993,7 +1061,8 @@ fn run_picker(
         .filter(|r| !matches!(r.target, SubagentTarget::Cloud))
         .count();
     eprintln!(
-        "\nSaved. {local} subagent(s) route to local under `{cli} claude --local`; the rest stay on cloud.",
+        "\nSaved {stored} exception(s) (default: {default}); {local} subagent(s) route to local under `{cli} claude --local`.",
+        default = state.default.short_label(),
         cli = crate::CLI_BIN,
     );
     Ok(())
@@ -1021,8 +1090,9 @@ fn draw_picker(
     };
     let mut lines: Vec<String> = vec![
         format!(
-            "Map {discovered_total} subagent(s) to local/cloud for `{} claude --local`.",
-            crate::CLI_BIN
+            "Map {discovered_total} subagent(s) for `{} claude --local`.  Unlisted agents → {default} (only changes are saved).",
+            crate::CLI_BIN,
+            default = state.default.short_label(),
         ),
         format!(
             "Filter: {filter}{query_note}   Page {page}/{pages}   ({shown} of {total} shown)",
@@ -1097,17 +1167,16 @@ fn truncate(value: &str, width: usize) -> String {
 fn print_inventory_json(
     discovered: &[DiscoveredAgent],
     index: &HashMap<String, Capability>,
-    existing: &SubagentRoutes,
+    configured: Option<&SubagentRoutes>,
 ) {
     let agents: Vec<Value> = discovered
         .iter()
         .map(|agent| {
             let capability = capability_of(&agent.agent_type, index);
-            let target = existing
-                .routes
-                .get(&agent.agent_type)
-                .cloned()
-                .unwrap_or_else(|| default_target(&agent.agent_type, capability));
+            let target = match configured {
+                Some(config) => config.effective(&agent.agent_type),
+                None => default_target(&agent.agent_type, capability),
+            };
             json!({
                 "agent_type": agent.agent_type,
                 "uses": agent.uses,
@@ -1116,7 +1185,12 @@ fn print_inventory_json(
             })
         })
         .collect();
-    let payload = json!({ "agents": agents });
+    let payload = json!({
+        "default": configured
+            .map(|c| c.default.short_label())
+            .unwrap_or_else(|| SubagentTarget::Cloud.short_label()),
+        "agents": agents,
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned())
@@ -1147,14 +1221,23 @@ pub fn offer_subagent_mapping(home: &Path) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
     let discovered = discover_agents(&claude_projects_roots(home));
     let index = load_agent_definitions(&agent_definition_dirs(home, &cwd));
-    let existing = read_subagent_routes(home).unwrap_or_default();
+    let existing = read_subagent_routes(home);
+    let default = existing
+        .as_ref()
+        .map(|e| e.default.clone())
+        .unwrap_or(SubagentTarget::Cloud);
     let menu = target_menu(home);
-    let rows = build_rows(&discovered, &index, &existing, false);
+    let rows = build_rows(&discovered, &index, existing.as_ref(), false);
     if rows.is_empty() {
         eprintln!("No subagents discovered yet; the read-only default applies.");
         return;
     }
-    if let Err(error) = run_picker(home, &menu, PickerState::new(rows), discovered.len()) {
+    if let Err(error) = run_picker(
+        home,
+        &menu,
+        PickerState::new(rows, default),
+        discovered.len(),
+    ) {
         eprintln!("Subagent mapping skipped: {error}");
     }
 }
@@ -1305,36 +1388,83 @@ mod tests {
     }
 
     #[test]
-    fn subagent_routes_round_trip_preserves_siblings() {
+    fn subagent_routes_compact_round_trip_drops_default_entries() {
         let home = tmp_home("rt");
         status::write_settings(&home, &json!({ "local_model": { "mode": "recommended" } }))
             .unwrap();
 
-        let mut routes = SubagentRoutes::default();
-        routes
-            .routes
-            .insert("Explore".into(), SubagentTarget::Local);
-        routes
-            .routes
+        // A full mapping including a cloud entry (== the cloud default).
+        let mut full = SubagentRoutes::default();
+        full.routes.insert("Explore".into(), SubagentTarget::Local);
+        full.routes
             .insert("general-purpose".into(), SubagentTarget::Cloud);
-        routes.routes.insert(
+        full.routes.insert(
             "my-agent".into(),
             SubagentTarget::Endpoint {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 model: "llama3.3".into(),
             },
         );
-        write_subagent_routes_in_home(&home, &routes).unwrap();
+        write_subagent_routes_in_home(&home, &full).unwrap();
 
+        // Read back: the cloud entry (== default) was dropped; non-default kept.
         let read = read_subagent_routes(&home).unwrap();
-        assert_eq!(read, routes);
-        // Sibling key survived the merge-preserving write.
+        assert_eq!(read.default, SubagentTarget::Cloud);
+        assert_eq!(read.routes.len(), 2);
+        assert!(!read.routes.contains_key("general-purpose"));
+        assert_eq!(read.effective("general-purpose"), SubagentTarget::Cloud);
+        assert_eq!(read.effective("Explore"), SubagentTarget::Local);
+
+        // The on-disk file is compact, and the sibling key survived.
         let settings = status::read_settings(&home).unwrap();
         assert_eq!(settings["local_model"]["mode"], "recommended");
+        assert_eq!(settings["subagent_routes"]["default"]["target"], "cloud");
         assert_eq!(
-            settings["subagent_routes"]["schema"],
-            SUBAGENT_ROUTES_SCHEMA
+            settings["subagent_routes"]["routes"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
         );
+    }
+
+    #[test]
+    fn subagent_routes_back_compat_no_default_field_is_cloud() {
+        // Legacy files (pre-compaction) have no `default` and list every agent.
+        let home = tmp_home("legacy");
+        status::write_settings(
+            &home,
+            &json!({ "subagent_routes": { "schema": 1, "routes": {
+                "Explore": { "target": "local" },
+                "general-purpose": { "target": "cloud" }
+            }}}),
+        )
+        .unwrap();
+        let read = read_subagent_routes(&home).unwrap();
+        assert_eq!(read.default, SubagentTarget::Cloud);
+        // The redundant cloud entry is dropped on read, leaving only the exception.
+        assert_eq!(read.routes.len(), 1);
+        assert_eq!(read.effective("Explore"), SubagentTarget::Local);
+        assert_eq!(read.effective("general-purpose"), SubagentTarget::Cloud);
+    }
+
+    #[test]
+    fn subagent_routes_non_cloud_default_keeps_cloud_exceptions() {
+        let home = tmp_home("noncloud");
+        let mut full = SubagentRoutes {
+            default: SubagentTarget::Local,
+            routes: BTreeMap::new(),
+        };
+        full.routes.insert("reviewer".into(), SubagentTarget::Cloud);
+        full.routes.insert("Explore".into(), SubagentTarget::Local); // == default
+        write_subagent_routes_in_home(&home, &full).unwrap();
+
+        let read = read_subagent_routes(&home).unwrap();
+        assert_eq!(read.default, SubagentTarget::Local);
+        // Only the cloud exception is stored; the local entry (== default) dropped.
+        assert_eq!(read.routes.len(), 1);
+        assert_eq!(read.effective("reviewer"), SubagentTarget::Cloud);
+        assert_eq!(read.effective("anything-else"), SubagentTarget::Local);
     }
 
     #[test]
@@ -1549,10 +1679,13 @@ mod tests {
     #[test]
     fn picker_cycles_rows_bulk_and_signals() {
         let menu = TargetMenu::default();
-        let mut state = PickerState::new(vec![
-            row("a", SubagentTarget::Cloud),
-            row("b", SubagentTarget::Local),
-        ]);
+        let mut state = PickerState::new(
+            vec![
+                row("a", SubagentTarget::Cloud),
+                row("b", SubagentTarget::Local),
+            ],
+            SubagentTarget::Cloud,
+        );
         // Save / Quit / Search signals.
         assert_eq!(state.apply_key(&menu, PickerKey::Save), PickerAction::Save);
         assert_eq!(state.apply_key(&menu, PickerKey::Quit), PickerAction::Quit);
@@ -1581,19 +1714,22 @@ mod tests {
     #[test]
     fn picker_filter_and_search_scope_the_view() {
         let menu = TargetMenu::default();
-        let mut state = PickerState::new(vec![
-            row_cap(
-                "codebase-locator",
-                SubagentTarget::Local,
-                Capability::ReadOnly,
-            ),
-            row_cap("refactorer", SubagentTarget::Cloud, Capability::Mutating),
-            row_cap(
-                "codebase-analyzer",
-                SubagentTarget::Local,
-                Capability::ReadOnly,
-            ),
-        ]);
+        let mut state = PickerState::new(
+            vec![
+                row_cap(
+                    "codebase-locator",
+                    SubagentTarget::Local,
+                    Capability::ReadOnly,
+                ),
+                row_cap("refactorer", SubagentTarget::Cloud, Capability::Mutating),
+                row_cap(
+                    "codebase-analyzer",
+                    SubagentTarget::Local,
+                    Capability::ReadOnly,
+                ),
+            ],
+            SubagentTarget::Cloud,
+        );
         // Kind filter → read-only view is rows 0 and 2; hex slot is page-relative.
         state.apply_key(&menu, PickerKey::CycleFilter);
         assert_eq!(state.filter, KindFilter::ReadOnly);
@@ -1622,7 +1758,7 @@ mod tests {
         let rows: Vec<Row> = (0..40)
             .map(|i| row(&format!("agent-{i}"), SubagentTarget::Cloud))
             .collect();
-        let mut state = PickerState::new(rows);
+        let mut state = PickerState::new(rows, SubagentTarget::Cloud);
         assert_eq!(state.page_count(state.view().len()), 3); // 40 / 16 → 3 pages
         state.apply_key(&menu, PickerKey::NextPage);
         assert_eq!(state.page, 1);
@@ -1665,7 +1801,7 @@ mod tests {
             .routes
             .insert("decided-rare".into(), SubagentTarget::Local);
 
-        let rows = build_rows(&discovered, &index, &existing, false);
+        let rows = build_rows(&discovered, &index, Some(&existing), false);
         let names: Vec<&str> = rows.iter().map(|r| r.agent_type.as_str()).collect();
         // High-use + built-in capability shown; decided agent shown.
         assert!(names.contains(&"Explore"));
@@ -1677,7 +1813,33 @@ mod tests {
         assert!(names.contains(&"codebase-locator"));
 
         // include_all keeps the tail too.
-        let all = build_rows(&discovered, &index, &existing, true);
+        let all = build_rows(&discovered, &index, Some(&existing), true);
         assert!(all.iter().any(|r| r.agent_type == "one-off-agent"));
+    }
+
+    #[test]
+    fn build_rows_first_run_heuristic_then_follows_configured_default() {
+        let discovered = vec![DiscoveredAgent {
+            agent_type: "codebase-analyzer".into(), // an anchor → heuristic local
+            uses: 5,
+        }];
+        let index = load_agent_definitions(&[]);
+        let target_of = |rows: &[Row]| {
+            rows.iter()
+                .find(|r| r.agent_type == "codebase-analyzer")
+                .unwrap()
+                .target
+                .clone()
+        };
+
+        // First run (no config): the read-only/anchor heuristic seeds local.
+        let first = build_rows(&discovered, &index, None, false);
+        assert_eq!(target_of(&first), SubagentTarget::Local);
+
+        // Configured with a cloud default and no exception for it: the agent now
+        // follows the default (cloud), not the heuristic — predictable + compact.
+        let configured = SubagentRoutes::default();
+        let after = build_rows(&discovered, &index, Some(&configured), false);
+        assert_eq!(target_of(&after), SubagentTarget::Cloud);
     }
 }
