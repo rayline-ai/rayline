@@ -513,6 +513,19 @@ async fn run_command_from_home(
             .unwrap_or(false);
     let local_plane = request.local_router || config_engages_local;
 
+    // Tell the user which config is driving routing when it engages the on-device
+    // router (the case where the file changes behavior from plain cloud).
+    if config_engages_local {
+        if let Some(path) = effective_config.as_deref() {
+            let source = if path == crate::router_config::default_config_path(home) {
+                "default router config"
+            } else {
+                "router config"
+            };
+            eprintln!("Routing via {source}: {}", path.display());
+        }
+    }
+
     let hosted = if local_plane {
         None
     } else {
