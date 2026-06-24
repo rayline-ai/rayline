@@ -268,15 +268,14 @@ fn rank(counts: HashMap<String, u64>) -> Vec<DiscoveredAgent> {
 // Classification: read agent definitions, decide read-only vs mutating.
 // ---------------------------------------------------------------------------
 
-/// Directories that may hold agent definitions: the global set plus the
-/// project-local set under `cwd`.
-pub fn agent_definition_dirs(home: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![home.join(".claude").join("agents")];
-    let project = cwd.join(".claude").join("agents");
-    if !dirs.contains(&project) {
-        dirs.push(project);
-    }
-    dirs
+/// Directories that hold globally-applicable agent definitions. Only the global
+/// `~/.claude/agents` set is used, NOT the current project's `.claude/agents`:
+/// the discovered mapping is keyed by agent type and applies in EVERY project,
+/// so a name that is read-only in the current repo but mutating in another must
+/// not be defaulted to local globally. Project-local names classify as Unknown
+/// (→ cloud) unless the user explicitly chooses otherwise.
+pub fn agent_definition_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![home.join(".claude").join("agents")]
 }
 
 /// Build a capability index (lowercased agent name → capability) from the
@@ -520,12 +519,26 @@ fn endpoint_id(base_url: &str) -> String {
 /// can never match a real agent id or type — nothing gets intercepted.
 const ROUTE_NOTHING_SENTINEL: &str = "__rayline_no_local_subagents__";
 
-/// Build the managed router config (proxy allowlist + router endpoints + routes)
-/// from a persisted mapping. Cloud agents are omitted so the proxy leaves them
-/// on cloud; local agents use the bundled `local` endpoint (no model — the
-/// router fills it from the served model); endpoint agents get a synthesized
-/// custom endpoint reached via the router's remote-forward path.
-pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
+/// The proxy allowlist (`routes.subagents`) plus any synthesized custom
+/// endpoints derived from a saved mapping.
+pub struct MaterializedSubagents {
+    /// A JSON object: agent type → route target.
+    pub subagents: Value,
+    /// Custom endpoint definitions to add to the router config's `endpoints`.
+    pub custom_endpoints: Vec<Value>,
+}
+
+/// Translate a saved mapping into the proxy allowlist. `local_target` is the
+/// route a `Local` agent gets — the bundled `{ "endpoint": "local" }` or a
+/// provider endpoint like `{ "endpoint": "ollama", "model": "…" }` — so the
+/// SAME mapping drives both the bundled and provider launch paths. Cloud agents
+/// are omitted (proxy leaves them on cloud); endpoint agents get a synthesized
+/// custom endpoint; an all-cloud mapping yields the non-matching sentinel so the
+/// proxy intercepts nothing (an empty list would invert to "route everything").
+pub fn materialize_subagents(
+    routes: &SubagentRoutes,
+    local_target: &Value,
+) -> MaterializedSubagents {
     let mut subagents = serde_json::Map::new();
     // endpoint id -> (base_url, models seen)
     let mut endpoints: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
@@ -533,7 +546,7 @@ pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
         match target {
             SubagentTarget::Cloud => {} // omit → stays on cloud Claude
             SubagentTarget::Local => {
-                subagents.insert(agent.clone(), json!({ "endpoint": "local" }));
+                subagents.insert(agent.clone(), local_target.clone());
             }
             SubagentTarget::Endpoint { base_url, model } => {
                 let id = endpoint_id(base_url);
@@ -547,36 +560,44 @@ pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
             }
         }
     }
-    // All-cloud mapping → empty allowlist would invert to "route everything
-    // local"; emit the sentinel so the proxy intercepts nothing instead.
     if subagents.is_empty() {
-        subagents.insert(
-            ROUTE_NOTHING_SENTINEL.to_owned(),
-            json!({ "endpoint": "local" }),
-        );
+        subagents.insert(ROUTE_NOTHING_SENTINEL.to_owned(), local_target.clone());
     }
+    let custom_endpoints = endpoints
+        .into_iter()
+        .map(|(id, (base_url, models))| {
+            json!({
+                "id": id,
+                "kind": "custom",
+                // Custom endpoints saved via `local custom` are Anthropic
+                // Messages servers (validated at `{base_url}/v1/messages`),
+                // so the router must speak that protocol, not openai_chat.
+                "protocol": "anthropic_messages",
+                "base_url": base_url,
+                "models": models,
+            })
+        })
+        .collect();
+    MaterializedSubagents {
+        subagents: Value::Object(subagents),
+        custom_endpoints,
+    }
+}
+
+/// Build the managed router config for the BUNDLED local model from a saved
+/// mapping: `Local` agents route to the in-process `local` endpoint.
+pub fn routes_config_json(routes: &SubagentRoutes) -> Value {
+    let materialized = materialize_subagents(routes, &json!({ "endpoint": "local" }));
     let mut config = serde_json::Map::new();
     config.insert(
         "routes".to_owned(),
-        json!({ "subagents": Value::Object(subagents) }),
+        json!({ "subagents": materialized.subagents }),
     );
-    if !endpoints.is_empty() {
-        let endpoints_json: Vec<Value> = endpoints
-            .into_iter()
-            .map(|(id, (base_url, models))| {
-                json!({
-                    "id": id,
-                    "kind": "custom",
-                    // Custom endpoints saved via `local custom` are Anthropic
-                    // Messages servers (validated at `{base_url}/v1/messages`),
-                    // so the router must speak that protocol, not openai_chat.
-                    "protocol": "anthropic_messages",
-                    "base_url": base_url,
-                    "models": models,
-                })
-            })
-            .collect();
-        config.insert("endpoints".to_owned(), Value::Array(endpoints_json));
+    if !materialized.custom_endpoints.is_empty() {
+        config.insert(
+            "endpoints".to_owned(),
+            Value::Array(materialized.custom_endpoints),
+        );
     }
     Value::Object(config)
 }
@@ -936,11 +957,9 @@ fn rows_to_routes(rows: &[Row], default: SubagentTarget) -> SubagentRoutes {
 /// JSON (`--json`, non-interactive) or run the interactive mapping picker.
 pub async fn run_subagents_command(json: bool, include_all: bool) -> Result<(), String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-
     eprintln!("Scanning your Claude Code history for subagents…");
     let discovered = discover_agents(&claude_projects_roots(&home));
-    let index = load_agent_definitions(&agent_definition_dirs(&home, &cwd));
+    let index = load_agent_definitions(&agent_definition_dirs(&home));
     let existing = read_subagent_routes(&home);
     let default = existing
         .as_ref()
@@ -1243,9 +1262,8 @@ pub fn offer_subagent_mapping(home: &Path) {
     }
 
     eprintln!("Scanning your Claude Code history for subagents…");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
     let discovered = discover_agents(&claude_projects_roots(home));
-    let index = load_agent_definitions(&agent_definition_dirs(home, &cwd));
+    let index = load_agent_definitions(&agent_definition_dirs(home));
     let existing = read_subagent_routes(home);
     let default = existing
         .as_ref()
@@ -1559,6 +1577,41 @@ mod tests {
         assert_eq!(read.routes.len(), 1);
         assert_eq!(read.effective("reviewer"), SubagentTarget::Cloud);
         assert_eq!(read.effective("anything-else"), SubagentTarget::Local);
+    }
+
+    #[test]
+    fn agent_definition_dirs_are_global_only() {
+        // P2b: the project-local `.claude/agents` must NOT feed the global
+        // mapping — only `~/.claude/agents` does.
+        let home = PathBuf::from("/home/u");
+        let dirs = agent_definition_dirs(&home);
+        assert_eq!(dirs, vec![home.join(".claude").join("agents")]);
+    }
+
+    #[test]
+    fn materialize_subagents_uses_supplied_local_target() {
+        // The same mapping drives bundled (`local`) and provider targets.
+        let mut routes = SubagentRoutes::default();
+        routes
+            .routes
+            .insert("Explore".into(), SubagentTarget::Local);
+        routes
+            .routes
+            .insert("reviewer".into(), SubagentTarget::Cloud);
+
+        let provider_target = json!({ "endpoint": "ollama", "model": "m" });
+        let m = materialize_subagents(&routes, &provider_target);
+        let subs = m.subagents.as_object().unwrap();
+        assert_eq!(subs["Explore"], provider_target);
+        assert!(!subs.contains_key("reviewer")); // cloud omitted
+        assert!(m.custom_endpoints.is_empty());
+
+        // All-cloud → just the sentinel, carrying the supplied target.
+        let all_cloud = SubagentRoutes::default();
+        let m = materialize_subagents(&all_cloud, &provider_target);
+        let subs = m.subagents.as_object().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert!(!subs.contains_key("Explore"));
     }
 
     #[test]
