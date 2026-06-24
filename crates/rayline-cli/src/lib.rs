@@ -12,6 +12,7 @@ pub mod local_model;
 pub mod onboarding;
 pub mod providers;
 pub mod router;
+pub mod router_config;
 pub mod status;
 pub mod update;
 
@@ -1117,6 +1118,11 @@ where
     } else {
         None
     };
+    // `--router-config-path` drives the on-device router; `--via env` is cloud-only.
+    // Reject the combination (mirrors `--via env` + `--local`).
+    if router_config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
+        return None;
+    }
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -2062,6 +2068,34 @@ mod tests {
         assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--via", "env", "--local"])),
             RaylineDispatch::Unavailable
+        ));
+    }
+
+    #[test]
+    fn via_env_with_router_config_path_is_unavailable() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "--via",
+                "env",
+                "--router-config-path",
+                "/tmp/router.json",
+            ])),
+            RaylineDispatch::Unavailable
+        ));
+    }
+
+    #[test]
+    fn router_config_path_alone_parses_as_claude_run() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "--router-config-path",
+                "/tmp/router.json",
+            ])),
+            RaylineDispatch::ClaudeRun(_)
         ));
     }
 

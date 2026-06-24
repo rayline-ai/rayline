@@ -149,6 +149,64 @@ local session, and drops the stored router key.
 Custom hosted environments can be configured in
 `~/.config/rayline/settings.json` for internal/dev routing.
 
+## Config-Driven Routing (default `router.json`)
+
+`rayline claude` is config-file driven. The effective config is resolved as:
+
+1. `--router-config-path <file>` (explicit), else
+2. `~/.config/rayline/router.json` — a default file auto-created on first run, else
+3. the built-in default.
+
+The default `router.json` reproduces today's behavior — it routes everything to
+the hosted cloud router (`api.rayline.ai`). Edit it to change routing; you do
+**not** need `--local`.
+
+Engagement is lazy: the on-device router only starts when the config routes
+something **away** from the hosted cloud router (a `"local"` route, a custom/loopback
+provider, or a direct-Anthropic endpoint). A pure everything-to-the-cloud-router
+config stays on the hosted path with no local process.
+
+When the config does engage the on-device router, all traffic flows through it
+(`--route all`) and the main thread is pinned to the virtual model `rayline-router`
+so `routes.main` governs it. This makes the hybrid possible — main on the hosted
+cloud router, subagents on local models:
+
+```json
+{
+  "endpoints": [
+    { "id": "ollama", "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": ["qwen2.5-coder:7b", "qwen3.5:9b"] },
+    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "models": ["rayline-router"] }
+  ],
+  "routes": {
+    "main":    { "endpoint": "rayline-cloud", "model": "rayline-router" },
+    "default": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+    "subagents": {
+      "Explore": { "endpoint": "ollama", "model": "qwen2.5-coder:7b" },
+      "Plan":    { "endpoint": "ollama", "model": "qwen3.5:9b" }
+    }
+  }
+}
+```
+
+```bash
+rayline claude                                  # uses ~/.config/rayline/router.json
+rayline claude --router-config-path ./my.json   # or an explicit file
+```
+
+Notes:
+
+- The `rayline-cloud` endpoint authenticates with your `rayline auth login` key —
+  no manual env var. (As a fallback, a user-set `RAYLINE_ROUTER_API_KEY` is used.)
+- A direct `anthropic` endpoint needs `ANTHROPIC_API_KEY` set.
+- No bundled local model is required when routes target only named endpoints; a
+  `"local"` route still needs `rayline local use`/`custom`.
+- `--via env` is cloud-only and is rejected together with `--router-config-path`.
+
 ## Routing Specific Subagents (Override Config)
 
 The router config is JSON layered over Rayline Local's defaults. Save it wherever
