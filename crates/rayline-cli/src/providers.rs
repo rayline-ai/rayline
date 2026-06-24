@@ -314,6 +314,43 @@ pub fn provider_routes_json_with_explicit_config(
     generated
 }
 
+/// Provider routes whose per-subagent allowlist comes from the user's saved
+/// `subagent_routes` mapping instead of the hardcoded default. A `Local` agent
+/// routes to THIS provider; cloud agents are omitted; custom-endpoint agents get
+/// their own endpoint. Keeps the provider's endpoint + fallback + model routes.
+pub fn provider_routes_json_from_mapping(
+    id: ProviderId,
+    base_url_v1: &str,
+    model: &str,
+    routes: &crate::discover::SubagentRoutes,
+) -> Value {
+    let mut generated = provider_routes_json(id, base_url_v1, model);
+    // For a provider-backed local model, "local" means this provider endpoint.
+    let local_target = json!({ "endpoint": id.as_str(), "model": model });
+    let materialized = crate::discover::materialize_subagents(routes, &local_target);
+
+    if let Some(routes_obj) = generated.get_mut("routes").and_then(Value::as_object_mut) {
+        routes_obj.insert("subagents".to_owned(), materialized.subagents);
+    }
+    if let Some(endpoints) = generated.get_mut("endpoints").and_then(Value::as_array_mut) {
+        for endpoint in materialized.custom_endpoints {
+            let id = endpoint
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let duplicate = id.as_deref().is_some_and(|id| {
+                endpoints
+                    .iter()
+                    .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+            });
+            if !duplicate {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+    generated
+}
+
 fn merge_explicit_endpoints(
     generated: &mut Value,
     explicit: &Value,
@@ -470,12 +507,19 @@ pub fn write_provider_routes_for_config(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("provider-routes.json");
     let value = match explicit_config_path {
+        // An explicit `--router-config-path` always wins (same precedence as the
+        // bundled path), so it is NOT overridden by the saved mapping.
         Some(path) => {
             let raw = std::fs::read_to_string(path)?;
             let explicit = parse_explicit_router_config(path, &raw)?;
             provider_routes_json_with_explicit_config(id, base_url_v1, model, &explicit)
         }
-        None => provider_routes_json(id, base_url_v1, model),
+        // Otherwise honor the user's saved per-subagent mapping if present,
+        // falling back to the hardcoded read-only allowlist when never configured.
+        None => match crate::discover::read_subagent_routes(home) {
+            Some(routes) => provider_routes_json_from_mapping(id, base_url_v1, model, &routes),
+            None => provider_routes_json(id, base_url_v1, model),
+        },
     };
     let body = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
@@ -677,6 +721,43 @@ mod tests {
         assert_eq!(
             value["routes"]["model_routes"]["rayline-local"]["endpoint"],
             "ollama"
+        );
+    }
+
+    #[test]
+    fn provider_routes_from_mapping_honor_saved_choices() {
+        use crate::discover::{SubagentRoutes, SubagentTarget};
+
+        // All-cloud mapping (no exceptions) → the provider allowlist is just the
+        // non-matching sentinel, so NO default agent is routed to the provider.
+        let all_cloud = SubagentRoutes::default();
+        let value =
+            provider_routes_json_from_mapping(ProviderId::Ollama, "http://x/v1", "m", &all_cloud);
+        let subagents = value["routes"]["subagents"].as_object().unwrap();
+        assert!(!subagents.contains_key("Explore"));
+        assert!(!subagents.contains_key("codebase-locator"));
+        assert_eq!(subagents.len(), 1, "only the route-nothing sentinel");
+
+        // A local exception routes that agent to THIS provider; cloud agents stay
+        // omitted; the long-tail default (codebase-locator) is no longer forced.
+        let mut mapping = SubagentRoutes::default();
+        mapping
+            .routes
+            .insert("Explore".into(), SubagentTarget::Local);
+        let value =
+            provider_routes_json_from_mapping(ProviderId::Ollama, "http://x/v1", "m", &mapping);
+        let subagents = value["routes"]["subagents"].as_object().unwrap();
+        assert_eq!(
+            subagents["Explore"]["endpoint"],
+            ProviderId::Ollama.as_str()
+        );
+        assert_eq!(subagents["Explore"]["model"], "m");
+        assert!(!subagents.contains_key("codebase-locator"));
+        // The provider endpoint + fallback are still present.
+        assert_eq!(value["endpoints"][0]["id"], ProviderId::Ollama.as_str());
+        assert_eq!(
+            value["routes"]["subagent"]["endpoint"],
+            ProviderId::Ollama.as_str()
         );
     }
 

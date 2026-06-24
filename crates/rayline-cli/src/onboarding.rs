@@ -316,16 +316,32 @@ async fn run_wizard(home: &Path, env_name: &str) -> io::Result<OnboardingOutcome
             outcome,
         },
     )?;
+
+    // Now that a model is configured, offer to map which subagents route to it.
+    // Skipped when the user stayed on cloud — there's nothing to route to yet.
+    if outcome != OnboardingOutcome::Skipped {
+        crate::discover::offer_subagent_mapping(home);
+    }
     Ok(outcome)
 }
 
 /// Write the managed default routes under the router state dir and return its
 /// path. Regenerated idempotently each launch so anchor changes roll forward.
+/// When the user has saved a per-subagent mapping (`<cli> local subagents`),
+/// that mapping is materialized instead of the hardcoded read-only allowlist.
 pub fn write_default_local_routes(home: &Path) -> io::Result<PathBuf> {
     let dir = home.join(crate::ROUTER_STATE_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("local-default-routes.json");
-    let body = serde_json::to_vec_pretty(&default_local_routes_json()).map_err(io::Error::other)?;
+    // Use the saved mapping whenever it exists — including an all-cloud choice
+    // that compacts to zero exceptions, where `routes_config_json` emits its
+    // "route nothing local" sentinel. Only a never-configured machine (no
+    // `subagent_routes` key) falls back to the hardcoded read-only allowlist.
+    let value = match crate::discover::read_subagent_routes(home) {
+        Some(routes) => crate::discover::routes_config_json(&routes),
+        None => default_local_routes_json(),
+    };
+    let body = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
     Ok(path)
 }
@@ -452,6 +468,30 @@ mod tests {
         let text = std::fs::read_to_string(&a).unwrap();
         assert!(text.contains("\"Explore\""));
         assert!(text.contains("\"endpoint\": \"local\""));
+    }
+
+    #[test]
+    fn write_default_local_routes_honors_saved_all_cloud_mapping() {
+        // A saved all-cloud mapping compacts to zero exceptions. The generated
+        // config must reflect that explicit choice (the sentinel → route nothing
+        // local), NOT fall back to the hardcoded read-only allowlist.
+        let home = tmp_home();
+        crate::discover::write_subagent_routes_in_home(
+            &home,
+            &crate::discover::SubagentRoutes::default(), // default cloud, no exceptions
+        )
+        .unwrap();
+
+        let path = write_default_local_routes(&home).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("\"Explore\""),
+            "must not regenerate the hardcoded allowlist: {text}"
+        );
+        assert!(
+            text.contains("__rayline_no_local_subagents__"),
+            "expected the route-nothing sentinel: {text}"
+        );
     }
 
     #[tokio::test]

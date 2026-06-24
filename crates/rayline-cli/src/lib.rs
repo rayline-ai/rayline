@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode};
 pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
+pub mod discover;
 pub mod local_model;
 pub mod onboarding;
 pub mod providers;
@@ -200,6 +201,7 @@ Commands:
   on        Turn local routing on for your account
   off       Turn local routing off for your account
   onboard   Set up or re-pick a local model for `rayline claude --local`
+  subagents Discover your subagents and map each to local or cloud
 ";
 
 const LOCAL_MODELS_HELP: &str = "\
@@ -270,6 +272,27 @@ Set up (or re-pick) a local model for `rayline claude --local`.
 
 Options:
   --reset    Clear the current local model first, then run the wizard
+";
+
+const LOCAL_SUBAGENTS_HELP: &str = "\
+Usage: rayline local subagents [--json] [--all]
+
+Scan your Claude Code history for the subagents you use and map each to a
+routing target (local or cloud) for `rayline claude --local`. Read-only agents
+are pre-selected for local. The mapping is saved to settings.json and applied
+on the next `--local` launch.
+
+The interactive picker is single-keypress (no Enter needed): 16 rows per page
+labeled 0-9a-f cycle that row's target; n/p page; k cycles the kind filter
+(all / read-only / has-edit / unknown); / searches by agent name; L/C send the
+whole filtered set to local/cloud; s (or Enter) saves; q (or Esc) quits.
+
+Settings stay compact: only agents that differ from the default (cloud) are
+saved, so a long tail of rarely-used agents costs nothing.
+
+Options:
+  --json    Print discovered agents and their default target as JSON; no prompt
+  --all     Include rarely-used agents (otherwise the long tail is hidden)
 ";
 
 const UPDATE_HELP: &str = "\
@@ -546,6 +569,15 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 }
             }
         }
+        RaylineDispatch::LocalSubagents { json, all } => {
+            match discover::run_subagents_command(json, all).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         RaylineDispatch::Update(request) => match update::run(&request).await {
             Ok(result) => {
                 if result.stderr {
@@ -625,6 +657,10 @@ pub enum RaylineDispatch {
     LocalOnboard {
         env_name: Option<String>,
         reset: bool,
+    },
+    LocalSubagents {
+        json: bool,
+        all: bool,
     },
     Update(update::UpdateRequest),
     Unavailable,
@@ -1459,8 +1495,27 @@ where
             env_name: root_env,
             reset,
         }),
+        "subagents" => parse_local_subagents(args)
+            .map(|(json, all)| RaylineDispatch::LocalSubagents { json, all }),
         _ => None,
     }
+}
+
+fn parse_local_subagents<'a, I>(mut args: std::iter::Peekable<I>) -> Option<(bool, bool)>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut json = false;
+    let mut all = false;
+    for arg in args.by_ref() {
+        match arg.to_str()? {
+            "--json" => json = true,
+            "--all" => all = true,
+            "--help" => return None,
+            _ => return None,
+        }
+    }
+    Some((json, all))
 }
 
 fn parse_local_no_arg<'a, I>(mut args: std::iter::Peekable<I>) -> Option<()>
@@ -1665,6 +1720,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["local", "on"] => Some(LOCAL_ON_HELP),
         ["local", "off"] => Some(LOCAL_OFF_HELP),
         ["local", "onboard"] => Some(LOCAL_ONBOARD_HELP),
+        ["local", "subagents"] => Some(LOCAL_SUBAGENTS_HELP),
         ["router"] => Some(ROUTER_HELP),
         ["router", "start"] => Some(ROUTER_START_HELP),
         ["router", "status"] => Some(ROUTER_STATUS_HELP),
