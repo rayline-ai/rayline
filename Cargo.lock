@@ -1432,6 +1432,7 @@ dependencies = [
  "rand",
  "rayline-hf",
  "rayline-llama",
+ "rayline-local-router",
  "rayline-metrics",
  "reqwest",
  "serde_json",

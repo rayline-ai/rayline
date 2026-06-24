@@ -159,7 +159,7 @@ pub fn default_local_routes_json() -> Value {
 /// Readiness verdict returned to the `--local` launch path.
 pub enum LocalModelReadiness {
     /// A usable local model exists; proceed with local routing.
-    Ready(local_model::LocalModelConfig),
+    Ready(Box<local_model::LocalModelConfig>),
     /// No usable model — either the user skipped, the session is
     /// non-interactive, or the wizard was already completed and the model
     /// disappeared. Caller should warn and stay on cloud.
@@ -173,7 +173,9 @@ pub async fn ensure_local_model(home: &Path, env_name: &str) -> io::Result<Local
     let cfg = local_model::read_from_home(home);
     let engageable = cfg.as_ref().is_some_and(|c| c.is_engageable());
     if engageable {
-        return Ok(LocalModelReadiness::Ready(cfg.expect("engageable")));
+        return Ok(LocalModelReadiness::Ready(Box::new(
+            cfg.expect("engageable"),
+        )));
     }
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let marker = read_onboarding(home);
@@ -182,7 +184,9 @@ pub async fn ensure_local_model(home: &Path, env_name: &str) -> io::Result<Local
             run_wizard(home, env_name).await?;
             let cfg = local_model::read_from_home(home);
             if cfg.as_ref().is_some_and(|c| c.is_engageable()) {
-                Ok(LocalModelReadiness::Ready(cfg.expect("engageable")))
+                Ok(LocalModelReadiness::Ready(Box::new(
+                    cfg.expect("engageable"),
+                )))
             } else {
                 Ok(LocalModelReadiness::NotConfigured) // user skipped
             }
@@ -385,7 +389,11 @@ mod tests {
     }
 
     fn tmp_home() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("rl-onboard-{}", std::process::id()));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rl-onboard-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".config").join("rayline")).unwrap();
         dir

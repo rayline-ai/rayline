@@ -9,6 +9,7 @@ pub mod claude;
 pub(crate) mod claude_daemon;
 pub mod local_model;
 pub mod onboarding;
+pub mod providers;
 pub mod router;
 pub mod status;
 pub mod update;
@@ -109,6 +110,8 @@ Options:
   --auto-compact-window <tokens>    Override Claude auto-compact threshold
   --local                           Use local static routing without hosted auth
                                     (no login; forces the proxy)
+  --local-provider <provider>       Use a local provider for subagents
+                                    (ollama, lmstudio, llamacpp)
   --isolated                        Use a separate Claude config dir so this
                                     session can run beside other Claude Code
                                     background agents
@@ -186,13 +189,13 @@ Usage: rayline local COMMAND
 Configure local model routing for this machine.
 
 Commands:
-  models    List recommended models with download status and hardware fit
+  models    List provider and recommended models with hardware fit
   download  Download a recommended model without selecting it
   use       Select a recommended model, downloading it first if needed
   remove    Delete a downloaded model from disk
   custom    Use a custom endpoint URL + model name
   show      Show the configured mode, endpoint, and account routing state
-  test      Probe a custom endpoint for an Anthropic Messages API response
+  test      Probe a custom/provider endpoint for a compatible API response
   clear     Remove the local model configuration
   on        Turn local routing on for your account
   off       Turn local routing off for your account
@@ -202,7 +205,7 @@ Commands:
 const LOCAL_MODELS_HELP: &str = "\
 Usage: rayline local models [--json]
 
-List recommended local models.
+List provider and recommended local models.
 ";
 
 const LOCAL_DOWNLOAD_HELP: &str = "\
@@ -214,7 +217,7 @@ Download a recommended model into the local cache without selecting it.
 const LOCAL_USE_HELP: &str = "\
 Usage: rayline local use <number|model-id>
 
-Select a recommended model for the built-in llama server.
+Select a provider model or recommended built-in model.
 Numbers come from `rayline local models`.
 ";
 
@@ -902,6 +905,7 @@ where
     let mut env_name = root_env;
     let mut model = None;
     let mut auto_compact_window = None;
+    let mut local_provider = None;
     let mut local_router = false;
     let mut isolated = false;
     let mut local_injector_port = None;
@@ -957,6 +961,11 @@ where
                     auto_compact_window = Some(value.parse().ok()?);
                     continue;
                 }
+                "--local-provider" => {
+                    local_provider = Some(crate::providers::ProviderId::parse(value)?);
+                    local_router = true;
+                    continue;
+                }
                 "--via" => {
                     via = Some(parse_via(value)?);
                     continue;
@@ -995,6 +1004,11 @@ where
             }
             "--auto-compact-window" => {
                 auto_compact_window = Some(args.next()?.to_str()?.parse().ok()?);
+                continue;
+            }
+            "--local-provider" => {
+                local_provider = Some(crate::providers::ProviderId::parse(args.next()?.to_str()?)?);
+                local_router = true;
                 continue;
             }
             "--via" => {
@@ -1059,6 +1073,14 @@ where
         claude_args.push(arg.clone());
     }
 
+    let local_provider_model = if matches!(
+        local_provider,
+        Some(crate::providers::ProviderId::Ollama | crate::providers::ProviderId::LmStudio)
+    ) {
+        model.take()
+    } else {
+        None
+    };
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -1066,6 +1088,8 @@ where
         auth_token: root_auth_token,
         args: claude_args,
         model,
+        local_provider,
+        local_provider_model,
         auto_compact_window,
         local_router,
         isolated,
@@ -1721,6 +1745,7 @@ fn is_value_option(arg: &str) -> bool {
         "--env"
             | "--auth-token"
             | "--model"
+            | "--local-provider"
             | "--auto-compact-window"
             | "--routing-mode"
             | "--via"
@@ -1840,6 +1865,90 @@ mod tests {
         let request = claude_run(&["rayline", "claude", "--local"]);
         assert!(request.local_router);
         assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
+    }
+
+    #[test]
+    fn claude_accepts_local_provider() {
+        let request = claude_run(&["rayline", "claude", "--local", "--local-provider", "ollama"]);
+        assert!(request.local_router);
+        assert_eq!(
+            request.local_provider,
+            Some(crate::providers::ProviderId::Ollama)
+        );
+    }
+
+    #[test]
+    fn claude_local_provider_implies_local() {
+        let request = claude_run(&["rayline", "claude", "--local-provider", "lmstudio"]);
+        assert!(request.local_router);
+        assert_eq!(
+            request.local_provider,
+            Some(crate::providers::ProviderId::LmStudio)
+        );
+        assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
+    }
+
+    #[test]
+    fn claude_local_provider_consumes_model_as_provider_model() {
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--local-provider",
+            "ollama",
+            "--model",
+            "qwen3-coder:30b",
+        ]);
+        assert_eq!(
+            request.local_provider,
+            Some(crate::providers::ProviderId::Ollama)
+        );
+        assert_eq!(
+            request.local_provider_model.as_deref(),
+            Some("qwen3-coder:30b")
+        );
+        assert_eq!(request.model, None);
+    }
+
+    #[test]
+    fn claude_local_provider_llamacpp_uses_builtin_path() {
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--local-provider",
+            "llamacpp",
+            "--model",
+            "claude-sonnet-4-20250514",
+        ]);
+        assert!(request.local_router);
+        assert_eq!(
+            request.local_provider,
+            Some(crate::providers::ProviderId::LlamaCpp)
+        );
+        assert_eq!(request.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(request.local_provider_model, None);
+    }
+
+    #[test]
+    fn claude_rejects_unknown_local_provider() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--local-provider", "bogus"])),
+            RaylineDispatch::Unavailable
+        ));
+    }
+
+    #[test]
+    fn claude_rejects_local_provider_with_via_env() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "--local-provider",
+                "ollama",
+                "--via",
+                "env"
+            ])),
+            RaylineDispatch::Unavailable
+        ));
     }
 
     #[test]

@@ -475,6 +475,12 @@ pub struct ModelListing {
     pub selected: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum PickerEntry {
+    Provider(crate::providers::ProviderModel),
+    BuiltIn(CatalogModel),
+}
+
 pub fn listings(
     models: Vec<CatalogModel>,
     hardware: Option<&rayline_llama::HardwareInfo>,
@@ -497,12 +503,65 @@ pub fn render_listings_json(
     listings: &[ModelListing],
     hardware: Option<&rayline_llama::HardwareInfo>,
 ) -> String {
+    render_listings_json_with_providers(&[], listings, hardware, None)
+}
+
+pub fn render_listings_json_with_providers(
+    provider_groups: &[(
+        crate::providers::ProviderId,
+        Vec<crate::providers::ProviderModel>,
+    )],
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+    selected_provider: Option<(&str, &str)>,
+) -> String {
     let total_ram_bytes = hardware.map(|hw| hw.total_ram_bytes);
+    let provider_count = provider_groups
+        .iter()
+        .map(|(_, models)| models.len())
+        .sum::<usize>();
+    let builtin_selections = ordered_selectable(listings)
+        .into_iter()
+        .enumerate()
+        .map(|(index, listing)| (listing.model.id.as_str(), provider_count + index + 1))
+        .collect::<Vec<_>>();
+    let provider_models = provider_groups
+        .iter()
+        .flat_map(|(provider, models)| {
+            models.iter().map(move |model| {
+                let selected =
+                    selected_provider.is_some_and(|(selected_provider, selected_model)| {
+                        selected_provider == provider.as_str() && selected_model == model.model
+                    });
+                json!({
+                    "id": format!("{}:{}", provider.as_str(), model.model),
+                    "source": "provider",
+                    "provider": provider.as_str(),
+                    "provider_label": provider.label(),
+                    "model": model.model,
+                    "name": model.model,
+                    "size_bytes": model.size_bytes,
+                    "selected": selected,
+                })
+            })
+        })
+        .enumerate()
+        .map(|(index, mut value)| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("selection".to_owned(), json!(index + 1));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
     let models = listings
         .iter()
         .map(|listing| {
+            let selection = builtin_selections
+                .iter()
+                .find_map(|(id, selection)| (*id == listing.model.id).then_some(*selection));
             json!({
                 "id": listing.model.id,
+                "source": "builtin",
                 "name": listing.model.name,
                 "repo": listing.model.repo,
                 "filename": listing.model.filename,
@@ -517,11 +576,13 @@ pub fn render_listings_json(
                 "selected": listing.selected,
                 "is_moe": listing.model.is_moe,
                 "active_ram_bytes": listing.model.active_ram_bytes,
+                "selection": selection,
             })
         })
         .collect::<Vec<_>>();
     let payload = json!({
         "total_ram_bytes": total_ram_bytes,
+        "provider_models": provider_models,
         "models": models,
     });
     format!("{payload}\n")
@@ -660,6 +721,221 @@ pub fn render_listings_human(
     );
     output.push_str(&format!("{}\n", paint(&footer, "2", color)));
 
+    output
+}
+
+pub fn picker_entries(
+    provider_groups: &[(
+        crate::providers::ProviderId,
+        Vec<crate::providers::ProviderModel>,
+    )],
+    listings: &[ModelListing],
+) -> Vec<PickerEntry> {
+    provider_groups
+        .iter()
+        .flat_map(|(_, models)| models.iter().cloned().map(PickerEntry::Provider))
+        .chain(
+            ordered_selectable(listings)
+                .into_iter()
+                .map(|listing| PickerEntry::BuiltIn(listing.model.clone())),
+        )
+        .collect()
+}
+
+pub fn resolve_picker_selection(entries: &[PickerEntry], token: &str) -> Option<PickerEntry> {
+    if let Ok(index) = token.parse::<usize>() {
+        if (1..=entries.len()).contains(&index) {
+            return Some(entries[index - 1].clone());
+        }
+        return None;
+    }
+    entries
+        .iter()
+        .find_map(|entry| match entry {
+            PickerEntry::BuiltIn(model) if model.id == token => Some(entry.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            entries.iter().find_map(|entry| match entry {
+                PickerEntry::Provider(model)
+                    if format!("{}:{}", model.provider.as_str(), model.model) == token =>
+                {
+                    Some(entry.clone())
+                }
+                _ => None,
+            })
+        })
+        .or_else(|| {
+            entries.iter().find_map(|entry| match entry {
+                PickerEntry::Provider(model) if model.model == token => Some(entry.clone()),
+                _ => None,
+            })
+        })
+}
+
+pub fn render_listings_human_with_providers(
+    provider_groups: &[(
+        crate::providers::ProviderId,
+        Vec<crate::providers::ProviderModel>,
+    )],
+    listings: &[ModelListing],
+    hardware: Option<&rayline_llama::HardwareInfo>,
+    recommended_id: Option<&str>,
+    selected_provider: Option<(&str, &str)>,
+    color: bool,
+) -> String {
+    if provider_groups.is_empty() {
+        return render_listings_human(listings, hardware, recommended_id, color);
+    }
+
+    let cli = crate::CLI_BIN;
+    let entries = picker_entries(provider_groups, listings);
+    let mut output = String::new();
+    match hardware.map(|hw| hw.total_ram_bytes) {
+        Some(total) => {
+            let dim_part = paint(
+                &format!(" · this machine: {} RAM", format_bytes(total)),
+                "2",
+                color,
+            );
+            output.push_str(&format!("Local models{dim_part}\n"));
+        }
+        None => output.push_str("Local models\n"),
+    }
+    output.push('\n');
+
+    let max_name_w = entries
+        .iter()
+        .map(|entry| match entry {
+            PickerEntry::Provider(model) => model.model.len(),
+            PickerEntry::BuiltIn(model) => model.name.len(),
+        })
+        .max()
+        .unwrap_or(0);
+
+    let mut next_number = 1usize;
+    for (provider, models) in provider_groups {
+        output.push_str(&format!("{}\n", paint(provider.label(), "2", color)));
+        for model in models {
+            let num_str = paint(&format!("{next_number:>3}"), "36", color);
+            let pad = max_name_w.saturating_sub(model.model.len());
+            let padded_name = format!("{}{}", model.model, " ".repeat(pad));
+            let size = model
+                .size_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "external".to_owned());
+            let size_str = paint(&format!("{size:>8}"), "2", color);
+            let mut markers = String::new();
+            if selected_provider.is_some_and(|(selected_provider, selected_model)| {
+                selected_provider == provider.as_str() && selected_model == model.model
+            }) {
+                markers.push_str(&format!("  {}", paint("● selected", "36", color)));
+            }
+            output.push_str(&format!(
+                "  {num_str}  {padded_name}  {size_str}{markers}\n"
+            ));
+            next_number += 1;
+        }
+        output.push('\n');
+    }
+
+    let built_in_entries = ordered_selectable(listings);
+    let max_id_w = built_in_entries
+        .iter()
+        .map(|listing| listing.model.id.len())
+        .max()
+        .unwrap_or(0);
+    let render_builtin_line = |number: usize, listing: &ModelListing| -> String {
+        let num_str = paint(&format!("{number:>3}"), "36", color);
+        let pad = max_name_w.saturating_sub(listing.model.name.len());
+        let padded_name = format!("{}{}", listing.model.name, " ".repeat(pad));
+        let size_str = paint(
+            &format!("{:>8}", format_bytes(listing.model.size_bytes)),
+            "2",
+            color,
+        );
+        let id_pad = max_id_w.saturating_sub(listing.model.id.len());
+        let id_str = paint(
+            &format!("{}{}", listing.model.id, " ".repeat(id_pad)),
+            "2",
+            color,
+        );
+        let mut markers = String::new();
+        if recommended_id == Some(listing.model.id.as_str()) {
+            markers.push_str(&format!("  {}", paint("★ recommended", "32", color)));
+        }
+        if listing.selected {
+            markers.push_str(&format!("  {}", paint("● selected", "36", color)));
+        }
+        match listing.fit {
+            Fit::Amber => markers.push_str(&format!("  {}", paint("· tight fit", "33", color))),
+            Fit::Red if listing.downloaded => {
+                markers.push_str(&format!("  {}", paint("· too large", "31", color)))
+            }
+            _ => {}
+        }
+        format!("  {num_str}  {padded_name}  {size_str}  {id_str}{markers}\n")
+    };
+
+    output.push_str(&format!(
+        "{}\n",
+        paint("Built-in · managed llama.cpp", "2", color)
+    ));
+    let indexed_builtins = built_in_entries
+        .into_iter()
+        .enumerate()
+        .map(|(offset, listing)| (next_number + offset, listing))
+        .collect::<Vec<_>>();
+    let installed_items = indexed_builtins
+        .iter()
+        .copied()
+        .filter(|(_, listing)| listing.downloaded)
+        .collect::<Vec<_>>();
+    let available_items = indexed_builtins
+        .iter()
+        .copied()
+        .filter(|(_, listing)| !listing.downloaded)
+        .collect::<Vec<_>>();
+    output.push_str(&format!("{}\n", paint("Installed", "2", color)));
+    if installed_items.is_empty() {
+        output.push_str(&format!("  {}\n", paint("(none yet)", "2", color)));
+    } else {
+        for (number, listing) in &installed_items {
+            output.push_str(&render_builtin_line(*number, listing));
+        }
+    }
+    output.push('\n');
+    output.push_str(&format!("{}\n", paint("Available to download", "2", color)));
+    let hidden = listings
+        .iter()
+        .filter(|listing| !listing.downloaded && listing.fit == Fit::Red)
+        .count();
+    if available_items.is_empty() {
+        output.push_str("  No models suitable to download for this machine.\n");
+    } else {
+        for (number, listing) in &available_items {
+            output.push_str(&render_builtin_line(*number, listing));
+        }
+    }
+    if hidden > 0 {
+        output.push_str(&format!(
+            "  {}\n",
+            paint(
+                &format!(
+                    "({hidden} larger model{s} hidden — too large)",
+                    s = if hidden == 1 { "" } else { "s" }
+                ),
+                "2",
+                color
+            )
+        ));
+    }
+
+    output.push('\n');
+    let footer = format!(
+        "Pick a number to use it (provider rows configure instantly; built-in rows download first) — or  {cli} local use <number|id>"
+    );
+    output.push_str(&format!("{}\n", paint(&footer, "2", color)));
     output
 }
 
@@ -815,17 +1091,31 @@ pub async fn models_command(
     let env_name = crate::status::resolve_env(env_name, Some(&home));
     let models = fetch_curated(&env_name).await;
     let hardware = detect_hardware();
+    let local_config = crate::local_model::read_from_home(&home);
     // Only a Recommended-mode pick counts as the selected catalog model. In
     // Custom mode `model_id` is still populated (preserved for switching back),
     // but the active selection is the custom endpoint, not this row.
-    let selected_id = crate::local_model::read_from_home(&home).and_then(|config| {
-        matches!(config.mode, crate::local_model::LocalModelMode::Recommended)
-            .then_some(config.model_id)
+    let selected_id = local_config.as_ref().and_then(|config| {
+        (config.mode == crate::local_model::LocalModelMode::Recommended)
+            .then(|| config.model_id.clone())
+            .flatten()
+    });
+    let selected_provider = local_config.as_ref().and_then(|config| {
+        (config.mode == crate::local_model::LocalModelMode::Custom)
+            .then(|| Some((config.provider.clone()?, config.model.clone()?)))
             .flatten()
     });
     let listings = listings(models, hardware, selected_id.as_deref());
+    let provider_groups = crate::providers::discover_all().await;
     Ok(if json {
-        render_listings_json(&listings, hardware)
+        render_listings_json_with_providers(
+            &provider_groups,
+            &listings,
+            hardware,
+            selected_provider
+                .as_ref()
+                .map(|(provider, model)| (provider.as_str(), model.as_str())),
+        )
     } else {
         // Compute recommended_id: same policy as recommend_for_hardware —
         // best non-Red model by (fit, already-downloaded, quality) — pure,
@@ -842,7 +1132,16 @@ pub async fn models_command(
             .collect();
         let recommended = recommend_from(candidates, &downloaded_ids, hardware);
         let recommended_id = recommended.as_ref().map(|m| m.id.as_str());
-        render_listings_human(&listings, hardware, recommended_id, color)
+        render_listings_human_with_providers(
+            &provider_groups,
+            &listings,
+            hardware,
+            recommended_id,
+            selected_provider
+                .as_ref()
+                .map(|(provider, model)| (provider.as_str(), model.as_str())),
+            color,
+        )
     })
 }
 
@@ -978,31 +1277,58 @@ fn should_auto_select(
 /// `<cli> local use <number|model-id>`: resolve by 1-based selection number
 /// (from `rayline local models`) or model id, download if missing, then select.
 pub async fn use_command(env_name: Option<&str>, selection: &str) -> Result<String, String> {
-    let (_, models) = fetch_for_command(env_name).await?;
+    let (home, models) = fetch_for_command(env_name).await?;
     let hardware = detect_hardware();
     let listing_vec = listings(models, hardware, None);
-    let ordered = ordered_selectable(&listing_vec);
-    let model = resolve_selection(&ordered, selection).ok_or_else(|| {
-        let range = if ordered.is_empty() {
+    let provider_groups = crate::providers::discover_all().await;
+    let entries = picker_entries(&provider_groups, &listing_vec);
+    let entry = resolve_picker_selection(&entries, selection).ok_or_else(|| {
+        let range = if entries.is_empty() {
             "no models available".to_owned()
         } else {
-            format!("1–{}", ordered.len())
+            format!("1–{}", entries.len())
         };
-        let ids = ordered
+        let ids = entries
             .iter()
-            .map(|l| l.model.id.as_str())
+            .map(|entry| match entry {
+                PickerEntry::Provider(model) => model.model.as_str(),
+                PickerEntry::BuiltIn(model) => model.id.as_str(),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("Unknown selection `{selection}`. Valid numbers: {range}. Valid ids: {ids}")
     })?;
-    download(&model, false).await?;
-    crate::local_model::set_recommended(&model)?;
-    let cli = crate::CLI_BIN;
-    Ok(format!(
-        "Local model set to {id} ({name}).\nLocal routing uses it once enabled for your account (`{cli} local on`).",
-        id = model.id,
-        name = model.name,
-    ))
+    match entry {
+        PickerEntry::Provider(model) => {
+            let endpoint = crate::providers::provider_endpoint(model.provider)
+                .map_err(|error| format!("Could not resolve provider endpoint: {error}"))?
+                .ok_or_else(|| "built-in provider has no endpoint".to_owned())?;
+            crate::local_model::set_provider_endpoint_in_home(
+                &home,
+                model.provider.as_str(),
+                &endpoint.base_url,
+                &model.model,
+                "openai_chat",
+            )?;
+            let cli = crate::CLI_BIN;
+            Ok(format!(
+                "Local model set to {provider} `{model}` ({url}).\nLocal routing uses it with `{cli} claude --local`.",
+                provider = model.provider.label(),
+                model = model.model,
+                url = endpoint.base_url,
+            ))
+        }
+        PickerEntry::BuiltIn(model) => {
+            download(&model, false).await?;
+            crate::local_model::set_recommended(&model)?;
+            let cli = crate::CLI_BIN;
+            Ok(format!(
+                "Local model set to {id} ({name}).\nLocal routing uses it once enabled for your account (`{cli} local on`).",
+                id = model.id,
+                name = model.name,
+            ))
+        }
+    }
 }
 
 fn find_in(models: &[CatalogModel], model_id: &str) -> Result<CatalogModel, String> {
@@ -1504,6 +1830,190 @@ mod tests {
             !line_b.contains("★ recommended"),
             "no recommended marker on model-b"
         );
+    }
+
+    #[test]
+    fn render_listings_human_with_providers_numbers_provider_rows_first() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::Ollama,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::Ollama,
+                model: "qwen3-coder:30b".to_owned(),
+                size_bytes: Some(18_000_000_000),
+            }],
+        )];
+
+        let output = render_listings_human_with_providers(
+            &providers,
+            &listings,
+            None,
+            None,
+            Some(("ollama", "qwen3-coder:30b")),
+            false,
+        );
+
+        let provider_line = output
+            .lines()
+            .find(|line| line.contains("qwen3-coder:30b"))
+            .unwrap();
+        let builtin_line = output
+            .lines()
+            .find(|line| line.contains("Model A"))
+            .unwrap();
+        assert!(provider_line.contains("  1  ") || provider_line.trim_start().starts_with("1 "));
+        assert!(provider_line.contains("● selected"));
+        assert!(builtin_line.contains("  2  ") || builtin_line.trim_start().starts_with("2 "));
+    }
+
+    #[test]
+    fn render_listings_json_includes_provider_models() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::Ollama,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::Ollama,
+                model: "qwen3-coder:30b".to_owned(),
+                size_bytes: Some(18_000_000_000),
+            }],
+        )];
+
+        let output = render_listings_json_with_providers(
+            &providers,
+            &listings,
+            None,
+            Some(("ollama", "qwen3-coder:30b")),
+        );
+        let value: Value = serde_json::from_str(&output).unwrap();
+        let provider = &value["provider_models"][0];
+        assert_eq!(provider["provider"], "ollama");
+        assert_eq!(provider["model"], "qwen3-coder:30b");
+        assert_eq!(provider["selection"], 1);
+        assert_eq!(provider["selected"], true);
+        assert_eq!(value["models"][0]["id"], "model-a");
+        assert_eq!(value["models"][0]["selection"], 2);
+    }
+
+    #[test]
+    fn resolve_picker_selection_maps_numbers_and_ids() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::LmStudio,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::LmStudio,
+                model: "qwen2.5-coder-7b".to_owned(),
+                size_bytes: None,
+            }],
+        )];
+        let entries = picker_entries(&providers, &listings);
+
+        assert!(matches!(
+            resolve_picker_selection(&entries, "1"),
+            Some(PickerEntry::Provider(model)) if model.model == "qwen2.5-coder-7b"
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "2"),
+            Some(PickerEntry::BuiltIn(model)) if model.id == "model-a"
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "qwen2.5-coder-7b"),
+            Some(PickerEntry::Provider(_))
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "lmstudio:qwen2.5-coder-7b"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::LmStudio
+                    && model.model == "qwen2.5-coder-7b"
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "model-a"),
+            Some(PickerEntry::BuiltIn(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_picker_selection_disambiguates_provider_qualified_ids() {
+        let providers = vec![
+            (
+                crate::providers::ProviderId::Ollama,
+                vec![crate::providers::ProviderModel {
+                    provider: crate::providers::ProviderId::Ollama,
+                    model: "shared-model".to_owned(),
+                    size_bytes: None,
+                }],
+            ),
+            (
+                crate::providers::ProviderId::LmStudio,
+                vec![crate::providers::ProviderModel {
+                    provider: crate::providers::ProviderId::LmStudio,
+                    model: "shared-model".to_owned(),
+                    size_bytes: None,
+                }],
+            ),
+        ];
+        let entries = picker_entries(&providers, &[]);
+
+        assert!(matches!(
+            resolve_picker_selection(&entries, "lmstudio:shared-model"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::LmStudio
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "ollama:shared-model"),
+            Some(PickerEntry::Provider(model))
+                if model.provider == crate::providers::ProviderId::Ollama
+        ));
+    }
+
+    #[test]
+    fn resolve_picker_selection_prefers_builtin_id_over_provider_model_name() {
+        let listings = vec![test_listing(
+            "model-a",
+            "Model A",
+            4_000_000_000,
+            Fit::Green,
+            false,
+            false,
+        )];
+        let providers = vec![(
+            crate::providers::ProviderId::LmStudio,
+            vec![crate::providers::ProviderModel {
+                provider: crate::providers::ProviderId::LmStudio,
+                model: "model-a".to_owned(),
+                size_bytes: None,
+            }],
+        )];
+        let entries = picker_entries(&providers, &listings);
+
+        assert!(matches!(
+            resolve_picker_selection(&entries, "1"),
+            Some(PickerEntry::Provider(model)) if model.model == "model-a"
+        ));
+        assert!(matches!(
+            resolve_picker_selection(&entries, "model-a"),
+            Some(PickerEntry::BuiltIn(model)) if model.id == "model-a"
+        ));
     }
 
     #[test]

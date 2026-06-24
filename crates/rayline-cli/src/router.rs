@@ -1489,7 +1489,7 @@ async fn resolve_start_model(
                     "Custom local endpoint is incomplete. Set it with `{cli} local custom --url <URL> --model <NAME>`."
                 )));
             }
-            Ok(RouterStartRequest::from_local_model(&cfg, request))
+            start_request_from_local_model(home, &cfg, request)
         }
         crate::local_model::LocalModelMode::Recommended => {
             let cfg = if cfg.has_recommended_pick() {
@@ -1517,7 +1517,7 @@ async fn resolve_start_model(
                             let cfg = crate::local_model::activate_custom_endpoint_in_home(
                                 home, endpoint,
                             )?;
-                            return Ok(RouterStartRequest::from_local_model(&cfg, request));
+                            return start_request_from_local_model(home, &cfg, request);
                         }
                         _ => {
                             return Err(io::Error::other(format!(
@@ -1537,9 +1537,31 @@ async fn resolve_start_model(
                     "Local model `{model_id}` is not downloaded. Run `{cli} local download {model_id}`."
                 )));
             }
-            Ok(RouterStartRequest::from_local_model(&cfg, request))
+            start_request_from_local_model(home, &cfg, request)
         }
     }
+}
+
+fn start_request_from_local_model(
+    home: &Path,
+    cfg: &crate::local_model::LocalModelConfig,
+    request: RouterStartRequest,
+) -> io::Result<RouterStartRequest> {
+    let mut request = RouterStartRequest::from_local_model(cfg, request);
+    if let Some(path) = crate::providers::write_provider_routes_for_local_config(
+        home,
+        cfg,
+        request.router_config_path.as_deref(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to write provider routes: {error}"),
+        )
+    })? {
+        request.router_config_path = Some(path);
+    }
+    Ok(request)
 }
 
 pub async fn start_from_home(home: &Path, request: &RouterStartRequest) -> io::Result<String> {
@@ -2447,6 +2469,9 @@ fn router_meta(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
+    if let Some(fingerprint) = router_config_fingerprint(request.router_config_path.as_deref()) {
+        meta.insert("router_config_sha256".to_owned(), fingerprint);
+    }
     meta.insert("local_model_id".to_owned(), request.local_model_id.clone());
     meta.insert("adapter_port".to_owned(), request.adapter_port.to_string());
     meta.insert(
@@ -2611,10 +2636,18 @@ fn proxy_meta(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
+    if let Some(fingerprint) = router_config_fingerprint(router_config_path) {
+        meta.insert("router_config_sha256".to_owned(), fingerprint);
+    }
     if let Some(bin_path) = bin_path {
         meta.insert("bin_path".to_owned(), bin_path.display().to_string());
     }
     meta
+}
+
+fn router_config_fingerprint(router_config_path: Option<&Path>) -> Option<String> {
+    let bytes = fs::read(router_config_path?).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 fn metadata_matches_config(
@@ -2655,6 +2688,7 @@ fn format_meta(meta: &BTreeMap<String, String>) -> String {
         "local_available",
         "local_router_port",
         "router_config_path",
+        "router_config_sha256",
         "local_model_id",
         "local_adapter_port",
         "local_custom",
@@ -3133,6 +3167,92 @@ mod tests {
         requested.insert("metrics_port".to_owned(), "20814".to_owned());
 
         assert!(metadata_matches_config(&on_disk, &requested));
+    }
+
+    #[test]
+    fn metadata_detects_router_config_content_changes_at_same_path() {
+        let home = unique_test_dir("router-config-meta");
+        std::fs::create_dir_all(&home).unwrap();
+        let config_path = home.join("routes.json");
+        std::fs::write(
+            &config_path,
+            r#"{"endpoints":{},"routes":{"default":{"endpoint":"local"}}}"#,
+        )
+        .unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.router_config_path = Some(config_path.clone());
+        request.local_model_id = "local-model".to_owned();
+        let on_disk = router_meta(&home, &request, None, None);
+
+        std::fs::write(
+            &config_path,
+            r#"{"endpoints":{},"routes":{"default":{"endpoint":"ollama","model":"llama3"}}}"#,
+        )
+        .unwrap();
+        let requested = router_meta(&home, &request, None, None);
+
+        assert_ne!(
+            on_disk.get("router_config_sha256"),
+            requested.get("router_config_sha256")
+        );
+        assert!(!metadata_matches_config(&on_disk, &requested));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn resolve_start_model_writes_provider_routes_for_saved_provider() {
+        let home = unique_test_dir("router-provider-routes");
+        std::fs::create_dir_all(&home).unwrap();
+        crate::local_model::set_provider_endpoint_in_home(
+            &home,
+            "ollama",
+            "http://localhost:11434",
+            "qwen3-coder:30b",
+            "openai_chat",
+        )
+        .unwrap();
+        let explicit_config_path = home.join("explicit-routes.json");
+        std::fs::write(
+            &explicit_config_path,
+            r#"{"endpoints":[],"routes":{"subagents":{"Explore":{"endpoint":"local"}}}}"#,
+        )
+        .unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.router_config_path = Some(explicit_config_path.clone());
+        let resolved = resolve_start_model(&home, request).await.unwrap();
+
+        assert_eq!(
+            resolved.upstream_url.as_deref(),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(resolved.upstream_model.as_deref(), Some("qwen3-coder:30b"));
+        let provider_routes_path = resolved.router_config_path.as_ref().unwrap();
+        assert_ne!(provider_routes_path, &explicit_config_path);
+        let routes: Value =
+            serde_json::from_str(&std::fs::read_to_string(provider_routes_path).unwrap()).unwrap();
+        assert_eq!(routes["endpoints"][0]["id"], "ollama");
+        assert_eq!(routes["endpoints"][0]["protocol"], "openai_chat");
+        assert_eq!(
+            routes["endpoints"][0]["base_url"],
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            routes["routes"]["model_routes"]["rayline-local"]["endpoint"],
+            "ollama"
+        );
+        assert_eq!(
+            routes["routes"]["subagents"]["Explore"]["endpoint"],
+            "ollama"
+        );
+        assert_eq!(
+            routes["routes"]["subagents"]["Explore"]["model"],
+            "qwen3-coder:30b"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
