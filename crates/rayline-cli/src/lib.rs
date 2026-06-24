@@ -1661,6 +1661,7 @@ fn root_version_requested(original_argv: &[OsString]) -> bool {
 }
 
 async fn exec_claude(request: crate::claude::RunRequest) -> ExitCode {
+    let print_mode = crate::claude::print_mode_flag(&request.args).is_some();
     let mut command = match crate::claude::run_command(&request).await {
         Ok(command) => command,
         Err(error) => {
@@ -1668,6 +1669,17 @@ async fn exec_claude(request: crate::claude::RunRequest) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // Separate Rayline's setup output from Claude Code's own (the interactive
+    // banner, or the `-p` response). In print mode Claude emits nothing until the
+    // model answers — which reads as a hang — so note that we're waiting, then a
+    // rule below it marks the handoff. All on stderr, so piped `-p` stdout stays
+    // clean.
+    eprintln!();
+    if print_mode {
+        eprintln!("Prompt submitted to Claude Code — waiting for the response");
+    }
+    eprintln!("{}", "─".repeat(72));
 
     exec_or_status(&mut command)
 }

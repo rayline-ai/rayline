@@ -1,18 +1,10 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-#[cfg(target_os = "macos")]
-use std::io::Read;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::process::Stdio;
-#[cfg(target_os = "macos")]
-use std::thread;
 use std::time::Duration;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
 
 use crate::claude_daemon::{LaunchPreflight, LaunchRecord, PreflightOutcome, RequestSpec};
 use serde_json::Value;
@@ -122,6 +114,14 @@ pub(crate) fn is_proxy_routing_mode(mode: RoutingMode) -> bool {
     matches!(mode, RoutingMode::Proxy | RoutingMode::ProxySubagents)
 }
 
+/// Whether an isolated session in this routing mode needs its own Claude Code
+/// OAuth login. Env mode (`Override`) authenticates Claude Code via
+/// `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` env vars, so it does not; the
+/// proxy modes route through Claude's own credential and do.
+fn isolated_needs_claude_login(mode: RoutingMode) -> bool {
+    mode != RoutingMode::Override
+}
+
 fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
     match mode {
         RoutingMode::ProxySubagents => DEFAULT_PROXY_SUBAGENTS_MODEL,
@@ -178,6 +178,7 @@ pub enum RunError {
     Auth(crate::status::AuthTokenError),
     Login(String),
     KeyProvision(String),
+    NotLoggedIn(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -202,6 +203,7 @@ impl std::fmt::Display for RunError {
             Self::Auth(error) => error.fmt(formatter),
             Self::Login(message) => formatter.write_str(message),
             Self::KeyProvision(message) => formatter.write_str(message),
+            Self::NotLoggedIn(message) => formatter.write_str(message),
         }
     }
 }
@@ -465,6 +467,22 @@ pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
     run_command_from_home(request, &home, claude_bin).await
 }
 
+/// The print-mode flag (`-p` / `--print`) in the forwarded Claude args, if any.
+/// Print mode suppresses Claude Code's own startup output and is
+/// non-interactive. Returns the exact flag the user passed, so messaging can
+/// name it.
+pub fn print_mode_flag(args: &[OsString]) -> Option<&'static str> {
+    args.iter().find_map(|arg| {
+        if arg == "-p" {
+            Some("-p")
+        } else if arg == "--print" {
+            Some("--print")
+        } else {
+            None
+        }
+    })
+}
+
 async fn run_command_from_home(
     request: &RunRequest,
     home: &Path,
@@ -710,7 +728,14 @@ async fn run_command_from_home(
     // config so those target the isolated settings.json and proxy, not the shared
     // ones under ~/.claude.
     if isolated {
-        apply_isolated_config_dir(&mut command, home, &claude_bin);
+        let print_flag = print_mode_flag(&request.args);
+        apply_isolated_config_dir(
+            &mut command,
+            home,
+            &claude_bin,
+            print_flag,
+            isolated_needs_claude_login(request.routing_mode),
+        )?;
     }
     match request.routing_mode {
         RoutingMode::Override => {
@@ -1455,53 +1480,175 @@ const ISOLATED_OPTIONAL_ENTRIES: [&str; 7] = [
 ];
 
 /// Per-profile config dir files seeded as independent copies so they can
-/// diverge. `.claude.json` is seeded
-/// separately because it lives outside the config dir by default (see
-/// [`global_claude_json_path`]).
+/// diverge. `.claude.json` is seeded separately (see
+/// [`seed_isolated_claude_json`]) because it lives outside the config dir.
 const ISOLATED_SEED_FILES: [&str; 1] = ["settings.json"];
 
 /// Lay down the isolated overlay and point Claude Code at it. Idempotent: safe
 /// to call on every run.
-fn apply_isolated_config_dir(command: &mut Command, home: &Path, claude_bin: &Path) {
+fn apply_isolated_config_dir(
+    command: &mut Command,
+    home: &Path,
+    claude_bin: &Path,
+    print_flag: Option<&str>,
+    needs_claude_login: bool,
+) -> Result<(), RunError> {
     let source_dir = claude_config_dir(home, false);
     let isolated_dir = isolated_cc_dir(home);
     ensure_isolated_overlay(&source_dir, &isolated_dir);
-    // `.claude.json` (global app state, project-trust, OAuth, personal MCP) lives
-    // at $HOME/.claude.json by default, NOT inside ~/.claude. Keep the isolated
-    // profile local by default so a `/login` done under `--isolated` survives
-    // future launches and the launcher never triggers macOS keychain prompts.
-    //
-    // Developers who explicitly want to clone the source Claude profile can opt
-    // in, but that path may prompt for keychain access on macOS.
+    // `.claude.json` (global app state, project-trust, personal MCP) lives at
+    // $HOME/.claude.json by default, NOT inside ~/.claude. Seed the isolated
+    // profile from it so project-trust, MCP servers and settings carry over, but
+    // strip the auth keys so it starts logged out (its own login below).
     let source_global_config = global_claude_json_path(home);
     let isolated_global_config = isolated_dir.join(".claude.json");
-    if should_sync_claude_keychain_credentials() {
-        refresh_local_copy(&source_global_config, &isolated_global_config);
-        mirror_claude_code_keychain_credentials(&source_dir, &isolated_dir, claude_bin);
-    } else {
-        seed_local_copy(&source_global_config, &isolated_global_config);
-    }
+
     command.env(CLAUDE_CONFIG_DIR_ENV, &isolated_dir);
+
+    // Always (re)seed `.claude.json` first — it is idempotent (no-op when the
+    // file already exists), so this restores project-trust/MCP/onboarding state
+    // even if `~/.rayline/cc` was deleted while the credential survived (the
+    // macOS keychain entry outlives the dir). Do it before any auth fast-path so
+    // a recreated profile never loses the inherited app state.
+    seed_isolated_claude_json(&source_global_config, &isolated_global_config);
+
+    // Env mode authenticates Claude Code via ANTHROPIC_BASE_URL/AUTH_TOKEN, so it
+    // needs no Claude OAuth login; the seed above is all it requires.
+    if !needs_claude_login {
+        return Ok(());
+    }
+
+    // Already authenticated → nothing more to do.
+    if isolated_profile_is_authenticated(&isolated_dir) {
+        return Ok(());
+    }
+
+    // Non-interactive (`-p`/`--print`, or piped streams): we can't drive a
+    // browser sign-in. Fail before starting the router/proxy (so the output
+    // isn't cluttered with a launch that can't succeed), telling the user how to
+    // authenticate the isolated profile once.
+    if !can_prompt_user(print_flag.is_some()) {
+        let how = match print_flag {
+            Some(flag) => format!("Re-run the same command without `{flag}` to sign in first."),
+            None => "Run it again interactively (not piped) to sign in first.".to_owned(),
+        };
+        return Err(RunError::NotLoggedIn(format!(
+            "This isolated session is not logged in to Claude Code. {how}"
+        )));
+    }
+
+    // Interactive: sign the isolated profile in via Claude Code's own browser
+    // OAuth, then proceed. Claude owns the credential, so we never touch the
+    // secret.
+    run_isolated_browser_login(&isolated_dir, claude_bin)?;
+
+    // `claude auth login` rewrites `.claude.json`, resetting
+    // `hasCompletedOnboarding` to false — which would launch the session into the
+    // first-run onboarding wizard right after the user just signed in. Restore
+    // the inherited app state (onboarding flag + project-trust + MCP) from the
+    // source profile, keeping the `oauthAccount` login that auth-login just
+    // wrote. This is sequential — login has fully exited before we rewrite, and
+    // the session reads the file afterward — so there is no flash. (Per-folder
+    // trust prompts are a separate, legitimate Claude Code behavior for folders
+    // the user has not yet trusted.)
+    restore_isolated_app_state(&source_global_config, &isolated_global_config);
+    Ok(())
 }
 
-fn should_sync_claude_keychain_credentials() -> bool {
-    matches!(
-        env::var("RAYLINE_SYNC_CLAUDE_KEYCHAIN")
-            .or_else(|_| env::var("RAYLINE_SYNC_CLAUDE_KEYCHAIN"))
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "yes")
-    )
+/// After login, merge the source profile's app state (onboarding, project-trust,
+/// MCP) into the isolated `.claude.json` while preserving the freshly-written
+/// auth. Source keys win for app state; the isolated file's `oauthAccount` (just
+/// written by `auth login`) is kept. Best-effort no-op on any error.
+fn restore_isolated_app_state(source: &Path, dest: &Path) {
+    let Ok(dest_raw) = fs::read_to_string(dest) else {
+        return;
+    };
+    let Ok(mut dest_value) = serde_json::from_str::<Value>(&dest_raw) else {
+        return;
+    };
+    let Some(dest_obj) = dest_value.as_object_mut() else {
+        return;
+    };
+
+    // Merge inherited app state from the source profile (trust, MCP, onboarding,
+    // settings), but never the source's auth keys — login owns those now.
+    if let Some(source_obj) = fs::read_to_string(source)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+    {
+        for (key, val) in source_obj {
+            if CLAUDE_JSON_AUTH_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            dest_obj.insert(key, val);
+        }
+    }
+    // Belt-and-braces: ensure onboarding is complete even if the source lacked it.
+    dest_obj.insert("hasCompletedOnboarding".to_owned(), Value::Bool(true));
+
+    if let Ok(updated) = serde_json::to_string_pretty(&dest_value) {
+        let _ = fs::write(dest, updated);
+    }
 }
 
-/// Path of Claude Code's global `.claude.json` (app state, project-trust, OAuth,
-/// personal MCP servers). It lives inside `CLAUDE_CONFIG_DIR` when that is set,
-/// otherwise at `$HOME/.claude.json` (NOT inside `~/.claude`).
+/// Path of Claude Code's global `.claude.json` (app state, project-trust,
+/// personal MCP servers, OAuth). It lives inside `CLAUDE_CONFIG_DIR` when that
+/// is set, otherwise at `$HOME/.claude.json` (NOT inside `~/.claude`).
 fn global_claude_json_path(home: &Path) -> PathBuf {
     match env::var_os(CLAUDE_CONFIG_DIR_ENV) {
         Some(dir) => expand_user_path(PathBuf::from(dir), Some(home)).join(".claude.json"),
         None => home.join(".claude.json"),
     }
+}
+
+/// Whether we may interactively prompt the user before launching Claude Code.
+/// False in print mode (`-p`/`--print`) and whenever stdin/stdout/stderr are not
+/// all TTYs (e.g. piped output), so non-interactive launches never block.
+fn can_prompt_user(print_mode: bool) -> bool {
+    !print_mode
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+}
+
+/// Sign the isolated profile in via Claude Code's own `auth login` (browser
+/// OAuth), waiting for it to complete so the profile is authenticated before the
+/// main launch. Caller has confirmed we can prompt (see [`can_prompt_user`]).
+///
+/// Fails (so the caller aborts the launch as a clean preflight failure, rather
+/// than starting the proxy/router against an unauthenticated profile) when the
+/// login command cannot run, exits non-zero (e.g. the user cancels or the OAuth
+/// callback server cannot bind), or leaves the profile still logged out.
+fn run_isolated_browser_login(isolated_dir: &Path, claude_bin: &Path) -> Result<(), RunError> {
+    eprintln!(
+        "\nThis isolated session needs its own Claude Code login. \
+         Opening browser sign-in..."
+    );
+    // `claude auth login` runs the browser OAuth flow and exits (unlike passing
+    // `/login`, which would open the REPL). It honors CLAUDE_CONFIG_DIR for the
+    // credential location on Linux/Windows; on macOS the credential lands in the
+    // keychain under the isolated dir's namespaced service. Claude sets up the
+    // credential and its ACL itself, so there is no keychain prompt from us.
+    let status = Command::new(claude_bin)
+        .args(["auth", "login"])
+        .env(CLAUDE_CONFIG_DIR_ENV, isolated_dir)
+        .status()
+        .map_err(|error| {
+            RunError::NotLoggedIn(format!("Could not run `claude auth login`: {error}"))
+        })?;
+    eprintln!();
+
+    // Don't trust the exit code alone — re-check that the credential actually
+    // landed, so a partial/cancelled sign-in doesn't proceed as logged in.
+    if !status.success() || !isolated_profile_is_authenticated(isolated_dir) {
+        return Err(RunError::NotLoggedIn(
+            "Claude Code sign-in did not complete, so this isolated session is still \
+             logged out. Re-run and finish the browser sign-in."
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Make `isolated_dir` a thin overlay on `shared_root` (the user's main Claude
@@ -1561,20 +1708,42 @@ fn seed_local_copy(source: &Path, dest: &Path) {
     copy_private_file(source, dest);
 }
 
-/// Copy `source` -> `dest`, replacing any existing file/symlink. Used for
-/// selected-source auth state that must not remain pinned to a stale isolated
-/// profile.
-fn refresh_local_copy(source: &Path, dest: &Path) {
-    if same_path(source, dest) {
+/// Auth-bearing keys in `.claude.json` — stripped when seeding an isolated
+/// profile so it starts logged out (and signs in via its own browser login),
+/// while project-trust, MCP servers and settings carry over. `primaryApiKey` is
+/// where Claude stores a Console/API key when keychain storage is unavailable;
+/// `customApiKeyResponses` caches API-key approval prompts; `oauthAccount` is the
+/// subscription login. None of these should be copied into the isolated profile.
+const CLAUDE_JSON_AUTH_KEYS: [&str; 3] = ["oauthAccount", "customApiKeyResponses", "primaryApiKey"];
+
+/// Seed the isolated `.claude.json` from the user's profile, minus the auth
+/// keys, so the isolated session inherits project-trust, MCP servers and
+/// settings but starts logged out. Falls back to a minimal onboarding-complete
+/// stub when the source is missing or unreadable. No-op if the destination
+/// already exists (a prior login must not be clobbered).
+fn seed_isolated_claude_json(source: &Path, dest: &Path) {
+    if fs::symlink_metadata(dest).is_ok() {
         return;
     }
-    if !source.is_file() {
-        return;
+    let contents = fs::read_to_string(source)
+        .ok()
+        .and_then(|raw| claude_json_without_auth(&raw))
+        .unwrap_or_else(|| "{\n  \"hasCompletedOnboarding\": true\n}".to_owned());
+    if fs::write(dest, contents).is_ok() {
+        set_user_private_permissions(dest);
     }
-    if fs::symlink_metadata(dest).is_ok() && fs::remove_file(dest).is_err() {
-        return;
+}
+
+/// Return `raw` (`.claude.json` contents) with the auth keys removed, or `None`
+/// if it is not a JSON object. Used to seed a logged-out isolated profile that
+/// still carries project-trust, MCP servers and settings.
+fn claude_json_without_auth(raw: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<Value>(raw).ok()?;
+    let object = value.as_object_mut()?;
+    for key in CLAUDE_JSON_AUTH_KEYS {
+        object.remove(key);
     }
-    copy_private_file(source, dest);
+    serde_json::to_string_pretty(&value).ok()
 }
 
 fn copy_private_file(source: &Path, dest: &Path) {
@@ -1586,51 +1755,30 @@ fn copy_private_file(source: &Path, dest: &Path) {
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
+/// Whether the isolated profile already has its own Claude Code credential.
+/// On macOS the credential is a keychain item namespaced by the config-dir path
+/// hash; we look it up by attributes only (no `-w`), so this never prompts.
 #[cfg(target_os = "macos")]
-fn mirror_claude_code_keychain_credentials(
-    source_config_dir: &Path,
-    isolated_dir: &Path,
-    claude_bin: &Path,
-) {
-    if same_path(source_config_dir, isolated_dir) {
-        return;
-    }
-    let source_service = claude_code_keychain_service(source_config_dir);
-    let dest_service = claude_code_keychain_service(isolated_dir);
-    if source_service == dest_service {
-        return;
-    }
-    let Some(account) = find_keychain_account(&source_service) else {
-        return;
-    };
-    let Some(secret) = read_keychain_secret(&source_service, &account) else {
-        return;
-    };
-    if read_keychain_secret(&dest_service, &account).as_deref() == Some(secret.as_str()) {
-        return;
-    }
-    write_keychain_secret(&dest_service, &account, &secret, claude_bin);
+fn isolated_profile_is_authenticated(isolated_dir: &Path) -> bool {
+    find_keychain_account(&claude_code_keychain_service(isolated_dir)).is_some()
 }
 
+/// On Linux/Windows Claude Code stores its credential as a plain
+/// `<config_dir>/.credentials.json` file, so a logged-in isolated profile simply
+/// has that file.
 #[cfg(not(target_os = "macos"))]
-fn mirror_claude_code_keychain_credentials(
-    _source_config_dir: &Path,
-    _isolated_dir: &Path,
-    _claude_bin: &Path,
-) {
+fn isolated_profile_is_authenticated(isolated_dir: &Path) -> bool {
+    isolated_dir.join(".credentials.json").is_file()
 }
 
+/// Claude Code's macOS keychain generic-password service name for a non-default
+/// config dir: `Claude Code-credentials-<hex>` where `<hex>` is the first 4
+/// bytes of `sha256(path)` of the config-dir path string (verified against
+/// Claude Code v2.1.170). The isolated dir is always an explicit, non-default
+/// config dir, so it always carries this suffix.
 #[cfg(target_os = "macos")]
 fn claude_code_keychain_service(config_dir: &Path) -> String {
-    let normalized = fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
     format!(
         "Claude Code-credentials-{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
@@ -1665,112 +1813,6 @@ fn parse_keychain_account(output: &str) -> Option<String> {
         }
     }
     None
-}
-
-#[cfg(target_os = "macos")]
-fn read_keychain_secret(service: &str, account: &str) -> Option<String> {
-    let child = Command::new("security")
-        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let (status, stdout) = wait_for_child_stdout_with_timeout(child, Duration::from_secs(5))
-        .ok()
-        .flatten()?;
-    if !status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&stdout)
-            .trim_end_matches(['\r', '\n'])
-            .to_owned(),
-    )
-    .filter(|secret| !secret.is_empty())
-}
-
-#[cfg(target_os = "macos")]
-fn write_keychain_secret(service: &str, account: &str, secret: &str, claude_bin: &Path) {
-    let args = add_generic_password_args(service, account, claude_bin);
-    let mut child = match Command::new("security")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return,
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        // `security add-generic-password -w` prompt mode asks for the password
-        // twice. Feeding it via stdin keeps OAuth material out of process args.
-        let _ = writeln!(stdin, "{secret}");
-        let _ = writeln!(stdin, "{secret}");
-    }
-    let _ = wait_for_child_with_timeout(child, Duration::from_secs(5));
-}
-
-#[cfg(target_os = "macos")]
-fn add_generic_password_args(service: &str, account: &str, claude_bin: &Path) -> Vec<OsString> {
-    let mut args = vec![
-        OsString::from("add-generic-password"),
-        OsString::from("-U"),
-        OsString::from("-s"),
-        OsString::from(service),
-        OsString::from("-a"),
-        OsString::from(account),
-    ];
-    if claude_bin.is_file() {
-        args.push(OsString::from("-T"));
-        args.push(claude_bin.as_os_str().to_os_string());
-    }
-    // Keep this last: with no inline value, `security` prompts on stdin.
-    args.push(OsString::from("-w"));
-    args
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_child_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> io::Result<()> {
-    let start = Instant::now();
-    loop {
-        if let Some(_status) = child.try_wait()? {
-            return Ok(());
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_child_stdout_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> io::Result<Option<(std::process::ExitStatus, Vec<u8>)>> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)?;
-            }
-            return Ok(Some((status, stdout)));
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 #[cfg(unix)]
@@ -2448,6 +2490,63 @@ mod local_provider_tests {
             false,
             Some(&non_provider_cfg),
         ));
+    }
+}
+
+#[cfg(test)]
+mod isolated_needs_claude_login_tests {
+    use super::*;
+
+    #[test]
+    fn env_mode_skips_claude_login() {
+        // Env mode authenticates via ANTHROPIC_* env vars; requiring a separate
+        // Claude OAuth login would wrongly reject valid non-interactive runs.
+        assert!(!isolated_needs_claude_login(RoutingMode::Override));
+    }
+
+    #[test]
+    fn proxy_modes_require_claude_login() {
+        assert!(isolated_needs_claude_login(RoutingMode::Proxy));
+        assert!(isolated_needs_claude_login(RoutingMode::ProxySubagents));
+    }
+}
+
+#[cfg(test)]
+mod claude_json_without_auth_tests {
+    use super::*;
+
+    #[test]
+    fn strips_auth_keys_but_keeps_trust_and_mcp() {
+        let raw = r#"{
+            "oauthAccount": {"emailAddress": "me@example.com"},
+            "customApiKeyResponses": {"approved": ["k"]},
+            "primaryApiKey": "sk-ant-secret",
+            "hasCompletedOnboarding": true,
+            "projects": {"/repo": {"hasTrustDialogAccepted": true, "mcpServers": {}}},
+            "mcpServers": {"local": {"command": "x"}}
+        }"#;
+        let out = claude_json_without_auth(raw).expect("valid object");
+        assert!(!out.contains("sk-ant-secret"), "API key leaked: {out}");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let object = value.as_object().unwrap();
+
+        // Auth state removed.
+        assert!(!object.contains_key("oauthAccount"));
+        assert!(!object.contains_key("customApiKeyResponses"));
+        assert!(!object.contains_key("primaryApiKey"));
+        // Trust, MCP and onboarding state preserved.
+        assert!(object.contains_key("projects"));
+        assert!(object.contains_key("mcpServers"));
+        assert_eq!(
+            object.get("hasCompletedOnboarding"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn returns_none_for_non_object() {
+        assert!(claude_json_without_auth("[1, 2, 3]").is_none());
+        assert!(claude_json_without_auth("not json").is_none());
     }
 }
 

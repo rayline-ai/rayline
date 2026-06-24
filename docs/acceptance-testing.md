@@ -71,17 +71,29 @@ rayline router stop || true
 
 ## Run Claude Through Rayline Local
 
+Run interactively. On the first `--isolated` run the profile is logged out, so a
+browser sign-in opens automatically — complete it and the session continues.
+(Print mode `-p` can't drive the browser, so sign in interactively first.)
+
+<a href="https://get.rayline.ai/media/rayline-login-demo.mp4">
+  <img src="https://get.rayline.ai/media/rayline-login-demo.gif"
+       alt="rayline claude --local --isolated: browser sign-in, then an Explore subagent routed to the on-device model"
+       width="100%">
+</a>
+
 ```bash
 rayline claude \
   --local \
   --isolated \
   --route subagents \
-  --router-config-path ~/.config/rayline/local-router-explore-local.json \
-  -- \
-  -p 'Use the Explore subagent for this task. Ask the Explore subagent to reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK. After the Explore subagent returns, reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK.'
+  --router-config-path ~/.config/rayline/local-router-explore-local.json
 ```
 
-Expected stdout:
+At the prompt, paste: `Use the Explore subagent for this task. Ask the Explore
+subagent to reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK. After the Explore
+subagent returns, reply exactly: RAYLINE_EXPLORE_ACCEPTANCE_OK.`
+
+Expected reply:
 
 ```text
 RAYLINE_EXPLORE_ACCEPTANCE_OK
