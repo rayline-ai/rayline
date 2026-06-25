@@ -1,7 +1,10 @@
-# Local Router Claude Acceptance
+# Acceptance Testing
 
-This guide validates the real Claude Code path through Rayline Local's local
-router and managed llama.cpp runtime.
+This guide is for maintainers and coding agents who need to validate the real
+Claude Code path through Rayline Local end to end — exercising it the way a user
+would, against the local router and managed llama.cpp runtime. It complements the
+automated gate (`fmt` / `clippy` / `test`); run these manual steps on a real
+machine with a TTY after that gate is green.
 
 Prerequisites:
 
@@ -242,6 +245,80 @@ rayline claude --local -p 'hello'
 - `rayline local models` lists detected provider models before built-in models
 - Selecting a provider row configures it immediately (no GGUF download)
 - A later bare `rayline claude --local` reuses the persisted provider config and regenerates provider routes
+
+---
+
+## Manual CLI Checklist
+
+A broader sweep of the CLI surface, beyond the routing path above. The routing
+steps (3–5) reuse the same setup as
+[Run Claude Through Rayline Local](#run-claude-through-rayline-local); verify
+routing there rather than duplicating those assertions here.
+
+1. **Version and help:**
+
+   ```bash
+   rayline --version
+   rayline --help
+   rayline claude --help
+   rayline update --help
+   ```
+
+   Confirm the CLI exposes `claude`, `router`, `local`, and `update`, and that
+   `rayline claude --help` describes local routing and includes `--local`,
+   `--isolated`, `--via`, `--route`, and `--router-config-path`.
+
+2. **Update check:**
+
+   ```bash
+   rayline update --check
+   ```
+
+   Confirm the command reports either `Already on latest` (exit code 0) or
+   `Update available` (exit code 1). For install-path validation without
+   replacing the binary, run `rayline update --dry-run --version <version>`.
+
+3. **Isolated launch:**
+
+   ```bash
+   rayline claude \
+     --local \
+     --isolated \
+     --router-config-path ~/.config/rayline/local-router.json
+   ```
+
+   Confirm `~/.rayline/cc/settings.json` exists and
+   `~/.rayline/rld/cc/rl-rld-proxy.log` is written.
+
+4. **Default route (main-thread passthrough):** In the launched session, run a
+   normal main-thread prompt. Confirm the isolated proxy log shows passthrough
+   routing (for example `selective_main_passthrough`) and the local-router log
+   does not show that prompt as an `Explore` local route.
+
+5. **`Explore` route:** Ask Claude Code to use the `Explore` subagent. Confirm
+   the proxy log shows `selective_subagent_header` and the router log shows a
+   local route with `policy=subagent:Explore` (or another case-insensitive
+   `Explore` match).
+
+6. **Log inspection:**
+
+   ```bash
+   rayline router status
+   rayline router logs --lines 120
+   rayline router top
+   tail -n 120 ~/.rayline/rld/rl-rld.log
+   tail -n 120 ~/.rayline/rld/cc/rl-rld-proxy.log
+   ```
+
+   Confirm the status reports the expected ports and the logs identify the router
+   config path, selected endpoint, and local model.
+
+7. **Parallel isolated sessions:** Keep a normal Claude Code session running, then
+   launch the isolated local-router command in another terminal. Confirm the
+   normal session keeps using its own daemon and the isolated session writes only
+   under `~/.rayline/cc` and `~/.rayline/rld/cc` for Claude/proxy state. Start a
+   second isolated launch with the same config and confirm it reuses or restarts
+   only the isolated proxy, not the shared normal-session proxy.
 
 ---
 
