@@ -517,6 +517,13 @@ async fn run_command_from_home(
         .as_deref()
         .map(crate::router_config::config_main_is_passthrough)
         .unwrap_or(false);
+    // `--config` whose routes stay entirely on the hosted cloud router: no on-device
+    // router, but the proxy still gets the config (subagent allowlist) and the scope
+    // is derived from `routes.main`. Behaves like a cloud `rayline claude` with the
+    // config's per-type subagent allowlist applied.
+    let config_cloud_only = effective_config.is_some()
+        && request.routing_mode != RoutingMode::Override
+        && !config_engages_local;
     let local_plane = request.local_router || config_engages_local;
 
     if config_engages_local {
@@ -720,8 +727,9 @@ async fn run_command_from_home(
         // Config-driven routing derives scope from `routes.main`: a passthrough
         // (subscription / absent) main stays on the caller's credential
         // (selective-subagents), otherwise route ALL so `routes.main` governs the
-        // main thread. Non-config runs use the normal local-engagement default.
-        routing_mode: if config_engages_local {
+        // main thread. Applies to both local-plane and cloud-only configs.
+        // Non-config runs use the normal local-engagement default.
+        routing_mode: if config_engages_local || config_cloud_only {
             if config_main_passthrough {
                 RoutingMode::ProxySubagents
             } else {
@@ -733,6 +741,14 @@ async fn run_command_from_home(
                 local_engaged,
                 request.route_scope_explicit,
             )
+        },
+        // Cloud-only `--config`: hand the config to the proxy so its subagent
+        // allowlist applies. (Local-plane configs pass it via the local router's
+        // own `router_config_path`, set on the start request above.)
+        router_config_path: if config_cloud_only {
+            effective_config.clone()
+        } else {
+            request.router_config_path.clone()
         },
         ..request.clone()
     };
@@ -1160,6 +1176,10 @@ async fn configure_proxy_env(
             request.diagnose,
             request.upstream_ca_path.as_deref(),
             isolated,
+            // v2 cloud-plane `--config`: hand the proxy the config so its subagent
+            // allowlist (`routes.subagents`) routes the named types to the hosted
+            // router and passes the rest through.
+            request.router_config_path.as_deref(),
         )
         .await
         .map_err(|error| RunError::Router(error.to_string()))?;

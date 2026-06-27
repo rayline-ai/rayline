@@ -267,3 +267,102 @@ async fn anthropic_messages_passthrough_preserves_deltas_through_mock() {
     let _ = std::fs::remove_file(path);
     println!("PASS mock anthropic_messages passthrough: deltas={text_deltas} text={text:?}");
 }
+
+/// A minimal Anthropic SSE stream whose single text delta is `text`, so a test can
+/// tell which upstream answered by reading the response text.
+fn anthropic_sse(text: &str) -> String {
+    let body = format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"x\",\"content\":[],\"stop_reason\":null,\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n\
+event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n\
+event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    );
+    http_sse(&body)
+}
+
+fn sse_text(events: &[Value]) -> String {
+    events
+        .iter()
+        .filter(|e| e["delta"]["type"] == "text_delta")
+        .filter_map(|e| e["delta"]["text"].as_str())
+        .collect()
+}
+
+fn header<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// End-to-end (headless / agent path): a single `--config` with distinct `main`
+/// and `subagent` routes must send the MAIN request to one upstream and a SUBAGENT
+/// request to ANOTHER, over real HTTP. This is the SDK-through-the-router proof for
+/// `rayline router start --config` — main vs subagent is classified per request by
+/// the agent headers, exactly as the proxy sets them at runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_routes_main_and_subagent_to_distinct_endpoints() {
+    let main_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let main_port = main_up.local_addr().unwrap().port();
+    let sub_up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sub_port = sub_up.local_addr().unwrap().port();
+    tokio::spawn(serve_once(main_up, anthropic_sse("MAIN-OK")));
+    tokio::spawn(serve_once(sub_up, anthropic_sse("SUB-OK")));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [
+            {"id": "main-ep", "protocol": "anthropic_messages",
+             "base_url": format!("http://127.0.0.1:{main_port}"), "models": ["model-main"]},
+            {"id": "sub-ep", "protocol": "anthropic_messages",
+             "base_url": format!("http://127.0.0.1:{sub_port}"), "models": ["model-sub"]}
+        ],
+        "routes": {
+            "main": {"endpoint": "main-ep", "model": "model-main"},
+            "subagent": {"endpoint": "sub-ep", "model": "model-sub"}
+        }
+    });
+    let path = write_config("config-both", &config);
+    start_router(port, path.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Main turn: no agent headers → routes.main → main-ep.
+    let main_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "rayline-router", "stream": true, "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("main request");
+    assert_eq!(main_resp.status(), 200);
+    assert_eq!(header(&main_resp, "x-rayline-task-class"), Some("main"));
+    assert_eq!(
+        header(&main_resp, "x-rayline-selected-model"),
+        Some("model-main")
+    );
+    assert_eq!(sse_text(&collect_sse(main_resp).await), "MAIN-OK");
+
+    // Subagent turn: agent-id + agent-type headers → routes.subagent → sub-ep.
+    let sub_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-agent-id", "abc123")
+        .header("x-rayline-claude-code-agent-type", "reviewer")
+        .json(&json!({
+            "model": "rayline-router", "stream": true, "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("subagent request");
+    assert_eq!(sub_resp.status(), 200);
+    assert_eq!(header(&sub_resp, "x-rayline-task-class"), Some("subagent"));
+    assert_eq!(
+        header(&sub_resp, "x-rayline-selected-model"),
+        Some("model-sub")
+    );
+    assert_eq!(sse_text(&collect_sse(sub_resp).await), "SUB-OK");
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS config drives main→main-ep, subagent→sub-ep over HTTP");
+}

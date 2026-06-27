@@ -1664,6 +1664,7 @@ pub async fn start_from_home_with_rld_bin(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_proxy_from_home(
     home: &Path,
     router_url: &str,
@@ -1674,6 +1675,10 @@ pub async fn start_proxy_from_home(
     diagnose: bool,
     upstream_ca_path: Option<&Path>,
     isolated: bool,
+    // v2 `--config` (cloud plane): the proxy reads this for its subagent allowlist
+    // (`routes.subagents`), so a config can route specific subagent types to the
+    // hosted router and pass the rest through. `None` keeps today's behavior.
+    router_config_path: Option<&Path>,
 ) -> io::Result<String> {
     if router_api_key.is_empty() {
         return Err(io::Error::other(
@@ -1696,7 +1701,7 @@ pub async fn start_proxy_from_home(
         diagnose,
         upstream_ca_path,
         isolated,
-        None,
+        router_config_path,
         None,
         &client,
     )
