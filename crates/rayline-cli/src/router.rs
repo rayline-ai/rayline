@@ -76,6 +76,13 @@ pub struct RouterStartRequest {
     pub enable_proxy: bool,
     pub proxy_port: u16,
     pub proxy_routing_mode: String,
+    /// Config-only: start the daemon without a bundled local model (no GGUF /
+    /// upstream). Used when the static config routes only to named endpoints.
+    pub no_local_model: bool,
+    /// Override for the router API key the daemon endpoints read from
+    /// `RAYLINE_ROUTER_API_KEY` (e.g. the `rayline auth login` key for a hosted
+    /// cloud-router endpoint). When `None`, the normal resolution applies.
+    pub router_api_key_override: Option<String>,
     pub root_env_explicit: bool,
 }
 
@@ -122,8 +129,13 @@ pub struct RouterStopRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterStartCliRequest {
     /// Proxy routing mode: `PROXY_ROUTING_MODE_ALL` or
-    /// `PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS`.
+    /// `PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS`. Ignored when `config_path` is set
+    /// (the scope is then derived from the config's `routes.main`).
     pub proxy_routing_mode: String,
+    /// v2: a `RouterConfig` file (`--config`) driving BOTH main + subagents for
+    /// headless/agent use. When set, the daemon runs config-driven (decision plane
+    /// local, scope from `routes.main`).
+    pub config_path: Option<PathBuf>,
     pub root_env_explicit: bool,
 }
 
@@ -158,6 +170,8 @@ impl RouterStartRequest {
             enable_proxy: false,
             proxy_port: DEFAULT_PROXY_PORT,
             proxy_routing_mode: PROXY_ROUTING_MODE_ALL.to_owned(),
+            no_local_model: false,
+            router_api_key_override: None,
             root_env_explicit,
         }
     }
@@ -1581,6 +1595,32 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     let bin_path = resolve_rld_bin(&home)?;
     let mut start_request = RouterStartRequest::local_router_defaults(request.root_env_explicit);
     start_request.enable_proxy = true;
+
+    // v2: `--config <file>` drives BOTH main + subagents for headless/agent use.
+    // The local router reads the config's `endpoints` + `routes` directly; scope is
+    // derived from `routes.main` (passthrough sentinel → selective-subagents, else
+    // route-all). A `"local"` route needs the bundled model; named endpoints
+    // (ollama, direct-anthropic, rayline-cloud) are served by the local router
+    // directly. Cloud-router endpoints read `RAYLINE_ROUTER_API_KEY` from the env.
+    if let Some(path) = request.config_path.as_deref() {
+        start_request.router_config_path = Some(
+            crate::router_config::materialize_for_local_router(path, &home)?,
+        );
+        start_request.proxy_routing_mode =
+            if crate::router_config::config_main_is_passthrough(path) {
+                PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+            } else {
+                PROXY_ROUTING_MODE_ALL
+            }
+            .to_owned();
+        if crate::router_config::config_uses_local_endpoint(path) {
+            let start_request = resolve_start_model(&home, start_request).await?;
+            return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+        }
+        start_request.no_local_model = true;
+        return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+    }
+
     start_request.proxy_routing_mode = request.proxy_routing_mode.clone();
     // Selective-subagents materializes the conservative read-only subagent
     // allowlist as the proxy's static config; all-route leaves it unset so the
@@ -2086,9 +2126,12 @@ fn spawn_router(
     let metrics_port = rayline_metrics::DEFAULT_METRICS_PORT.to_string();
     let mut command = Command::new(bin_path);
     command.args(["serve"]);
-    // Custom mode: forward to the user's endpoint and skip the GGUF args so the
-    // daemon never downloads a bundled model. Auto mode: the bundled GGUF path.
-    if let Some(upstream_url) = request.upstream_url.as_deref() {
+    // Config-only: no bundled model at all (the static config routes only to named
+    // endpoints). Custom mode: forward to the user's endpoint and skip the GGUF
+    // args. Auto mode: the bundled GGUF path.
+    if request.no_local_model {
+        command.arg("--no-local-model");
+    } else if let Some(upstream_url) = request.upstream_url.as_deref() {
         command.args(["--upstream-url", upstream_url]);
         if let Some(upstream_model) = request.upstream_model.as_deref() {
             command.args(["--upstream-model", upstream_model]);
@@ -2174,9 +2217,10 @@ fn spawn_router(
         daemon_name(),
         paths.log_file.display()
     );
-    // Custom mode downloads no GGUF, so there is never a first-run download wait
-    // to warn about — treat it like a warm cache.
-    let cache_hit = request.upstream_url.is_some()
+    // Custom mode and config-only mode download no GGUF, so there is never a
+    // first-run download wait to warn about — treat them like a warm cache.
+    let cache_hit = request.no_local_model
+        || request.upstream_url.is_some()
         || hf_cache_has_verified_gguf(
             home,
             &request.model_repo,
@@ -2735,8 +2779,20 @@ fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Resu
     if !request.enable_proxy {
         return Ok(None);
     }
+    // Config-driven local routing can carry an explicit key (e.g. the
+    // `rayline auth login` key) so a hosted cloud-router endpoint in the config
+    // authenticates without a manual env var. The local router on :20811 itself
+    // needs no auth, so an empty override is fine too.
+    if let Some(override_key) = request.router_api_key_override.as_deref() {
+        return Ok(Some(override_key.to_owned()));
+    }
     if request.decision_plane == DECISION_PLANE_LOCAL {
-        return Ok(Some(String::new()));
+        // The local router on :20811 needs no auth, but a config endpoint may read
+        // RAYLINE_ROUTER_API_KEY (e.g. a hosted cloud-router route). Preserve a
+        // user-set value rather than clobbering it with empty.
+        return Ok(Some(
+            std::env::var("RAYLINE_ROUTER_API_KEY").unwrap_or_default(),
+        ));
     }
     let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
     crate::status::resolve_hosted_environment(&env_name, Some(home))

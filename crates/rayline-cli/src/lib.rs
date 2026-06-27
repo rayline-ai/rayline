@@ -12,6 +12,7 @@ pub mod local_model;
 pub mod onboarding;
 pub mod providers;
 pub mod router;
+pub mod router_config;
 pub mod status;
 pub mod update;
 
@@ -125,7 +126,12 @@ Options:
   --statusline/--no-statusline      Show proxy picked model in status line
   --diagnose                        Print routing diagnostics before exec
   --upstream-ca-path <path>         CA bundle for upstream proxy mode
+  --config <path>                   Routing config (endpoints + routes) driving
+                                    BOTH the main agent and subagents. Scope is
+                                    derived from routes.main (a `subscription`
+                                    main passes through; any endpoint routes it).
   --router-config-path <path>       Local-router static router JSON config
+                                    (refines `--local`'s subagent allowlist)
   --help                            Show this message and exit
 ";
 
@@ -141,7 +147,7 @@ Commands:
 ";
 
 const ROUTER_START_HELP: &str = "\
-Usage: rayline router start [--route <all|subagents>]
+Usage: rayline router start [--route <all|subagents>] [--config <path>]
 
 Start the local router + transparent proxy daemon and exit, leaving it running.
 Point an Anthropic SDK client at the proxy on http://127.0.0.1:20810 (and trust
@@ -152,6 +158,9 @@ Options:
   --route <all|subagents>   What the proxy routes through the router
                             (default: all). With `all`, request model
                             `rayline-local` to reach the on-device model.
+  --config <path>           Routing config (endpoints + routes) driving BOTH
+                            main and subagents; scope derived from routes.main.
+                            Overrides --route.
   --help                    Show this message and exit
 ";
 
@@ -954,6 +963,10 @@ where
     let mut diagnose = false;
     let mut upstream_ca_path = None;
     let mut router_config_path = None;
+    // v2: `--config <file>` drives BOTH main + subagents via a RouterConfig file,
+    // engaging the on-device router without `--local`. Distinct from the legacy
+    // `--router-config-path` (which only refines `--local`'s subagent allowlist).
+    let mut config_path = None;
     let mut claude_args = Vec::new();
 
     if args
@@ -1026,6 +1039,10 @@ where
                     router_config_path = Some(PathBuf::from(value));
                     continue;
                 }
+                "--config" => {
+                    config_path = Some(PathBuf::from(value));
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1089,6 +1106,10 @@ where
                 router_config_path = Some(PathBuf::from(args.next()?));
                 continue;
             }
+            "--config" => {
+                config_path = Some(PathBuf::from(args.next()?));
+                continue;
+            }
             "--no-telemetry" => {
                 return None;
             }
@@ -1117,6 +1138,12 @@ where
     } else {
         None
     };
+    // `--config` engages the on-device router; `--via env` is cloud-only by
+    // contract (it sets ANTHROPIC_BASE_URL directly and cannot reach local
+    // inference). Reject the combination, mirroring `--via env` + `--local`.
+    if config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
+        return None;
+    }
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -1136,6 +1163,7 @@ where
         diagnose,
         upstream_ca_path,
         router_config_path,
+        config_path,
         root_env_explicit,
     })
 }
@@ -1303,6 +1331,9 @@ where
     // `router start` is always local; default to routing everything so a plain
     // SDK client can reach the on-device model via model-name routing.
     let mut route_scope = RouteScope::All;
+    // v2: `--config <file>` drives BOTH main + subagents for headless/agent use;
+    // scope is then derived from the config's `routes.main`, so `--route` is ignored.
+    let mut config_path = None;
     while let Some(arg) = args.next() {
         let arg = arg.to_str()?;
         if arg == "--help" {
@@ -1321,6 +1352,14 @@ where
             route_scope = parse_route_scope(args.next()?.to_str()?)?;
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--config" {
+            config_path = Some(PathBuf::from(args.next()?));
+            continue;
+        }
         return None;
     }
     let proxy_routing_mode = match route_scope {
@@ -1330,6 +1369,7 @@ where
     .to_owned();
     Some(crate::router::RouterStartCliRequest {
         proxy_routing_mode,
+        config_path,
         root_env_explicit,
     })
 }
@@ -2066,6 +2106,52 @@ mod tests {
     }
 
     #[test]
+    fn claude_config_flag_parses_as_claude_run() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "claude",
+            "--config",
+            "/tmp/router.json",
+        ])) {
+            RaylineDispatch::ClaudeRun(request) => {
+                assert_eq!(
+                    request.config_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/router.json"))
+                );
+            }
+            other => panic!("expected ClaudeRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_config_flag_accepts_equals_form() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--config=/tmp/r.json"])) {
+            RaylineDispatch::ClaudeRun(request) => {
+                assert_eq!(
+                    request.config_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/r.json"))
+                );
+            }
+            other => panic!("expected ClaudeRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_via_env_with_config_is_unavailable() {
+        assert!(matches!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "--via",
+                "env",
+                "--config",
+                "/tmp/router.json",
+            ])),
+            RaylineDispatch::Unavailable
+        ));
+    }
+
+    #[test]
     fn root_version_is_public() {
         assert_eq!(
             rayline_dispatch_for_argv(&argv(&["rayline", "--version"])),
@@ -2378,5 +2464,24 @@ mod tests {
             rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--route", "bogus"])),
             RaylineDispatch::Unavailable,
         );
+    }
+
+    #[test]
+    fn router_start_accepts_config_flag() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "router",
+            "start",
+            "--config",
+            "/tmp/router.json",
+        ])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(
+                    request.config_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/router.json"))
+                );
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
     }
 }

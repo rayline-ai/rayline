@@ -2509,6 +2509,108 @@ mod tests {
         }
     }
 
+    /// End-to-end: each `examples/routing-modes/*.json` config (the `--config`
+    /// fixtures) must route the MAIN agent and SUBAGENTS to the endpoints/models it
+    /// declares. A `subscription` main is stripped first (the proxy handles it),
+    /// mirroring the CLI's `materialize_for_local_router`.
+    #[test]
+    fn config_mode_examples_route_main_and_subagents() {
+        fn load_state(raw: &str) -> AppState {
+            let mut cfg: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let main_passthrough = cfg["routes"]
+                .get("main")
+                .and_then(|main| main.get("endpoint"))
+                .and_then(serde_json::Value::as_str)
+                == Some("subscription");
+            if main_passthrough {
+                cfg["routes"].as_object_mut().unwrap().remove("main");
+            }
+            let path = std::env::temp_dir().join(format!(
+                "rl-mode-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let opts = LocalRouterOptions {
+                local_model_id: "local-model".to_owned(),
+                config_path: Some(path.clone()),
+                ..LocalRouterOptions::default()
+            };
+            let config = load_config(&opts).unwrap();
+            let _ = fs::remove_file(path);
+            state(config)
+        }
+        fn main_route(st: &AppState) -> (RouteSelection, String) {
+            let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+            let decision = select_route(st, &HeaderMap::new(), &body);
+            (decision.target, decision.selected_model)
+        }
+        fn sub_route(st: &AppState, agent_type: &str) -> (RouteSelection, String) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CLAUDE_CODE_AGENT_ID_HEADER,
+                HeaderValue::from_static("abc123"),
+            );
+            headers.insert(
+                RAYLINE_AGENT_TYPE_HEADER,
+                HeaderValue::from_str(agent_type).unwrap(),
+            );
+            let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+            let decision = select_route(st, &headers, &body);
+            (decision.target, decision.selected_model)
+        }
+        fn ep(id: &str) -> RouteSelection {
+            RouteSelection::Endpoint(id.to_owned())
+        }
+        let cloud = || (ep("rayline-cloud"), "rayline-router".to_owned());
+        let ollama_a = || (ep("ollama"), "model-a".to_owned());
+        let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
+
+        // main routed + subagent routed (the routes the local router executes):
+        let st = load_state(include_str!("../../../examples/routing-modes/RR.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RL.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LR.json"));
+        assert_eq!(main_route(&st), ollama_a());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LL.json"));
+        assert_eq!(main_route(&st), ollama_a());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RA.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LA.json"));
+        assert_eq!(main_route(&st), ollama_a());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        // subscription main (stripped) → assert subagents only:
+        let st = load_state(include_str!("../../../examples/routing-modes/AR.json"));
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/AL.json"));
+        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+
+        // per-type: Explore/Plan → distinct local models, anything else → cloud catch-all:
+        let st = load_state(include_str!(
+            "../../../examples/routing-modes/RL-per-type.json"
+        ));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "Explore"), ollama_a());
+        assert_eq!(sub_route(&st, "Plan"), (ep("ollama"), "model-b".to_owned()));
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+    }
+
     #[test]
     fn explicit_missing_config_path_errors() {
         let path = std::env::temp_dir().join(format!(

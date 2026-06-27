@@ -1,0 +1,33 @@
+{
+  "endpoints": [
+    {
+      "id": "rayline-cloud",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "auth": "api_key",
+      "models": [
+        "rayline-router"
+      ]
+    },
+    {
+      "id": "ollama",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": [
+        "model-a",
+        "model-b"
+      ]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "rayline-cloud",
+      "model": "rayline-router"
+    },
+    "subagent": {
+      "endpoint": "ollama",
+      "model": "model-a"
+    }
+  }
+}

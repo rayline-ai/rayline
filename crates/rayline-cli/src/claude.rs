@@ -100,6 +100,11 @@ pub struct RunRequest {
     pub diagnose: bool,
     pub upstream_ca_path: Option<PathBuf>,
     pub router_config_path: Option<PathBuf>,
+    /// v2: a `RouterConfig` file (`--config`) that drives BOTH the main agent and
+    /// subagents via the on-device router, without `--local`. Engages the local
+    /// plane; the proxy scope is derived from `routes.main` (passthrough sentinel
+    /// → subagents-only, else route-all). Distinct from `router_config_path`.
+    pub config_path: Option<PathBuf>,
     pub root_env_explicit: bool,
 }
 
@@ -489,7 +494,38 @@ async fn run_command_from_home(
     claude_bin: PathBuf,
 ) -> Result<Command, RunError> {
     let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
-    let hosted = if request.local_router {
+
+    // v2 config-driven routing: `--config <file>` drives BOTH main + subagents via
+    // the on-device router, without `--local`. Engage the local plane when the
+    // config routes something the hosted cloud router cannot serve on its own (a
+    // `"local"`/custom/direct-Anthropic endpoint). `--via env` (Override) is
+    // cloud-only and never engages local (already rejected with `--config` at parse
+    // time). `--local` keeps its own config path separate.
+    let effective_config = if request.local_router {
+        None
+    } else {
+        request.config_path.clone()
+    };
+    let config_engages_local = request.routing_mode != RoutingMode::Override
+        && effective_config
+            .as_deref()
+            .map(crate::router_config::config_needs_local_router)
+            .unwrap_or(false);
+    // Whether `routes.main` is the passthrough sentinel (or absent) → main stays on
+    // the caller's subscription (proxy selective-subagents) instead of being routed.
+    let config_main_passthrough = effective_config
+        .as_deref()
+        .map(crate::router_config::config_main_is_passthrough)
+        .unwrap_or(false);
+    let local_plane = request.local_router || config_engages_local;
+
+    if config_engages_local {
+        if let Some(path) = effective_config.as_deref() {
+            eprintln!("Routing via config: {}", path.display());
+        }
+    }
+
+    let hosted = if local_plane {
         None
     } else {
         Some(
@@ -497,8 +533,8 @@ async fn run_command_from_home(
                 .map_err(|error| RunError::HostedEnvironment(error.to_string()))?,
         )
     };
-    let router_url = router_url_for_run(hosted.as_ref(), request.local_router)?;
-    let key = if request.local_router {
+    let router_url = router_url_for_run(hosted.as_ref(), local_plane)?;
+    let key = if local_plane {
         "rayline-local".to_owned()
     } else {
         ensure_router_key(
@@ -517,7 +553,7 @@ async fn run_command_from_home(
     // even an incomplete config needs the toggle, to decide whether to warn).
     let local_cfg = crate::local_model::read_from_home(home);
     let need_settings =
-        !request.local_router && (!auto_compact_window_is_explicit(request) || local_cfg.is_some());
+        !local_plane && (!auto_compact_window_is_explicit(request) || local_cfg.is_some());
     let settings = if need_settings {
         fetch_router_settings(&env_name, &router_url, request.auth_token.as_deref(), &key).await
     } else {
@@ -550,7 +586,57 @@ async fn run_command_from_home(
         request.isolated,
         local_cfg.as_ref(),
     );
-    let local_start_request = if request.local_router {
+    let local_start_request = if config_engages_local {
+        // Config-driven (no `--local`): build a local-router start request straight
+        // from the `--config` file. The local router reads `endpoints` + `routes`
+        // (incl. per-subagent-type) directly; we only resolve the key and decide
+        // whether a bundled local model is needed.
+        let path = effective_config
+            .clone()
+            .expect("config_engages_local implies an effective config path");
+        let injector_port = resolve_injector_port(request.local_injector_port)?;
+        let mut start_request =
+            crate::router::RouterStartRequest::local_router_defaults(request.root_env_explicit);
+        start_request.env_name = Some(env_name.clone());
+        start_request.injector_port = injector_port;
+        // Hand the local router a config it can load: a passthrough `routes.main`
+        // (subscription) is stripped (the proxy handles main); otherwise verbatim.
+        start_request.router_config_path = Some(
+            crate::router_config::materialize_for_local_router(&path, home).map_err(|error| {
+                RunError::Router(format!("failed to prepare config for the router: {error}"))
+            })?,
+        );
+        // Reuse `rayline auth login` for a hosted cloud-router endpoint — inject the
+        // stored key so its `api_key_env` resolves with no manual env var. Best
+        // effort: the daemon surfaces a clear error only if a cloud route is hit.
+        if crate::router_config::config_uses_cloud_router(&path) {
+            start_request.router_api_key_override = ensure_router_key(
+                &env_name,
+                home,
+                request.auth_token.as_deref(),
+                request.root_env_explicit,
+            )
+            .await
+            .ok();
+        }
+        // A `"local"` route needs the bundled model; named endpoints (ollama,
+        // direct-anthropic, rayline-cloud) are served by the local router directly.
+        if crate::router_config::config_uses_local_endpoint(&path) {
+            let cfg = local_cfg
+                .as_ref()
+                .filter(|cfg| cfg.is_engageable())
+                .ok_or_else(|| {
+                    RunError::Router(format!(
+                        "Config routes to \"local\", but no local model is configured. Run `{cli} local use <model-id>` or `{cli} local custom ...`, or point that route at a named endpoint.",
+                        cli = crate::CLI_BIN,
+                    ))
+                })?;
+            start_request = crate::router::RouterStartRequest::from_local_model(cfg, start_request);
+        } else {
+            start_request.no_local_model = true;
+        }
+        Some(start_request)
+    } else if request.local_router {
         let provider_config = explicit_provider_config(request, home).await?;
         let (cfg, provider_routes_path) = if let Some((cfg, routes)) = provider_config {
             (cfg, Some(routes))
@@ -631,11 +717,23 @@ async fn run_command_from_home(
     // (model default, proxy wiring, status line) sees a single coherent value.
     let local_engaged = local_start_request.is_some();
     let request = &RunRequest {
-        routing_mode: effective_routing_mode(
-            request.routing_mode,
-            local_engaged,
-            request.route_scope_explicit,
-        ),
+        // Config-driven routing derives scope from `routes.main`: a passthrough
+        // (subscription / absent) main stays on the caller's credential
+        // (selective-subagents), otherwise route ALL so `routes.main` governs the
+        // main thread. Non-config runs use the normal local-engagement default.
+        routing_mode: if config_engages_local {
+            if config_main_passthrough {
+                RoutingMode::ProxySubagents
+            } else {
+                RoutingMode::Proxy
+            }
+        } else {
+            effective_routing_mode(
+                request.routing_mode,
+                local_engaged,
+                request.route_scope_explicit,
+            )
+        },
         ..request.clone()
     };
 
@@ -650,6 +748,16 @@ async fn run_command_from_home(
         request.model.is_some(),
         inherited_anthropic_model,
     );
+    // Config-driven route-all pins the main thread to the virtual model so the
+    // local router's `routes.main` governs it (a concrete model name would hit
+    // direct-model routing instead). An explicit `--model` still wins. Skipped for
+    // a passthrough main, which stays on the caller's own model.
+    let (model, set_model_env) =
+        if config_engages_local && !config_main_passthrough && request.model.is_none() {
+            ("rayline-router".to_owned(), true)
+        } else {
+            (model, set_model_env)
+        };
     let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
@@ -934,10 +1042,17 @@ async fn start_local_router(
     home: &Path,
     start_request: &crate::router::RouterStartRequest,
 ) -> Result<(), RunError> {
-    eprintln!(
-        "Starting on-device model (first response can take a minute or two while it loads and reads your prompt).\nRouter progress: tail -f {}",
-        crate::router::local_router_log_path(home).display()
-    );
+    if start_request.no_local_model {
+        eprintln!(
+            "Starting router (config-driven; no on-device model).\nRouter progress: tail -f {}",
+            crate::router::local_router_log_path(home).display()
+        );
+    } else {
+        eprintln!(
+            "Starting on-device model (first response can take a minute or two while it loads and reads your prompt).\nRouter progress: tail -f {}",
+            crate::router::local_router_log_path(home).display()
+        );
+    }
     if start_request.enable_proxy {
         eprintln!(
             "Proxy routing decisions: tail -f {}",
