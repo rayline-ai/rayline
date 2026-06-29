@@ -66,7 +66,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Supported | Config |
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
-| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | RCR picks cloud **or local** | RCR picks cloud **or local** | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) — main stays cloud § | RCR may send `Explore` → local § | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | on-device LSR decides | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | RCR picks cloud **or local** | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
@@ -103,16 +103,29 @@ supported configs (see [Tests](#tests)); the local-main **capability** is not ye
 viable, so a full interactive run is expected to fall short. The live e2e test
 (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
 
-**§ may-local from config — the redirect itself is hosted/account-gated.**
+**§ may-local from config — custom-endpoint scope + hosted decision.**
 `RRCL` wires the **client** contract from config: a `rayline-cloud` route carrying
 `local_models` stands up a custom adapter fronting the named local endpoint and
 advertises it to the RCR (`x-rayline-local-available` + the model id), decoupled
-from the `rayline local on/off` account toggle. Whether a turn is actually
-redirected to local is the **hosted RCR's** runtime decision and is account-gated
-today — so without it (or with the account flag off) `RRCL` behaves like `RRC`
-(cloud only). The advertisement + redirect *plumbing* is hermetically tested; the
-end-to-end redirect decision is exercised only by the ignored live test. The other
-`*CL` modes (`RACL`/`RLCL`/`ARCL`/`LRCL`) reuse this once their non-may-local base
+from the `rayline local on/off` account toggle. Two important limits:
+
+- **Exploration subagents only (custom endpoint).** A config `local_models` points
+  at a *custom* local endpoint (your ollama), so the proxy sends
+  `x-rayline-local-custom` and the RCR **only delegates exploration subagents
+  (`Explore`) to it — never the main agent** or other classes (`proxy/src/lib.rs`
+  `custom_mode`). The "Main agent →" column above is therefore the *intent*; in
+  practice the main turn stays cloud. Main-agent may-local would need a
+  trusted/bundled model path or a hosted change.
+- **The redirect is the hosted RCR's call.** Whether a (qualifying) turn is
+  actually sent to local is the RCR's runtime decision; without it (or with the
+  account flag off) `RRCL` behaves like `RRC`.
+
+Verified on-device: `rayline claude --config RRCL.json` with an `Explore`-spawning
+task → adapter forwards to `http://<endpoint>/v1/messages` and `rayline top` shows
+`model=<local>, target=local, agent_type=Explore` while main turns stay cloud. The
+advertisement + redirect *plumbing* is hermetically tested; the end-to-end redirect
+is exercised only by the ignored live test. The other `*CL` modes
+(`RACL`/`RLCL`/`ARCL`/`LRCL`) reuse this once their non-may-local base
 (`RAC`/`RLC`/…) is combined with the same advertisement — tracked separately.
 
 ### What "Supported" means
