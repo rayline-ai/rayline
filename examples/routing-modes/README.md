@@ -11,11 +11,10 @@ either entry point:
 (`routes.subagent`) from one file — the thing the old `--router-config-path` /
 `settings.json` surfaces could not express (they are subagent-only).
 
-> **Scope of this PR.** Only the **supported** modes (✅ in the table below) ship
-> as config files and route end-to-end today. The unsupported modes (❌) need the
-> two `rayline`-only sub-axes — **may-local from config** (`RRCL`/…) and the
-> **on-device LSR decider** (`RRL`/…) — which land in a follow-up PR. They are
-> listed here for completeness and have no `.json` yet. The full design lives in
+> **Scope of this PR.** The **supported** modes (✅ in the table below) ship as
+> config files and route end-to-end today — including `RRCL`/`ARCL` (may-local from
+> config) and `RRL` (on-device LSR static routing). The remaining unsupported modes
+> (❌) are listed for completeness and have no `.json` yet. The full design lives in
 > the routing-modes design doc.
 
 ## Mode names
@@ -27,7 +26,9 @@ The mode name encodes the routing choices, left to right:
 3. **rayline engine** suffix (only when a class is `rayline`):
    - **C** — `router: rayline-cloud`, **local-model off** (cloud only)
    - **CL** — `router: rayline-cloud`, **local-model on** (may-local)
-   - **L** — `router: rayline-local` (the on-device LSR decides)
+   - **L** — `router: rayline-local` (the on-device LSR is the router: it routes the
+     class **statically per the JSON** and pins the route's `model`, instead of the
+     hosted RCR deciding — even when the endpoint is `rayline-cloud`)
 
 Modes with no `rayline` class (`AL`, `LA`, `LL`) have no suffix — `router` and
 `local-model` are `N/A` for `anthropic` / `local`.
@@ -69,7 +70,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
 | **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | RCR may send a subagent → local | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
-| **RRL** | `rayline` | `rayline` | rayline-local | N/A | on-device LSR decides | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
+| **RRL** | `rayline` | `rayline` | rayline-local | N/A | LSR → `rayline-cloud` (model pinned in JSON) | LSR → `rayline-cloud` (model pinned in JSON) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) § | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
 | **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | on-device LSR decides | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (LSR decider) |
@@ -142,18 +143,21 @@ combined with the same advertisement — tracked separately.
     — these route a class to a non-cloud endpoint, engaging the on-device router,
     where may-local advertisement is not yet wired. (`RRCL`/`ARCL` are cloud-only
     routed, so they already work.)
-  - **on-device LSR decider** (`*L` modes) — `router: rayline-local` needs a new
-    on-device selection policy in the LSR (today the LSR routes by static rule
-    only). This is the **RRL** follow-up.
+  - **other `router: rayline-local` modes** (`RAL`/`RLL`/`ARL`/`LRL`) — `RRL` is
+    supported: `router: rayline-local` is **static LSR routing** (the JSON is the
+    decider; no new policy needed — that earlier claim was wrong). The remaining
+    `*L` modes use the *same* mechanism (just different endpoints on the other
+    class), so they should work too, but aren't yet shipped/verified.
 
 ## Files ↔ modes
 
-The supported modes ship as **11 config files** (the `❌` modes have none yet):
+The supported modes ship as **12 config files** (the `❌` modes have none yet):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
 | [`RRC.json`](./RRC.json) | rayline-cloud | rayline-cloud | RRC |
 | [`RRCL.json`](./RRCL.json) | rayline-cloud (+ `local_models`) | rayline-cloud (+ `local_models`) | RRCL § |
+| [`RRL.json`](./RRL.json) | rayline-cloud, `router: rayline-local` (model pinned) | rayline-cloud, `router: rayline-local` (default + `Explore` per-type) | RRL |
 | [`RAC.json`](./RAC.json) | rayline-cloud | anthropic (API key) | RAC |
 | [`RLC.json`](./RLC.json) | rayline-cloud | ollama (local) | RLC |
 | [`ARC.json`](./ARC.json) | subscription (passthrough) | rayline-cloud | ARC |
@@ -207,13 +211,16 @@ A route targeting the `rayline` cloud endpoint accepts two optional fields:
 ```jsonc
 "main": {
   "endpoint": "rayline-cloud", "model": "rayline-router",
-  "router": "rayline-cloud",              // rayline-cloud (default) | rayline-local (RRL — not yet)
+  "router": "rayline-cloud",              // rayline-cloud (default) | rayline-local (RRL)
   "local_models": ["qwen2.5-coder:7b"]    // non-empty ⇒ may-local ON (RRCL); must be served by a declared local endpoint
 }
 ```
 
 - **`router`** — which rayline decider runs. `rayline-cloud` (or absent) = the
-  hosted RCR. `rayline-local` (the on-device LSR decider) is **not yet supported**.
+  hosted RCR picks the model. `rayline-local` (RRL) = the **on-device LSR** is the
+  router: it engages even when the endpoint is `rayline-cloud`, routing the class
+  statically per the JSON and **pinning the route's `model`** (so the RCR doesn't
+  pick). The `model` you set is sent as-is to the endpoint.
 - **`local_models`** — the model ids the cloud RCR may redirect this class to
   (may-local). A non-empty list turns may-local **on** and advertises
   `local_models[0]`; the id must appear in a declared local endpoint's `models`

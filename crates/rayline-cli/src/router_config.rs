@@ -67,8 +67,12 @@ pub fn resolve_config_path(flag: Option<&Path>, home: &Path) -> Option<PathBuf> 
 /// Whether the config requires the on-device router. True if any route targets an
 /// endpoint that is *not* the hosted cloud router (`api.rayline.ai`) — including the
 /// bundled `"local"` endpoint, a custom/loopback provider, or a direct-Anthropic
-/// endpoint, all of which the hosted plane cannot serve on its own. A pure
-/// everything-to-the-cloud-router config returns `false` → stay on today's path.
+/// endpoint, all of which the hosted plane cannot serve on its own — **or** if any
+/// route declares `router: rayline-local` (the on-device LSR is explicitly the
+/// router, even when it forwards to the `rayline-cloud` endpoint: it pins the
+/// route's `model` on-device instead of letting the hosted RCR pick). A pure
+/// everything-to-the-cloud-router config with no `rayline-local` route returns
+/// `false` → stay on today's hosted path.
 pub fn config_needs_local_router(path: &Path) -> bool {
     let Ok(raw) = std::fs::read(path) else {
         return false;
@@ -80,10 +84,33 @@ pub fn config_needs_local_router(path: &Path) -> bool {
 }
 
 fn config_value_needs_local_router(cfg: &Value) -> bool {
+    if config_value_uses_local_decider(cfg) {
+        return true;
+    }
     let cloud_ids = cloud_router_endpoint_ids(cfg);
     route_target_endpoints(cfg)
         .into_iter()
         .any(|endpoint| !cloud_ids.contains(&endpoint))
+}
+
+/// Whether any route names the on-device LSR as its router (`router: rayline-local`).
+/// Such a route is decided + has its `model` pinned on-device — so the LSR must be
+/// engaged even if the route's endpoint is the hosted cloud router.
+fn config_value_uses_local_decider(cfg: &Value) -> bool {
+    let Some(routes) = cfg.get("routes") else {
+        return false;
+    };
+    let singletons = ["main", "subagent", "default"]
+        .into_iter()
+        .filter_map(|key| routes.get(key));
+    let maps = ["subagents", "model_routes"]
+        .into_iter()
+        .filter_map(|key| routes.get(key))
+        .filter_map(Value::as_object)
+        .flat_map(|map| map.values());
+    singletons
+        .chain(maps)
+        .any(|route| route.get("router").and_then(Value::as_str) == Some(ROUTER_RAYLINE_LOCAL))
 }
 
 /// Whether any route targets the hosted cloud router (so its key should be
@@ -117,7 +144,8 @@ pub fn config_uses_local_endpoint(path: &Path) -> bool {
 
 /// `router` value selecting the hosted cloud decider (the default when absent).
 pub const ROUTER_RAYLINE_CLOUD: &str = "rayline-cloud";
-/// `router` value selecting the on-device LSR decider (not yet supported — RRL).
+/// `router` value selecting the on-device LSR decider (RRL): the LSR routes the
+/// class per the static JSON and pins its `model`, rather than the hosted RCR.
 pub const ROUTER_RAYLINE_LOCAL: &str = "rayline-local";
 
 /// The local model the hosted cloud router may redirect a `rayline` class to
@@ -493,6 +521,47 @@ mod tests {
                 !config_needs_local_router(&path) && config_may_local(&path).is_some();
             assert_eq!(actually_fires, fires, "{file}: may-local wired by CLI");
         }
+    }
+
+    #[test]
+    fn rrl_example_engages_local_router() {
+        // RRL: `router: rayline-local` makes the on-device LSR the router even though
+        // the routes target the hosted `rayline-cloud` endpoint — so the LSR must be
+        // engaged (it pins the route's `model` on-device instead of letting the RCR
+        // pick). It is not may-local, not a passthrough main, and uses the cloud key.
+        let path = examples_dir().join("RRL.json");
+        assert!(path.exists(), "missing example config RRL.json");
+        serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            config_needs_local_router(&path),
+            "RRL: router rayline-local must engage the on-device router"
+        );
+        assert!(!config_main_is_passthrough(&path), "RRL: main is routed");
+        assert!(
+            config_uses_cloud_router(&path),
+            "RRL: forwards to the cloud key"
+        );
+        assert!(
+            !config_uses_local_endpoint(&path),
+            "RRL: no bundled local model"
+        );
+        assert_eq!(config_may_local(&path), None, "RRL: not may-local");
+    }
+
+    #[test]
+    fn rayline_local_router_engages_even_when_all_cloud() {
+        // An all-cloud config normally stays on the hosted path...
+        let all_cloud = json!({
+            "endpoints": [{ "id": "rayline-cloud", "protocol": "anthropic_messages",
+                "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+        assert!(!config_value_needs_local_router(&all_cloud));
+        // ...but `router: rayline-local` forces on-device routing.
+        let mut local_decider = all_cloud.clone();
+        local_decider["routes"]["main"]["router"] = json!("rayline-local");
+        assert!(config_value_needs_local_router(&local_decider));
+        assert!(config_value_uses_local_decider(&local_decider));
     }
 
     #[test]

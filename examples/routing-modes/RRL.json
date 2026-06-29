@@ -1,0 +1,36 @@
+{
+  "endpoints": [
+    {
+      "id": "rayline-cloud",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "auth": "api_key",
+      "models": [
+        "rayline-router",
+        "GLM-5.2",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash"
+      ]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "rayline-cloud",
+      "model": "GLM-5.2",
+      "router": "rayline-local"
+    },
+    "subagent": {
+      "endpoint": "rayline-cloud",
+      "model": "deepseek/deepseek-v4-pro",
+      "router": "rayline-local"
+    },
+    "subagents": {
+      "Explore": {
+        "endpoint": "rayline-cloud",
+        "model": "deepseek/deepseek-v4-flash",
+        "router": "rayline-local"
+      }
+    }
+  }
+}

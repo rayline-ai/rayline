@@ -2602,6 +2602,22 @@ mod tests {
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
+        // RRL: `router: rayline-local` makes the LSR the router; it forwards to the
+        // `rayline-cloud` endpoint but pins each class's `model` on-device instead of
+        // sending the `rayline-router` virtual model for the RCR to pick. Covers all
+        // three routing slots — main, default subagent, and a per-type override —
+        // each a distinct model, proving the LSR (not the RCR) is choosing.
+        let st = load_state(include_str!("../../../examples/routing-modes/RRL.json"));
+        assert_eq!(main_route(&st), (ep("rayline-cloud"), "GLM-5.2".to_owned()));
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned())
+        );
+        assert_eq!(
+            sub_route(&st, "Explore"),
+            (ep("rayline-cloud"), "deepseek/deepseek-v4-flash".to_owned())
+        );
+
         // RRCL: `router`/`local_models` are may-local advertisement metadata; they do
         // not change the LSR's routing — main + subagents still resolve to cloud.
         let st = load_state(include_str!("../../../examples/routing-modes/RRCL.json"));
