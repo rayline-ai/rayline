@@ -70,7 +70,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
 | **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | RCR may send a subagent → local | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
-| **RRL** | `rayline` | `rayline` | rayline-local | N/A | LSR → `rayline-cloud` (model pinned in JSON) | LSR → `rayline-cloud` (model pinned in JSON) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
+| **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) § | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
 | **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | on-device LSR decides | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (LSR decider) |
