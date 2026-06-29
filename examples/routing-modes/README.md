@@ -68,7 +68,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Supported | Config |
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
-| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud (RCR) § | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | RCR may send a subagent → local | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | on-device LSR decides | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) § | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
@@ -77,11 +77,11 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **RLCL** | `rayline` | `local` | rayline-cloud | on | cloud (RCR) § | local model | rayline | ❌ N | — (may-local) |
 | **RLL** | `rayline` | `local` | rayline-local | N/A | on-device LSR decides | local model | rayline | ❌ N | — (LSR decider) |
 | **ARC** | `anthropic` | `rayline` | rayline-cloud | off | Anthropic (subscription) | cloud (RCR) | subscription + rayline | ✅ Y | [`ARC.json`](./ARC.json) |
-| **ARCL** | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | cloud (RCR) § | subscription + rayline | ❌ N | — (may-local) |
+| **ARCL** | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | RCR may send a subagent → local | subscription + rayline | ❌ N | — (may-local) |
 | **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | on-device LSR decides | subscription + rayline | ❌ N | — (LSR decider) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ Y | [`AL.json`](./AL.json) |
 | **LRC** ‡ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ Y | [`LRC.json`](./LRC.json) |
-| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | cloud (RCR) § | rayline | ❌ N | — (may-local) |
+| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | RCR may send a subagent → local | rayline | ❌ N | — (may-local) |
 | **LRL** ‡ | `local` | `rayline` | rayline-local | N/A | local model | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **LA** † ‡ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | ✅ Y | [`LA.json`](./LA.json) |
 | **LL** ‡ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ Y | [`LL.json`](./LL.json) |
