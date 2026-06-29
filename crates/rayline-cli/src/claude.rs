@@ -137,13 +137,25 @@ fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
 /// Whether *implicit* account-local routing (the hosted `enable_local_router`
 /// toggle + an on-device config) should engage for this run.
 ///
-/// Env (`Override`) mode is cloud-only by contract — it sets `ANTHROPIC_BASE_URL`
-/// directly and the CLI documents it as unable to reach local inference — so it
-/// never engages local even when the account toggle is on. `--isolated` also
-/// opts out; an isolated local session must be requested explicitly with
-/// `--local`. This gate does not apply to explicit `--local` (handled upstream).
-fn implicit_local_engages(mode: RoutingMode, isolated: bool, toggle_on: bool) -> bool {
-    !matches!(mode, RoutingMode::Override) && !isolated && toggle_on
+/// Whether the account-toggle *implicit* local path should engage. This is the
+/// "no `--config`, no `--local`" fallback that turns on may-local purely from the
+/// account toggle + a configured local model.
+///
+/// - `config_present`: a `--config` file is in play. When true, the config is the
+///   sole driver of may-local (a `local_models` route → the RRCL/ARCL arm), so the
+///   implicit path is suppressed — e.g. a cloud-only `RRC` (`--local-model=off`)
+///   stays pure cloud even with `rayline local on` + a local model configured.
+/// - Env (`Override`) mode is cloud-only by contract (sets `ANTHROPIC_BASE_URL`
+///   directly, can't reach local), so it never engages.
+/// - `--isolated` opts out; an isolated local session must be requested with `--local`.
+/// - Does not apply to explicit `--local` (handled upstream).
+fn implicit_local_engages(
+    mode: RoutingMode,
+    isolated: bool,
+    toggle_on: bool,
+    config_present: bool,
+) -> bool {
+    !config_present && !matches!(mode, RoutingMode::Override) && !isolated && toggle_on
 }
 
 /// The routing mode after accounting for local engagement.
@@ -731,6 +743,7 @@ async fn run_command_from_home(
                     request.routing_mode,
                     request.isolated,
                     enable_local_router,
+                    effective_config.is_some(),
                 ) =>
             {
                 if crate::providers::provider_from_local_config(&cfg).is_some() {
@@ -2745,22 +2758,62 @@ mod implicit_local_routing_tests {
     #[test]
     fn env_mode_never_engages_implicit_local() {
         // Even with the account toggle on and no isolation, env mode stays cloud.
-        assert!(!implicit_local_engages(RoutingMode::Override, false, true));
+        assert!(!implicit_local_engages(
+            RoutingMode::Override,
+            false,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn proxy_mode_engages_implicit_local_when_toggle_on() {
-        assert!(implicit_local_engages(RoutingMode::Proxy, false, true));
+        assert!(implicit_local_engages(
+            RoutingMode::Proxy,
+            false,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn isolation_blocks_implicit_local() {
-        assert!(!implicit_local_engages(RoutingMode::Proxy, true, true));
+        assert!(!implicit_local_engages(
+            RoutingMode::Proxy,
+            true,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn toggle_off_blocks_implicit_local() {
-        assert!(!implicit_local_engages(RoutingMode::Proxy, false, false));
+        assert!(!implicit_local_engages(
+            RoutingMode::Proxy,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn config_suppresses_implicit_local() {
+        // With a `--config` in play, the config is the sole may-local driver — the
+        // account-toggle implicit path is suppressed even with the toggle on and no
+        // isolation. (This is why `RRC --config` stays pure cloud when local is ON.)
+        assert!(!implicit_local_engages(
+            RoutingMode::Proxy,
+            false,
+            true,
+            true
+        ));
+        // And plain `rayline claude` (no config) still honors the toggle.
+        assert!(implicit_local_engages(
+            RoutingMode::Proxy,
+            false,
+            true,
+            false
+        ));
     }
 
     // ── Finding 1: local engagement defaults to subagents-only ──
