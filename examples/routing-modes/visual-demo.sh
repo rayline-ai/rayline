@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./visual-demo.sh [MODE] [PROMPT]
-#     MODE    one of the configs in this dir (default: RR), e.g. RR RL LL AL ...
+#     MODE    one of the configs in this dir (default: RRC), e.g. RRC RLC LL AL ...
 #     PROMPT  the prompt sent to Claude Code in print mode
 #             (default: "Reply with exactly one word: pong")
 #
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${1:-RR}"
+MODE="${1:-RRC}"
 PROMPT="${2:-Reply with exactly one word: pong}"
 RAYLINE_BIN="${RAYLINE_BIN:-rayline}"
 WINDOW_SIZE="${WINDOW_SIZE:-220x50}"

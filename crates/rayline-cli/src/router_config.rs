@@ -324,13 +324,13 @@ mod tests {
     fn example_mode_configs_derive_expected_routing() {
         // (file, main_is_passthrough, needs_local_router, uses_cloud_router)
         let cases = [
-            ("RR.json", false, false, true),
-            ("RL.json", false, true, true),
-            ("RL-per-type.json", false, true, true),
-            ("RA.json", false, true, true),
-            ("AR.json", true, false, true),
+            ("RRC.json", false, false, true),
+            ("RLC.json", false, true, true),
+            ("RLC-per-type.json", false, true, true),
+            ("RAC.json", false, true, true),
+            ("ARC.json", true, false, true),
             ("AL.json", true, true, false),
-            ("LR.json", false, true, true),
+            ("LRC.json", false, true, true),
             ("LL.json", false, true, false),
             ("LA.json", false, true, false),
         ];
@@ -367,16 +367,16 @@ mod tests {
     #[test]
     fn materialize_strips_subscription_main_for_local_router() {
         let home = tmp_home();
-        // AR: main = subscription (passthrough) → stripped; subagent stays.
-        let out = materialize_for_local_router(&examples_dir().join("AR.json"), &home).unwrap();
+        // ARC: main = subscription (passthrough) → stripped; subagent stays.
+        let out = materialize_for_local_router(&examples_dir().join("ARC.json"), &home).unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         assert!(
             cfg["routes"].get("main").is_none(),
             "subscription main must be stripped"
         );
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "rayline-cloud");
-        // RL: main is a real endpoint → file used verbatim (path unchanged).
-        let rl = examples_dir().join("RL.json");
+        // RLC: main is a real endpoint → file used verbatim (path unchanged).
+        let rl = examples_dir().join("RLC.json");
         assert_eq!(materialize_for_local_router(&rl, &home).unwrap(), rl);
         let _ = std::fs::remove_dir_all(&home);
     }

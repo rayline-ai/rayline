@@ -2570,15 +2570,15 @@ mod tests {
         let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
 
         // main routed + subagent routed (the routes the local router executes):
-        let st = load_state(include_str!("../../../examples/routing-modes/RR.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/RRC.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/RL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/RLC.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/LR.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/LRC.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
@@ -2586,7 +2586,7 @@ mod tests {
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/RA.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/RAC.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
@@ -2595,7 +2595,7 @@ mod tests {
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
         // subscription main (stripped) → assert subagents only:
-        let st = load_state(include_str!("../../../examples/routing-modes/AR.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/ARC.json"));
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
         let st = load_state(include_str!("../../../examples/routing-modes/AL.json"));
@@ -2603,7 +2603,7 @@ mod tests {
 
         // per-type: Explore/Plan → distinct local models, anything else → cloud catch-all:
         let st = load_state(include_str!(
-            "../../../examples/routing-modes/RL-per-type.json"
+            "../../../examples/routing-modes/RLC-per-type.json"
         ));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(
