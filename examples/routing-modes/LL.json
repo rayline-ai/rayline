@@ -5,19 +5,19 @@
       "protocol": "openai_chat",
       "base_url": "http://127.0.0.1:11434/v1",
       "models": [
-        "model-a",
-        "model-b"
+        "qwen3.5:9b",
+        "qwen2.5-coder:7b"
       ]
     }
   ],
   "routes": {
     "main": {
       "endpoint": "ollama",
-      "model": "model-a"
+      "model": "qwen3.5:9b"
     },
     "subagent": {
       "endpoint": "ollama",
-      "model": "model-a"
+      "model": "qwen3.5:9b"
     }
   }
 }

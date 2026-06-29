@@ -2566,7 +2566,7 @@ mod tests {
             RouteSelection::Endpoint(id.to_owned())
         }
         let cloud = || (ep("rayline-cloud"), "rayline-router".to_owned());
-        let ollama_a = || (ep("ollama"), "model-a".to_owned());
+        let ollama_def = || (ep("ollama"), "qwen3.5:9b".to_owned());
         let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
 
         // main routed + subagent routed (the routes the local router executes):
@@ -2576,22 +2576,22 @@ mod tests {
 
         let st = load_state(include_str!("../../../examples/routing-modes/RL.json"));
         assert_eq!(main_route(&st), cloud());
-        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         let st = load_state(include_str!("../../../examples/routing-modes/LR.json"));
-        assert_eq!(main_route(&st), ollama_a());
+        assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
         let st = load_state(include_str!("../../../examples/routing-modes/LL.json"));
-        assert_eq!(main_route(&st), ollama_a());
-        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         let st = load_state(include_str!("../../../examples/routing-modes/RA.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
         let st = load_state(include_str!("../../../examples/routing-modes/LA.json"));
-        assert_eq!(main_route(&st), ollama_a());
+        assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
         // subscription main (stripped) → assert subagents only:
@@ -2599,15 +2599,18 @@ mod tests {
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
         let st = load_state(include_str!("../../../examples/routing-modes/AL.json"));
-        assert_eq!(sub_route(&st, "reviewer"), ollama_a());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         // per-type: Explore/Plan → distinct local models, anything else → cloud catch-all:
         let st = load_state(include_str!(
             "../../../examples/routing-modes/RL-per-type.json"
         ));
         assert_eq!(main_route(&st), cloud());
-        assert_eq!(sub_route(&st, "Explore"), ollama_a());
-        assert_eq!(sub_route(&st, "Plan"), (ep("ollama"), "model-b".to_owned()));
+        assert_eq!(
+            sub_route(&st, "Explore"),
+            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
+        );
+        assert_eq!(sub_route(&st, "Plan"), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
     }
 
