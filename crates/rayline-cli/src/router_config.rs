@@ -115,6 +115,94 @@ pub fn config_uses_local_endpoint(path: &Path) -> bool {
         .any(|endpoint| endpoint == "local")
 }
 
+/// `router` value selecting the hosted cloud decider (the default when absent).
+pub const ROUTER_RAYLINE_CLOUD: &str = "rayline-cloud";
+/// `router` value selecting the on-device LSR decider (not yet supported — RRL).
+pub const ROUTER_RAYLINE_LOCAL: &str = "rayline-local";
+
+/// The local model the hosted cloud router may redirect a `rayline` class to
+/// ("may-local"), resolved from the config. Returns the advertised model id and
+/// the base URL of the local endpoint that serves it (the redirect target the
+/// proxy fronts via a custom-mode adapter). `None` when no route turns may-local
+/// on (no `router: rayline-cloud` route carries a non-empty `local_models`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MayLocal {
+    pub model: String,
+    pub upstream_url: String,
+}
+
+/// Resolve [`MayLocal`] from a config file. See [`MayLocal`].
+pub fn config_may_local(path: &Path) -> Option<MayLocal> {
+    let raw = std::fs::read(path).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    config_value_may_local(&cfg)
+}
+
+fn config_value_may_local(cfg: &Value) -> Option<MayLocal> {
+    let model = config_advertised_local_model(cfg)?;
+    let upstream_url = endpoint_base_url_for_model(cfg, &model)?;
+    Some(MayLocal {
+        model,
+        upstream_url,
+    })
+}
+
+/// First local model advertised by a may-local route: a route whose `router` is
+/// `rayline-cloud` (or absent → the cloud default) carrying a non-empty
+/// `local_models`. Routes are scanned `main`, `subagent`, `default`, then the
+/// `subagents`/`model_routes` maps. `rayline-local` routes are skipped (may-local
+/// is `N/A` there).
+fn config_advertised_local_model(cfg: &Value) -> Option<String> {
+    let routes = cfg.get("routes")?;
+    let singletons = ["main", "subagent", "default"]
+        .into_iter()
+        .filter_map(|key| routes.get(key));
+    let maps = ["subagents", "model_routes"]
+        .into_iter()
+        .filter_map(|key| routes.get(key))
+        .filter_map(Value::as_object)
+        .flat_map(|map| map.values());
+    singletons
+        .chain(maps)
+        .filter_map(route_advertised_local_model)
+        .next()
+}
+
+/// A single route's advertised local model, if it has may-local on.
+fn route_advertised_local_model(route: &Value) -> Option<String> {
+    // `rayline-local` routes never advertise may-local (N/A).
+    if route.get("router").and_then(Value::as_str) == Some(ROUTER_RAYLINE_LOCAL) {
+        return None;
+    }
+    route
+        .get("local_models")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// Base URL of the (non-cloud) endpoint that lists `model` in its `models`. This
+/// is the upstream the proxy's may-local redirect is fronted onto. The hosted
+/// cloud router is excluded — a local model is served by a local endpoint.
+fn endpoint_base_url_for_model(cfg: &Value, model: &str) -> Option<String> {
+    let cloud_ids = cloud_router_endpoint_ids(cfg);
+    cfg.get("endpoints")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|endpoint| {
+            let id = endpoint.get("id").and_then(Value::as_str);
+            let is_cloud = id.is_some_and(|id| cloud_ids.iter().any(|cloud| cloud == id));
+            !is_cloud
+                && endpoint
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .is_some_and(|models| models.iter().any(|m| m.as_str() == Some(model)))
+        })
+        .and_then(|endpoint| endpoint.get("base_url").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
 /// Reserved `routes.main.endpoint` value meaning "do not route the main agent —
 /// let it pass through to the caller's own Claude subscription/credential".
 /// `RouterConfig` cannot express a credential-passthrough endpoint, so the CLI
@@ -325,6 +413,9 @@ mod tests {
         // (file, main_is_passthrough, needs_local_router, uses_cloud_router)
         let cases = [
             ("RRC.json", false, false, true),
+            // RRCL: may-local routes stay on the cloud router (the `ollama` endpoint
+            // is a redirect target, not a route) → no on-device router engaged.
+            ("RRCL.json", false, false, true),
             ("RLC.json", false, true, true),
             ("RLC-per-type.json", false, true, true),
             ("RAC.json", false, true, true),
@@ -365,6 +456,23 @@ mod tests {
     }
 
     #[test]
+    fn rrcl_example_resolves_may_local() {
+        // The shipped RRCL config advertises a local model fronted by the `ollama`
+        // endpoint, and stays cloud-only for routing (no on-device router engaged).
+        let path = examples_dir().join("RRCL.json");
+        assert!(path.exists(), "missing example config RRCL.json");
+        assert_eq!(
+            config_may_local(&path),
+            Some(MayLocal {
+                model: "qwen2.5-coder:7b".to_owned(),
+                upstream_url: "http://127.0.0.1:11434/v1".to_owned(),
+            })
+        );
+        // RRC (no may-local) must not resolve one.
+        assert_eq!(config_may_local(&examples_dir().join("RRC.json")), None);
+    }
+
+    #[test]
     fn materialize_strips_subscription_main_for_local_router() {
         let home = tmp_home();
         // ARC: main = subscription (passthrough) → stripped; subagent stays.
@@ -379,6 +487,92 @@ mod tests {
         let rl = examples_dir().join("RLC.json");
         assert_eq!(materialize_for_local_router(&rl, &home).unwrap(), rl);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn may_local_resolves_model_and_upstream_for_rrcl() {
+        // RRCL: rayline-cloud routes carrying `local_models`, plus a local endpoint
+        // that serves the advertised model.
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rayline", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                { "id": "ollama", "protocol": "openai_chat",
+                  "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
+            ],
+            "routes": {
+                "main": { "endpoint": "rayline", "router": "rayline-cloud",
+                          "local_models": ["qwen2.5-coder:7b"] },
+                "subagent": { "endpoint": "rayline", "router": "rayline-cloud",
+                              "local_models": ["qwen2.5-coder:7b"] }
+            }
+        });
+        assert_eq!(
+            config_value_may_local(&cfg),
+            Some(MayLocal {
+                model: "qwen2.5-coder:7b".to_owned(),
+                upstream_url: "http://127.0.0.1:11434/v1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn may_local_off_when_no_local_models() {
+        // RRC: rayline-cloud, no `local_models` → may-local off.
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rayline", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }
+            ],
+            "routes": {
+                "main": { "endpoint": "rayline", "router": "rayline-cloud" },
+                "subagent": { "endpoint": "rayline", "router": "rayline-cloud" }
+            }
+        });
+        assert_eq!(config_value_may_local(&cfg), None);
+        assert_eq!(config_advertised_local_model(&cfg), None);
+    }
+
+    #[test]
+    fn may_local_ignored_for_rayline_local_router() {
+        // RRL-shaped: `rayline-local` routes never advertise may-local (N/A), even
+        // if a stray `local_models` is present.
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rayline", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                { "id": "ollama", "protocol": "openai_chat",
+                  "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
+            ],
+            "routes": {
+                "main": { "endpoint": "rayline", "router": "rayline-local",
+                          "local_models": ["qwen2.5-coder:7b"] }
+            }
+        });
+        assert_eq!(config_value_may_local(&cfg), None);
+    }
+
+    #[test]
+    fn may_local_none_when_model_endpoint_undeclared() {
+        // `local_models` names a model no local endpoint serves → cannot resolve an
+        // upstream, so may-local does not engage (the CLI surfaces a clear error
+        // path instead of silently advertising an unreachable model).
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rayline", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }
+            ],
+            "routes": {
+                "main": { "endpoint": "rayline", "router": "rayline-cloud",
+                          "local_models": ["qwen2.5-coder:7b"] }
+            }
+        });
+        assert_eq!(
+            config_advertised_local_model(&cfg),
+            Some("qwen2.5-coder:7b".to_owned())
+        );
+        assert_eq!(endpoint_base_url_for_model(&cfg, "qwen2.5-coder:7b"), None);
+        assert_eq!(config_value_may_local(&cfg), None);
     }
 
     #[test]

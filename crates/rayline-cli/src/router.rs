@@ -1603,6 +1603,26 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     // (ollama, direct-anthropic, rayline-cloud) are served by the local router
     // directly. Cloud-router endpoints read `RAYLINE_ROUTER_API_KEY` from the env.
     if let Some(path) = request.config_path.as_deref() {
+        // RRCL (may-local): a cloud-only config whose `rayline-cloud` route declares
+        // `local_models`. Route on the hosted cloud router (RCR) but front the
+        // config's local endpoint with a custom adapter and advertise it, so the RCR
+        // may 307-redirect to it. Cloud decision plane + custom upstream; the daemon
+        // reads `RAYLINE_ROUTER_API_KEY` from the env for the RCR.
+        if let Some(may_local) = crate::router_config::config_may_local(path) {
+            let mut start_request = RouterStartRequest::defaults(request.root_env_explicit);
+            start_request.enable_proxy = true;
+            start_request.proxy_routing_mode =
+                if crate::router_config::config_main_is_passthrough(path) {
+                    PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+                } else {
+                    PROXY_ROUTING_MODE_ALL
+                }
+                .to_owned();
+            start_request.upstream_url = Some(may_local.upstream_url);
+            start_request.upstream_model = Some(may_local.model.clone());
+            start_request.local_model_id = may_local.model;
+            return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+        }
         start_request.router_config_path = Some(
             crate::router_config::materialize_for_local_router(path, &home)?,
         );

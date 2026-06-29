@@ -524,6 +524,20 @@ async fn run_command_from_home(
     let config_cloud_only = effective_config.is_some()
         && request.routing_mode != RoutingMode::Override
         && !config_engages_local;
+    // RRCL (may-local): a cloud-only config whose `rayline-cloud` route declares
+    // `local_models`. Routing stays on the hosted cloud router (RCR), but a custom
+    // adapter fronts the config's local endpoint so the RCR may 307-redirect a turn
+    // to it — the same shape as the account-toggle may-local, driven by config. The
+    // RCR makes the redirect decision (account-gated), so without it this behaves
+    // like RRC. `N/A` under `--via env` (cloud-only override) and for local-plane
+    // configs.
+    let config_may_local = if config_cloud_only {
+        effective_config
+            .as_deref()
+            .and_then(crate::router_config::config_may_local)
+    } else {
+        None
+    };
     let local_plane = request.local_router || config_engages_local;
 
     if config_engages_local {
@@ -642,6 +656,43 @@ async fn run_command_from_home(
         } else {
             start_request.no_local_model = true;
         }
+        Some(start_request)
+    } else if let Some(may_local) = config_may_local.clone() {
+        // RRCL: keep routing on the hosted cloud router, but stand up a custom-mode
+        // adapter fronting the config's local endpoint and advertise it, so the RCR
+        // can 307-redirect to it (may-local). Mirrors the proven account-toggle
+        // may-local path (`defaults()` keeps the hosted decision plane + cloud
+        // `router_url`; `from_local_model`-style Custom fields point the adapter at
+        // the upstream), sourced from `local_models` instead of `rayline local on`.
+        eprintln!(
+            "Routing via config: {} (may-local → {})",
+            effective_config
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            may_local.model,
+        );
+        let injector_port = resolve_injector_port(request.local_injector_port)?;
+        let mut start_request =
+            crate::router::RouterStartRequest::defaults(request.root_env_explicit);
+        start_request.env_name = Some(env_name.clone());
+        start_request.router_url = router_url.to_owned();
+        start_request.router_url_explicit = true;
+        start_request.injector_port = injector_port;
+        // Cloud-router endpoint: inject the stored `rayline auth login` key so the
+        // embedded proxy authenticates to the RCR without a manual env var.
+        start_request.router_api_key_override = ensure_router_key(
+            &env_name,
+            home,
+            request.auth_token.as_deref(),
+            request.root_env_explicit,
+        )
+        .await
+        .ok();
+        // Custom adapter fronting the config's local endpoint (the redirect target).
+        start_request.upstream_url = Some(may_local.upstream_url);
+        start_request.upstream_model = Some(may_local.model.clone());
+        start_request.local_model_id = may_local.model;
         Some(start_request)
     } else if request.local_router {
         let provider_config = explicit_provider_config(request, home).await?;

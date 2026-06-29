@@ -111,11 +111,23 @@ pub enum EndpointProtocol {
     OpenAIChat,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouteTarget {
     pub endpoint: String,
     #[serde(default)]
     pub model: String,
+    /// v2 (`rayline`-only): which rayline decider runs — `"rayline-cloud"` (the
+    /// hosted RCR) or `"rayline-local"` (the on-device LSR). `None` defaults to
+    /// `rayline-cloud` behavior. Ignored for non-`rayline` endpoints. The LSR's
+    /// own routing does not read this; the CLI inspects it to wire the run.
+    #[serde(default)]
+    pub router: Option<String>,
+    /// v2 (`router: rayline-cloud` only): local model ids the hosted RCR may
+    /// redirect this class to ("may-local"). A non-empty list turns may-local ON
+    /// and advertises `local_models[0]`; today only the first entry is used.
+    /// `N/A` (ignored) for `rayline-local` and for `anthropic`/`local` endpoints.
+    #[serde(default)]
+    pub local_models: Vec<String>,
 }
 
 impl RouteTarget {
@@ -123,6 +135,7 @@ impl RouteTarget {
         Self {
             endpoint: "local".to_owned(),
             model: model.into(),
+            ..Default::default()
         }
     }
 }
@@ -360,11 +373,13 @@ fn default_config(local_model_id: &str) -> RouterConfig {
             main: Some(RouteTarget {
                 endpoint: "anthropic".to_owned(),
                 model: "claude-sonnet-4-6".to_owned(),
+                ..Default::default()
             }),
             subagent: Some(RouteTarget::local(local_model_id)),
             default: Some(RouteTarget {
                 endpoint: "anthropic".to_owned(),
                 model: "claude-sonnet-4-6".to_owned(),
+                ..Default::default()
             }),
             model_routes: HashMap::from([
                 (
@@ -391,7 +406,11 @@ fn apply_env_overrides(config: &mut RouterConfig) {
                 .map(|route| route.endpoint.clone())
                 .unwrap_or_else(|| "anthropic".to_owned())
         });
-        config.routes.main = Some(RouteTarget { endpoint, model });
+        config.routes.main = Some(RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        });
     } else if let Ok(endpoint) = std::env::var(MAIN_ENDPOINT_ENV) {
         if let Some(route) = config.routes.main.as_mut() {
             route.endpoint = endpoint;
@@ -407,7 +426,11 @@ fn apply_env_overrides(config: &mut RouterConfig) {
                 .map(|route| route.endpoint.clone())
                 .unwrap_or_else(|| "local".to_owned())
         });
-        config.routes.subagent = Some(RouteTarget { endpoint, model });
+        config.routes.subagent = Some(RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        });
     } else if let Ok(endpoint) = std::env::var(SUBAGENT_ENDPOINT_ENV) {
         if let Some(route) = config.routes.subagent.as_mut() {
             route.endpoint = endpoint;
@@ -695,7 +718,11 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
             .unwrap_or_else(default_main_route)
     } else if let Some((endpoint, model)) = route_direct_model(&state.config, &requested_model) {
         policy = "direct-model".to_owned();
-        RouteTarget { endpoint, model }
+        RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        }
     } else {
         state
             .config
@@ -799,6 +826,7 @@ fn default_main_route() -> RouteTarget {
     RouteTarget {
         endpoint: "anthropic".to_owned(),
         model: "claude-sonnet-4-6".to_owned(),
+        ..Default::default()
     }
 }
 
@@ -2574,6 +2602,12 @@ mod tests {
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
+        // RRCL: `router`/`local_models` are may-local advertisement metadata; they do
+        // not change the LSR's routing — main + subagents still resolve to cloud.
+        let st = load_state(include_str!("../../../examples/routing-modes/RRCL.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
         let st = load_state(include_str!("../../../examples/routing-modes/RLC.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
@@ -2688,6 +2722,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);
@@ -2720,6 +2755,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);
@@ -2753,6 +2789,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);

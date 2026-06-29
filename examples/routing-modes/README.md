@@ -66,7 +66,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Supported | Config |
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
-| **RRCL** | `rayline` | `rayline` | rayline-cloud | on | RCR picks cloud **or local** | RCR picks cloud **or local** | rayline | ❌ N | — (may-local) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | RCR picks cloud **or local** | RCR picks cloud **or local** | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | on-device LSR decides | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | RCR picks cloud **or local** | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
@@ -103,27 +103,38 @@ supported configs (see [Tests](#tests)); the local-main **capability** is not ye
 viable, so a full interactive run is expected to fall short. The live e2e test
 (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
 
+**§ may-local from config — the redirect itself is hosted/account-gated.**
+`RRCL` wires the **client** contract from config: a `rayline-cloud` route carrying
+`local_models` stands up a custom adapter fronting the named local endpoint and
+advertises it to the RCR (`x-rayline-local-available` + the model id), decoupled
+from the `rayline local on/off` account toggle. Whether a turn is actually
+redirected to local is the **hosted RCR's** runtime decision and is account-gated
+today — so without it (or with the account flag off) `RRCL` behaves like `RRC`
+(cloud only). The advertisement + redirect *plumbing* is hermetically tested; the
+end-to-end redirect decision is exercised only by the ignored live test. The other
+`*CL` modes (`RACL`/`RLCL`/`ARCL`/`LRCL`) reuse this once their non-may-local base
+(`RAC`/`RLC`/…) is combined with the same advertisement — tracked separately.
+
 ### What "Supported" means
 
 - **✅ Y** — routable by the shipping `--config` engine today; a config file is
-  provided and exercised by the hermetic tests below.
+  provided and exercised by the hermetic tests below. (`RRCL` is supported for the
+  client/advertisement contract; its actual local redirect is hosted-gated — see §.)
 - **❌ N** — needs a `rayline`-only sub-axis not yet wired:
-  - **may-local** (`*CL` modes) — letting the cloud RCR redirect a `rayline` class
-    to a local model is currently the account-level `rayline local on/off` toggle
-    (decided server-side at runtime), not a per-config control. Driving it from
-    config (advertising the local model + decoupling from the account toggle) is
-    the **RRCL** follow-up.
+  - **may-local on a non-`RR` base** (`RACL`/`RLCL`/`ARCL`/`LRCL`) — the `RRCL`
+    advertisement combined with that mode's base routing; not yet wired.
   - **on-device LSR decider** (`*L` modes) — `router: rayline-local` needs a new
     on-device selection policy in the LSR (today the LSR routes by static rule
     only). This is the **RRL** follow-up.
 
 ## Files ↔ modes
 
-The supported modes ship as **9 config files** (the `❌` modes have none yet):
+The supported modes ship as **10 config files** (the `❌` modes have none yet):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
 | [`RRC.json`](./RRC.json) | rayline-cloud | rayline-cloud | RRC |
+| [`RRCL.json`](./RRCL.json) | rayline-cloud (+ `local_models`) | rayline-cloud (+ `local_models`) | RRCL § |
 | [`RAC.json`](./RAC.json) | rayline-cloud | anthropic (API key) | RAC |
 | [`RLC.json`](./RLC.json) | rayline-cloud | ollama (local) | RLC |
 | [`ARC.json`](./ARC.json) | subscription (passthrough) | rayline-cloud | ARC |
@@ -169,6 +180,26 @@ Real `EndpointConfig` fields only: `id`, `protocol`
 > Note: `routes.subagent` (singular) is the subagent **default**;
 > `routes.subagents` (the map) is **only** for per-type overrides.
 
+### `rayline`-only route fields (v2)
+
+A route targeting the `rayline` cloud endpoint accepts two optional fields:
+
+```jsonc
+"main": {
+  "endpoint": "rayline-cloud", "model": "rayline-router",
+  "router": "rayline-cloud",              // rayline-cloud (default) | rayline-local (RRL — not yet)
+  "local_models": ["qwen2.5-coder:7b"]    // non-empty ⇒ may-local ON (RRCL); must be served by a declared local endpoint
+}
+```
+
+- **`router`** — which rayline decider runs. `rayline-cloud` (or absent) = the
+  hosted RCR. `rayline-local` (the on-device LSR decider) is **not yet supported**.
+- **`local_models`** — the model ids the cloud RCR may redirect this class to
+  (may-local). A non-empty list turns may-local **on** and advertises
+  `local_models[0]`; the id must appear in a declared local endpoint's `models`
+  (that endpoint's `base_url` is the redirect target). Both fields are ignored for
+  `anthropic`/`local` endpoints and do not change the local router's own routing.
+
 ## Auth
 
 - `rayline-cloud` reads `RAYLINE_ROUTER_API_KEY` (an `rlk-` key). For
@@ -213,14 +244,19 @@ Routing is regression-tested hermetically (no credentials, loopback-only):
 The selective-main-subscription passthrough (`ARC`/`AL` main) is a proxy-layer
 behavior, covered in `crates/rayline-proxy`.
 
-**may-local (the `*CL` modes)** is the cloud router's *runtime* decision plus the
-proxy's local-redirect plumbing — not anything a static config encodes today. The
-proxy half (advertising `x-rayline-local-available` and following the router's
-`307` to the on-device adapter) is hermetically tested in `crates/rayline-proxy`
+**may-local — `RRCL` (§).** The config→advertisement mapping is unit-tested in
+`rayline-cli` (`router_config::tests::may_local_*` and `rrcl_example_resolves_may_local`):
+a `rayline-cloud` route with `local_models` resolves to the advertised model + the
+local endpoint's upstream URL, and `rayline-local`/no-`local_models` routes resolve
+to none. `config_mode_examples_route_main_and_subagents` also asserts the
+`router`/`local_models` fields **do not** change the LSR's routing (RRCL still
+routes main + subagents to cloud). The proxy half — advertising
+`x-rayline-local-available` and following the router's `307` to the local adapter —
+is hermetically tested in `crates/rayline-proxy`
 (`proxy_stashes_router_auth_for_local_307`,
-`local_proxy_redirect_uses_shared_router_auth_for_usage_update`). The toggle-driven
-end-to-end (e.g. `RRC` vs `RRCL`, flipped by `rayline local on/off`) is a
-hosted-router + account-state behavior, so it is not — and cannot be — a hermetic
+`local_proxy_redirect_uses_shared_router_auth_for_usage_update`). The **actual
+redirect decision** is the hosted RCR's call and is account-gated, so the true
+end-to-end (whether a turn lands on local) is not — and cannot be — a hermetic
 config test; that path is exercised by the ignored live test
 `crates/rayline-proxy/tests/it_claude_live.rs`.
 
