@@ -5,9 +5,11 @@
 #
 # Usage:
 #   ./visual-demo.sh [MODE] [PROMPT]
-#     MODE    one of the configs in this dir (default: RRC), e.g. RRC RLC LL AL ...
-#     PROMPT  the prompt sent to Claude Code in print mode
-#             (default: "Reply with exactly one word: pong")
+#     MODE    one of the configs in this dir (default: RRC), e.g. RRC RLC ARCL LL AL ...
+#     PROMPT  the prompt sent to Claude Code in print mode; overrides the default.
+#             The default spawns one Explore subagent so subagent routing — and
+#             may-local (e.g. RRCL/ARCL, where only Explore subagents go local) —
+#             is actually visible. (A plain "say pong" never spawns a subagent.)
 #
 # Env:
 #   RAYLINE_BIN   rayline binary to use (default: rayline from PATH)
@@ -19,7 +21,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-RRC}"
-PROMPT="${2:-Reply with exactly one word: pong}"
+PROMPT="${2:-Use the Task tool to launch one Explore subagent that replies with the single word PONG; do not use any other tool first. After it returns, output: DONE}"
 RAYLINE_BIN="${RAYLINE_BIN:-rayline}"
 WINDOW_SIZE="${WINDOW_SIZE:-220x50}"
 CFG="$HERE/$MODE.json"

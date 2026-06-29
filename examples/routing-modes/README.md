@@ -236,13 +236,21 @@ split-pane tmux session — the left pane runs `rayline claude --config <mode>` 
 the right pane runs `rayline top`, so you can watch the routing live:
 
 ```bash
-./examples/routing-modes/visual-demo.sh RRC       # default mode is RRC
-./examples/routing-modes/visual-demo.sh RLC       # any supported mode from the table
+./examples/routing-modes/visual-demo.sh RRC                       # default mode + default prompt
+./examples/routing-modes/visual-demo.sh ARCL                      # any supported mode from the table
+./examples/routing-modes/visual-demo.sh ARCL "your prompt here"   # 2nd arg overrides the prompt
 ```
 
-Requires `asciinema` and `tmux`. It forces `--via proxy` (so `rayline top` has
-metrics to show) and writes `<MODE>-demo.cast`; play it with
-`asciinema play <MODE>-demo.cast`.
+The **default prompt spawns one `Explore` subagent**, so subagent routing — and
+may-local (e.g. `RRCL`/`ARCL`, where only `Explore` subagents go local) — is
+actually visible in `rayline top`. Pass a 2nd arg to use your own prompt.
+
+Requires `asciinema` and `tmux` (and a TTY — `asciinema rec`/`tmux attach` need
+one). It forces `--via proxy` (so `rayline top` has metrics to show) and writes
+`<MODE>-demo.cast`; play it with `asciinema play <MODE>-demo.cast`. To verify a
+mode without recording, run the demo's core command directly:
+`rayline claude --config <MODE>.json --via proxy -p "<prompt>"` and read
+`rayline top --all`.
 
 ## Tests
 
