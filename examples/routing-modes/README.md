@@ -48,8 +48,10 @@ why the `router` and `local-model` columns exist and are `N/A` for
   is not the same thing as `subagent: local`.
 - **`local-model`** — a **sub-knob of `router: rayline-cloud`**: may the cloud RCR
   **redirect** that class to a local model (`on`) or stay cloud-only (`off`).
-  **`N/A` when `router: rayline-local`** (the on-device router already routes locally
-  itself) and N/A for `anthropic`/`local`.
+  **Today may-local only takes effect for exploration subagents (`Explore`) — the
+  main agent is always cloud** (a config-declared local model is a *custom*
+  endpoint, which the RCR delegates exploration-only). **`N/A` when
+  `router: rayline-local`** and for `anthropic`/`local`.
 
 The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-local`) →
 *only under `rayline-cloud`* → `local-model` (`on`|`off`) — so a `rayline` class has
@@ -58,7 +60,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | `router` | `local-model` | a `rayline` class then… | suffix |
 |---|---|---|---|
 | rayline-cloud | off | RCR serves a **cloud** model only | `C` |
-| rayline-cloud | on | RCR may **redirect to a local model** (may-local) | `CL` |
+| rayline-cloud | on | RCR may **redirect to a local model** (may-local) — today **`Explore` subagents only; main stays cloud** | `CL` |
 | rayline-local | — (N/A) | the on-device **LSR routes it itself** | `L` |
 
 ## Modes
@@ -66,20 +68,20 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Supported | Config |
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
-| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) — main stays cloud § | RCR may send `Explore` → local § | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud (RCR) § | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | on-device LSR decides | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
-| **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | RCR picks cloud **or local** | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
+| **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) § | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
 | **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | on-device LSR decides | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (LSR decider) |
 | **RLC** | `rayline` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ Y | [`RLC.json`](./RLC.json) |
-| **RLCL** | `rayline` | `local` | rayline-cloud | on | RCR picks cloud **or local** | local model | rayline | ❌ N | — (may-local) |
+| **RLCL** | `rayline` | `local` | rayline-cloud | on | cloud (RCR) § | local model | rayline | ❌ N | — (may-local) |
 | **RLL** | `rayline` | `local` | rayline-local | N/A | on-device LSR decides | local model | rayline | ❌ N | — (LSR decider) |
 | **ARC** | `anthropic` | `rayline` | rayline-cloud | off | Anthropic (subscription) | cloud (RCR) | subscription + rayline | ✅ Y | [`ARC.json`](./ARC.json) |
-| **ARCL** | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | RCR picks cloud **or local** | subscription + rayline | ❌ N | — (may-local) |
+| **ARCL** | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | cloud (RCR) § | subscription + rayline | ❌ N | — (may-local) |
 | **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | on-device LSR decides | subscription + rayline | ❌ N | — (LSR decider) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ Y | [`AL.json`](./AL.json) |
 | **LRC** ‡ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ Y | [`LRC.json`](./LRC.json) |
-| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | RCR picks cloud **or local** | rayline | ❌ N | — (may-local) |
+| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | cloud (RCR) § | rayline | ❌ N | — (may-local) |
 | **LRL** ‡ | `local` | `rayline` | rayline-local | N/A | local model | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
 | **LA** † ‡ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | ✅ Y | [`LA.json`](./LA.json) |
 | **LL** ‡ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ Y | [`LL.json`](./LL.json) |
