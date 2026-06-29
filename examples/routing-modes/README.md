@@ -70,6 +70,25 @@ tool-capable local main is available — the live e2e test
   the model — `cloud` (the cloud router's intelligent choice) vs `local` (your
   on-device static rules). `N/A` for `anthropic` / `local`.
 
+### Toggling may-local (the `1` ↔ `2` modes)
+
+The `local-model` `on`/`off` choice (e.g. **RR1 ↔ RR2**) is **not** a flag and
+**not** in the config — it is your account-level "may-local" toggle plus whether an
+on-device model is configured. The `rayline claude --config <file>` command is
+identical for both; the cloud router decides at runtime whether to redirect a
+`rayline`-routed request to your local model.
+
+```bash
+rayline local use <model>   # or: rayline local custom --url … --model …  (configure the on-device model)
+rayline local on            # may-local ON  for your account → the "2" modes (RR2/AR2/RL2/LR2)
+rayline local off           # may-local OFF for your account → the "1" modes (RR1/AR1/RL1/LR1)
+rayline local show          # configured model + on/off state (which mode you're effectively in)
+```
+
+With may-local **on** and a model configured, the cloud router may redirect
+`rayline`-routed requests (main and/or subagents) to local — the RR2/AR2/… behavior.
+With it **off**, every `rayline` route stays on cloud (RR1/AR1/…).
+
 ## Files ↔ modes
 
 13 modes collapse to **9 config files**: the `local-model` `on`/`off` pair
@@ -165,6 +184,17 @@ Routing is regression-tested hermetically (no credentials, loopback-only):
 
 The selective-main-subscription passthrough (`AR`/`AL` main) is a proxy-layer
 behavior, covered in `crates/rayline-proxy`.
+
+**may-local (the `1` ↔ `2` difference)** is the cloud router's *runtime* decision
+plus the proxy's local-redirect plumbing — not anything a static config encodes.
+The proxy half (advertising `x-rayline-local-available` and following the router's
+`307` to the on-device adapter) is hermetically tested in `crates/rayline-proxy`
+(`proxy_stashes_router_auth_for_local_307`,
+`local_proxy_redirect_uses_shared_router_auth_for_usage_update`). The toggle-driven
+end-to-end (RR1 vs RR2, flipped by `rayline local on/off`) is a hosted-router +
+account-state behavior, so it is not — and cannot be — a hermetic config test;
+that path is exercised by the ignored live test
+`crates/rayline-proxy/tests/it_claude_live.rs`.
 
 The full **interactive** end-to-end for the `agent = local` modes
 (`LR`/`LA`/`LL`, marked ‡) is **expected to fail** with current small local
