@@ -260,14 +260,14 @@ A route targeting the `rayline` cloud endpoint accepts two optional fields:
 
 ## Visual demo
 
-[`visual-demo.sh`](./visual-demo.sh) records an asciinema cast of any mode in a
+[`visual-verify.sh`](./visual-verify.sh) records an asciinema cast of any mode in a
 split-pane tmux session — the left pane runs `rayline claude --config <mode>` and
 the right pane runs `rayline top`, so you can watch the routing live:
 
 ```bash
-./examples/routing-modes/visual-demo.sh RRC                       # default mode + default prompt
-./examples/routing-modes/visual-demo.sh ARCL                      # any supported mode from the table
-./examples/routing-modes/visual-demo.sh ARCL "your prompt here"   # 2nd arg overrides the prompt
+./examples/routing-modes/visual-verify.sh RRC                       # default mode + default prompt
+./examples/routing-modes/visual-verify.sh ARCL                      # any supported mode from the table
+./examples/routing-modes/visual-verify.sh ARCL "your prompt here"   # 2nd arg overrides the prompt
 ```
 
 The **default prompt spawns one `Explore` subagent**, so subagent routing — and
