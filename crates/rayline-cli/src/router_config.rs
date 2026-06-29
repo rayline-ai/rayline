@@ -462,6 +462,40 @@ mod tests {
     }
 
     #[test]
+    fn cl_modes_may_local_wiring() {
+        // For each `--local-model=on` (*CL) config, report what the CLI derives:
+        //   resolves    = config_may_local resolves a model+upstream
+        //   needs_local = a route targets a non-cloud endpoint (engages the LSR)
+        //   fires       = the CLI actually wires may-local advertisement, which is
+        //                 gated on the cloud-only path (!needs_local) in claude.rs.
+        // (file, expect_resolves, expect_needs_local, expect_fires)
+        let cases = [
+            ("RRCL.json", true, false, true),
+            ("ARCL.json", true, false, true),
+            ("RACL.json", true, true, false),
+            ("RLCL.json", true, true, false),
+            ("LRCL.json", true, true, false),
+        ];
+        for (file, resolves, needs_local, fires) in cases {
+            let path = examples_dir().join(file);
+            assert!(path.exists(), "missing {file}");
+            assert_eq!(
+                config_may_local(&path).is_some(),
+                resolves,
+                "{file}: resolves"
+            );
+            assert_eq!(
+                config_needs_local_router(&path),
+                needs_local,
+                "{file}: needs_local"
+            );
+            let actually_fires =
+                !config_needs_local_router(&path) && config_may_local(&path).is_some();
+            assert_eq!(actually_fires, fires, "{file}: may-local wired by CLI");
+        }
+    }
+
+    #[test]
     fn rrcl_example_resolves_may_local() {
         // The shipped RRCL config advertises a local model fronted by the `ollama`
         // endpoint, and stays cloud-only for routing (no on-device router engaged).
