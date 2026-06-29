@@ -2662,6 +2662,30 @@ mod tests {
         );
         assert_eq!(sub_route(&st, "Plan"), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        // router: rayline-local on the rayline class (RAL/RLL/ARL/LRL) — the LSR
+        // routes that class to rayline-cloud and pins its model; the other class is
+        // anthropic (API key) / ollama / subscription, per the JSON.
+        let glm = || (ep("rayline-cloud"), "GLM-5.2".to_owned());
+        let ds_pro = || (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned());
+        let st = load_state(include_str!("../../../examples/routing-modes/RAL.json"));
+        assert_eq!(main_route(&st), glm());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RLL.json"));
+        assert_eq!(main_route(&st), glm());
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
+        );
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LRL.json"));
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), ds_pro());
+
+        // ARL: subscription main (stripped) → assert the rayline-local subagent only.
+        let st = load_state(include_str!("../../../examples/routing-modes/ARL.json"));
+        assert_eq!(sub_route(&st, "reviewer"), ds_pro());
     }
 
     #[test]

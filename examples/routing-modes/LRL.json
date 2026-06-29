@@ -1,0 +1,34 @@
+{
+  "endpoints": [
+    {
+      "id": "ollama",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "models": [
+        "qwen3.5:9b"
+      ]
+    },
+    {
+      "id": "rayline-cloud",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "auth": "api_key",
+      "models": [
+        "rayline-router",
+        "deepseek/deepseek-v4-pro"
+      ]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "ollama",
+      "model": "qwen3.5:9b"
+    },
+    "subagent": {
+      "endpoint": "rayline-cloud",
+      "model": "deepseek/deepseek-v4-pro",
+      "router": "rayline-local"
+    }
+  }
+}

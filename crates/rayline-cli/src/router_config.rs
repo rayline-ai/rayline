@@ -450,9 +450,18 @@ mod tests {
             // RRCL: may-local routes stay on the cloud router (the `ollama` endpoint
             // is a redirect target, not a route) → no on-device router engaged.
             ("RRCL.json", false, false, true),
+            // RRL: router rayline-local engages the on-device router even though
+            // both routes target rayline-cloud (it pins the model on-device).
+            ("RRL.json", false, true, true),
             ("RLC.json", false, true, true),
             ("RLC-per-type.json", false, true, true),
             ("RAC.json", false, true, true),
+            // RAL/RLL/ARL/LRL: router rayline-local on the rayline class → on-device
+            // routing; the other class is anthropic (API key) / ollama / subscription.
+            ("RAL.json", false, true, true),
+            ("RLL.json", false, true, true),
+            ("ARL.json", true, true, true),
+            ("LRL.json", false, true, true),
             ("ARC.json", true, false, true),
             ("AL.json", true, true, false),
             ("LRC.json", false, true, true),

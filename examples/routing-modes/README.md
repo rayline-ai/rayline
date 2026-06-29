@@ -73,17 +73,17 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** † | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) § | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
-| **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | on-device LSR decides | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (LSR decider) |
+| **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAL.json`](./RAL.json) |
 | **RLC** | `rayline` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ Y | [`RLC.json`](./RLC.json) |
 | **RLCL** | `rayline` | `local` | rayline-cloud | on | cloud (RCR) § | local model | rayline | ❌ N | — (may-local) |
-| **RLL** | `rayline` | `local` | rayline-local | N/A | on-device LSR decides | local model | rayline | ❌ N | — (LSR decider) |
+| **RLL** | `rayline` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ Y | [`RLL.json`](./RLL.json) |
 | **ARC** | `anthropic` | `rayline` | rayline-cloud | off | Anthropic (subscription) | cloud (RCR) | subscription + rayline | ✅ Y | [`ARC.json`](./ARC.json) |
 | **ARCL** § | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | RCR may send a subagent → local | subscription + rayline | ✅ Y | [`ARCL.json`](./ARCL.json) |
-| **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | on-device LSR decides | subscription + rayline | ❌ N | — (LSR decider) |
+| **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | cloud model (via local router) | subscription + rayline | ✅ Y | [`ARL.json`](./ARL.json) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ Y | [`AL.json`](./AL.json) |
 | **LRC** ‡ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ Y | [`LRC.json`](./LRC.json) |
 | **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | RCR may send a subagent → local | rayline | ❌ N | — (may-local) |
-| **LRL** ‡ | `local` | `rayline` | rayline-local | N/A | local model | on-device LSR decides | rayline | ❌ N | — (LSR decider) |
+| **LRL** ‡ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | ✅ Y | [`LRL.json`](./LRL.json) |
 | **LA** † ‡ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | ✅ Y | [`LA.json`](./LA.json) |
 | **LL** ‡ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ Y | [`LL.json`](./LL.json) |
 
@@ -138,20 +138,18 @@ combined with the same advertisement — tracked separately.
 - **✅ Y** — routable by the shipping `--config` engine today; a config file is
   provided and exercised by the hermetic tests below. (`RRCL` is supported for the
   client/advertisement contract; its actual local redirect is hosted-gated — see §.)
+  All `router: rayline-local` modes (`RRL`/`RAL`/`RLL`/`ARL`/`LRL`) are supported:
+  `router: rayline-local` is **static LSR routing** — the JSON is the decider (the
+  LSR routes each class per the config and pins its `model`), no ML policy needed.
 - **❌ N** — needs a `rayline`-only sub-axis not yet wired:
   - **may-local when a class is statically local/anthropic** (`RACL`/`RLCL`/`LRCL`)
     — these route a class to a non-cloud endpoint, engaging the on-device router,
     where may-local advertisement is not yet wired. (`RRCL`/`ARCL` are cloud-only
     routed, so they already work.)
-  - **other `router: rayline-local` modes** (`RAL`/`RLL`/`ARL`/`LRL`) — `RRL` is
-    supported: `router: rayline-local` is **static LSR routing** (the JSON is the
-    decider; no new policy needed — that earlier claim was wrong). The remaining
-    `*L` modes use the *same* mechanism (just different endpoints on the other
-    class), so they should work too, but aren't yet shipped/verified.
 
 ## Files ↔ modes
 
-The supported modes ship as **12 config files** (the `❌` modes have none yet):
+The supported modes ship as **16 config files** (the `❌` modes have none yet):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
@@ -159,11 +157,15 @@ The supported modes ship as **12 config files** (the `❌` modes have none yet):
 | [`RRCL.json`](./RRCL.json) | rayline-cloud (+ `local_models`) | rayline-cloud (+ `local_models`) | RRCL § |
 | [`RRL.json`](./RRL.json) | rayline-cloud, `router: rayline-local` (model pinned) | rayline-cloud, `router: rayline-local` (default + `Explore` per-type) | RRL |
 | [`RAC.json`](./RAC.json) | rayline-cloud | anthropic (API key) | RAC |
+| [`RAL.json`](./RAL.json) | rayline-cloud, `router: rayline-local` (model pinned) | anthropic (API key) | RAL |
 | [`RLC.json`](./RLC.json) | rayline-cloud | ollama (local) | RLC |
+| [`RLL.json`](./RLL.json) | rayline-cloud, `router: rayline-local` (model pinned) | ollama (local) | RLL |
 | [`ARC.json`](./ARC.json) | subscription (passthrough) | rayline-cloud | ARC |
 | [`ARCL.json`](./ARCL.json) | subscription (passthrough) | rayline-cloud (+ `local_models`) | ARCL § |
+| [`ARL.json`](./ARL.json) | subscription (passthrough) | rayline-cloud, `router: rayline-local` (model pinned) | ARL |
 | [`AL.json`](./AL.json) | subscription (passthrough) | ollama (local) | AL |
 | [`LRC.json`](./LRC.json) | ollama (local) | rayline-cloud | LRC |
+| [`LRL.json`](./LRL.json) | ollama (local) | rayline-cloud, `router: rayline-local` (model pinned) | LRL |
 | [`LA.json`](./LA.json) | ollama (local) | anthropic (API key) | LA |
 | [`LL.json`](./LL.json) | ollama (local) | ollama (local) | LL |
 | [`RLC-per-type.json`](./RLC-per-type.json) | rayline-cloud | per-type: `Explore`/`Plan` → ollama, default → rayline-cloud | RLC\* |
