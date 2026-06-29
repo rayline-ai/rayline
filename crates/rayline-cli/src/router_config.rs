@@ -140,7 +140,13 @@ pub fn config_may_local(path: &Path) -> Option<MayLocal> {
 
 fn config_value_may_local(cfg: &Value) -> Option<MayLocal> {
     let model = config_advertised_local_model(cfg)?;
-    let upstream_url = endpoint_base_url_for_model(cfg, &model)?;
+    let raw_base = endpoint_base_url_for_model(cfg, &model)?;
+    // The custom-mode adapter appends `/v1/messages` to the upstream base
+    // (`rayline-adapter` `format!("{}/v1/messages", target)`), so the upstream must
+    // be the server *root*. Normalize exactly like `rayline local custom` does —
+    // strip a trailing `/v1` — so an `openai_chat` endpoint's `…/v1` base_url does
+    // not become `…/v1/v1/messages`.
+    let upstream_url = crate::local_model::normalize_base_url(&raw_base);
     Some(MayLocal {
         model,
         upstream_url,
@@ -465,7 +471,7 @@ mod tests {
             config_may_local(&path),
             Some(MayLocal {
                 model: "qwen2.5-coder:7b".to_owned(),
-                upstream_url: "http://127.0.0.1:11434/v1".to_owned(),
+                upstream_url: "http://127.0.0.1:11434".to_owned(),
             })
         );
         // RRC (no may-local) must not resolve one.
@@ -511,7 +517,7 @@ mod tests {
             config_value_may_local(&cfg),
             Some(MayLocal {
                 model: "qwen2.5-coder:7b".to_owned(),
-                upstream_url: "http://127.0.0.1:11434/v1".to_owned(),
+                upstream_url: "http://127.0.0.1:11434".to_owned(),
             })
         );
     }
