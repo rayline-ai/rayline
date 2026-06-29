@@ -30,23 +30,26 @@ opens **two independent sub-axes that apply only to `rayline`** — which is exa
 why the `--local-model` and `--router` columns exist and are `N/A` for
 `anthropic` / `local`:
 
-- **`--router`** — *which rayline decider runs*: `cloud` = the hosted **RCR**
-  (intelligent ML pick) vs `local` = the on-device **LSR** (your static rules).
-  Two genuinely different deciders.
-- **`--local-model`** — **only under `router: cloud`**: may the cloud RCR
-  **redirect** that class to a local model (`on`) or stay cloud-only (`off`). It is
-  a *sub-knob of `cloud`* — **`N/A` when `router: local`** (the on-device router
-  already routes locally itself) and N/A for `anthropic`/`local`.
+- **`--router`** — *which rayline decider runs*: `rayline-cloud` = the hosted
+  **RCR** (intelligent ML pick) vs `rayline-local` = the on-device **LSR** (your
+  static rules). Two genuinely different deciders. The `rayline-` prefix keeps the
+  *engine* distinct from the `local`/`anthropic` **providers** — `router: rayline-local`
+  is not the same thing as `subagent: local`.
+- **`--local-model`** — a **sub-knob of `router: rayline-cloud`**: may the cloud RCR
+  **redirect** that class to a local model (`on`) or stay cloud-only (`off`).
+  **`N/A` when `router: rayline-local`** (the on-device router already routes locally
+  itself) and N/A for `anthropic`/`local`.
 
-The two sub-axes **nest** — `rayline` → `router` (cloud|local) → *only under cloud* →
-`local-model` (on|off) — so a `rayline` class has **three** distinct behaviours, not
-four (the provider letter alone underspecifies it; these are required, not redundant):
+The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-local`) →
+*only under `rayline-cloud`* → `local-model` (`on`|`off`) — so a `rayline` class has
+**three** distinct behaviours, not four (the provider letter alone underspecifies it;
+these are required, not redundant):
 
 | `--router` | `--local-model` | a `rayline` class then… |
 |---|---|---|
-| cloud | off | RCR serves a **cloud** model only |
-| cloud | on | RCR may **redirect to a local model** (may-local) |
-| local | — (N/A) | the on-device **LSR routes it itself** |
+| rayline-cloud | off | RCR serves a **cloud** model only |
+| rayline-cloud | on | RCR may **redirect to a local model** (may-local) |
+| rayline-local | — (N/A) | the on-device **LSR routes it itself** |
 
 How they are surfaced today (vs the intent above): `--router` is currently *derived*
 from the endpoint a route targets, and `--local-model` is the account-level
@@ -55,20 +58,20 @@ not yet first-class per-class controls.
 
 | agent | subagent | local-model | router | Mode | Config | Main agent → | Subagents → | Local model | Auth | CLI command |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `rayline` | `rayline` | off | cloud / local | **RR1** | [`RR.json`](./RR.json) | cloud model (via cloud router) | cloud model (via cloud router) | — | rayline | `rayline claude --config RR.json` |
-| `rayline` | `rayline` | on | cloud / local | **RR2** | [`RR.json`](./RR.json) | cloud router picks: cloud **or local** | cloud router picks: cloud **or local** | main + subagents | rayline | `rayline claude --config RR.json` |
-| `rayline` | `anthropic` | off | cloud / local | **RA1** † | [`RA.json`](./RA.json) | cloud model (via cloud router) | Anthropic (subscription) | — | rayline + Anthropic key | `rayline claude --config RA.json` |
-| `rayline` | `anthropic` | on | cloud / local | **RA2** † | [`RA.json`](./RA.json) | cloud router picks: cloud **or local** | Anthropic (subscription) | main | rayline + Anthropic key | `rayline claude --config RA.json` |
-| `rayline` | `local` | off | cloud / local | **RL1** | [`RL.json`](./RL.json) | cloud model (via cloud router) | local model | subagents | rayline | `rayline claude --config RL.json` |
-| `rayline` | `local` | on | cloud / local | **RL2** | [`RL.json`](./RL.json) | cloud router picks: cloud **or local** | local model | main + subagents | rayline | `rayline claude --config RL.json` |
-| `anthropic` | `rayline` | off | cloud / local | **AR1** | [`AR.json`](./AR.json) | Anthropic (subscription) | cloud model (via cloud router) | — | subscription + rayline | `rayline claude --config AR.json` |
-| `anthropic` | `rayline` | on | cloud / local | **AR2** | [`AR.json`](./AR.json) | Anthropic (subscription) | cloud router picks: cloud **or local** | subagents | subscription + rayline | `rayline claude --config AR.json` |
+| `rayline` | `rayline` | off | rayline-cloud / rayline-local | **RR1** | [`RR.json`](./RR.json) | cloud model (via cloud router) | cloud model (via cloud router) | — | rayline | `rayline claude --config RR.json` |
+| `rayline` | `rayline` | on | rayline-cloud / rayline-local | **RR2** | [`RR.json`](./RR.json) | cloud router picks: cloud **or local** | cloud router picks: cloud **or local** | main + subagents | rayline | `rayline claude --config RR.json` |
+| `rayline` | `anthropic` | off | rayline-cloud / rayline-local | **RA1** † | [`RA.json`](./RA.json) | cloud model (via cloud router) | Anthropic (subscription) | — | rayline + Anthropic key | `rayline claude --config RA.json` |
+| `rayline` | `anthropic` | on | rayline-cloud / rayline-local | **RA2** † | [`RA.json`](./RA.json) | cloud router picks: cloud **or local** | Anthropic (subscription) | main | rayline + Anthropic key | `rayline claude --config RA.json` |
+| `rayline` | `local` | off | rayline-cloud / rayline-local | **RL1** | [`RL.json`](./RL.json) | cloud model (via cloud router) | local model | subagents | rayline | `rayline claude --config RL.json` |
+| `rayline` | `local` | on | rayline-cloud / rayline-local | **RL2** | [`RL.json`](./RL.json) | cloud router picks: cloud **or local** | local model | main + subagents | rayline | `rayline claude --config RL.json` |
+| `anthropic` | `rayline` | off | rayline-cloud / rayline-local | **AR1** | [`AR.json`](./AR.json) | Anthropic (subscription) | cloud model (via cloud router) | — | subscription + rayline | `rayline claude --config AR.json` |
+| `anthropic` | `rayline` | on | rayline-cloud / rayline-local | **AR2** | [`AR.json`](./AR.json) | Anthropic (subscription) | cloud router picks: cloud **or local** | subagents | subscription + rayline | `rayline claude --config AR.json` |
 | `anthropic` | `local` | N/A | N/A | **AL** | [`AL.json`](./AL.json) | Anthropic (subscription) | local model | subagents | subscription | `rayline claude --config AL.json` |
-| `local` | `rayline` | off | cloud / local | **LR1** ‡ | [`LR.json`](./LR.json) | local model | cloud model (via cloud router) | main | rayline | `rayline claude --config LR.json` |
-| `local` | `rayline` | on | cloud / local | **LR2** ‡ | [`LR.json`](./LR.json) | local model | cloud router picks: cloud **or local** | main + subagents | rayline | `rayline claude --config LR.json` |
+| `local` | `rayline` | off | rayline-cloud / rayline-local | **LR1** ‡ | [`LR.json`](./LR.json) | local model | cloud model (via cloud router) | main | rayline | `rayline claude --config LR.json` |
+| `local` | `rayline` | on | rayline-cloud / rayline-local | **LR2** ‡ | [`LR.json`](./LR.json) | local model | cloud router picks: cloud **or local** | main + subagents | rayline | `rayline claude --config LR.json` |
 | `local` | `anthropic` | N/A | N/A | **LA** † ‡ | [`LA.json`](./LA.json) | local model | Anthropic (subscription) | main | subscription | `rayline claude --config LA.json` |
 | `local` | `local` | N/A | N/A | **LL** ‡ | [`LL.json`](./LL.json) | local model | local model | main + subagents | none | `rayline claude --config LL.json` |
-| `rayline` | `local` (per-type) | off | cloud / local | **RL\*** | [`RL-per-type.json`](./RL-per-type.json) | cloud model (via cloud router) | `Explore`/`Plan` → local; others → cloud | subagents | rayline | `rayline claude --config RL-per-type.json` |
+| `rayline` | `local` (per-type) | off | rayline-cloud / rayline-local | **RL\*** | [`RL-per-type.json`](./RL-per-type.json) | cloud model (via cloud router) | `Explore`/`Plan` → local; others → cloud | subagents | rayline | `rayline claude --config RL-per-type.json` |
 
 **† pathological — subscription on the subagent side is not expressible.**
 Subagents are the *routed* class and the router cannot forward your Claude
@@ -95,12 +98,13 @@ tool-capable local main is available — the live e2e test
   spawned by the main agent). Can be split per subagent **type** via
   `routes.subagents` (see `RL-per-type.json`).
 - **router** — only meaningful for a class set to `rayline`: which decider runs —
-  `cloud` (the hosted RCR's intelligent ML choice) vs `local` (the on-device LSR's
-  static rules). `N/A` for `anthropic` / `local`.
-- **local-model** — a **sub-knob of `router: cloud`**: may the cloud RCR *redirect*
-  that class to a local model (`on`) or stay cloud-only (`off`). A runtime
+  `rayline-cloud` (the hosted RCR's intelligent ML choice) vs `rayline-local` (the
+  on-device LSR's static rules). The `rayline-` prefix marks it as the *engine*, not
+  the `local`/`anthropic` *provider*. `N/A` for `anthropic` / `local`.
+- **local-model** — a **sub-knob of `router: rayline-cloud`**: may the cloud RCR
+  *redirect* that class to a local model (`on`) or stay cloud-only (`off`). A runtime
   ("may-local") decision, so the `on`/`off` pair shares one config file. **`N/A`
-  when `router: local`** (the on-device router already routes locally) and for
+  when `router: rayline-local`** (the on-device router already routes locally) and for
   `anthropic` / `local`.
 
 ### Toggling may-local (the `1` ↔ `2` modes)
