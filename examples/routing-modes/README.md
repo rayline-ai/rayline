@@ -33,19 +33,20 @@ why the `--local-model` and `--router` columns exist and are `N/A` for
 - **`--router`** — *which rayline decider runs*: `cloud` = the hosted **RCR**
   (intelligent ML pick) vs `local` = the on-device **LSR** (your static rules).
   Two genuinely different deciders.
-- **`--local-model`** — *may that decider use a local model*: `on` = may redirect
-  to local, `off` = cloud only.
+- **`--local-model`** — **only under `router: cloud`**: may the cloud RCR
+  **redirect** that class to a local model (`on`) or stay cloud-only (`off`). It is
+  a *sub-knob of `cloud`* — **`N/A` when `router: local`** (the on-device router
+  already routes locally itself) and N/A for `anthropic`/`local`.
 
-A `rayline` class is fully specified only by **provider `rayline` + `--router` +
-`--local-model`** — these four behaviours are all distinct, so the provider letter
-alone underspecifies it (the two are required, not redundant):
+The two sub-axes **nest** — `rayline` → `router` (cloud|local) → *only under cloud* →
+`local-model` (on|off) — so a `rayline` class has **three** distinct behaviours, not
+four (the provider letter alone underspecifies it; these are required, not redundant):
 
 | `--router` | `--local-model` | a `rayline` class then… |
 |---|---|---|
-| cloud | off | RCR picks a **cloud** model |
-| cloud | on | RCR picks cloud **or redirects to local** (may-local) |
-| local | off | **your static (on-device) rules** decide, cloud only |
-| local | on | your static rules decide, **may use local** |
+| cloud | off | RCR serves a **cloud** model only |
+| cloud | on | RCR may **redirect to a local model** (may-local) |
+| local | — (N/A) | the on-device **LSR routes it itself** |
 
 How they are surfaced today (vs the intent above): `--router` is currently *derived*
 from the endpoint a route targets, and `--local-model` is the account-level
@@ -93,13 +94,14 @@ tool-capable local main is available — the live e2e test
 - **subagent** — provider for **subagents** (Task-tool agents like `Explore`,
   spawned by the main agent). Can be split per subagent **type** via
   `routes.subagents` (see `RL-per-type.json`).
-- **local-model** — only meaningful for a class set to `rayline`: whether the
-  cloud router *may* serve that class from a local model (`on`) or cloud only
-  (`off`). This is a runtime cloud-router ("may-local") decision, so the `on`/`off`
-  pair shares one config file. `N/A` for `anthropic` / `local`.
-- **router** — only meaningful for a class set to `rayline`: which logic picks
-  the model — `cloud` (the cloud router's intelligent choice) vs `local` (your
-  on-device static rules). `N/A` for `anthropic` / `local`.
+- **router** — only meaningful for a class set to `rayline`: which decider runs —
+  `cloud` (the hosted RCR's intelligent ML choice) vs `local` (the on-device LSR's
+  static rules). `N/A` for `anthropic` / `local`.
+- **local-model** — a **sub-knob of `router: cloud`**: may the cloud RCR *redirect*
+  that class to a local model (`on`) or stay cloud-only (`off`). A runtime
+  ("may-local") decision, so the `on`/`off` pair shares one config file. **`N/A`
+  when `router: local`** (the on-device router already routes locally) and for
+  `anthropic` / `local`.
 
 ### Toggling may-local (the `1` ↔ `2` modes)
 
