@@ -61,6 +61,7 @@ const DECISION_PLANE_ENV: &str = "RAYLINE_DECISION_PLANE";
 const LOCAL_ROUTER_PORT_ENV: &str = "RAYLINE_LOCAL_ROUTER_PORT";
 const LOCAL_ROUTER_CONFIG_PATH_ENV: &str = "RAYLINE_ROUTER_CONFIG";
 const LOCAL_MODEL_ID_ENV: &str = "RAYLINE_LOCAL_MODEL_ID";
+const NO_LOCAL_MODEL_ENV: &str = "RAYLINE_NO_LOCAL_MODEL";
 const ADAPTER_UPSTREAM_MODEL_ENV: &str = "RAYLINE_ADAPTER_UPSTREAM_MODEL";
 const ADAPTER_UPSTREAM_URL_ENV: &str = "RAYLINE_ADAPTER_UPSTREAM_URL";
 const DATA_DIR_ENV: &str = "RAYLINE_DATA_DIR";
@@ -234,6 +235,13 @@ struct ServeArgs {
     /// Local metrics-control listen port for `rayline router top`.
     #[arg(long, env = METRICS_PORT_ENV, default_value_t = rayline_metrics::DEFAULT_METRICS_PORT, hide = true)]
     metrics_port: u16,
+
+    /// Run config-only: do not download/spawn a bundled llama-server and do not
+    /// require `--upstream-url`/`--model-repo`. Used when the static router config
+    /// routes only to named endpoints (no `"local"` route). The local router still
+    /// serves; local availability is advertised as unavailable.
+    #[arg(long, env = NO_LOCAL_MODEL_ENV)]
+    no_local_model: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -465,6 +473,17 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             upstream_model.unwrap_or("?")
         );
         (target, None, true, None)
+    } else if args.no_local_model {
+        // Config-only mode: no bundled model. The static router forwards to its
+        // named endpoints directly (the adapter / `"local"` route is unused), so
+        // advertise local-unavailable and point the adapter at a dead target.
+        info!("config-only mode — no bundled local model; routing via configured endpoints");
+        (
+            "http://127.0.0.1:1".to_owned(),
+            Some(Arc::new(AtomicBool::new(false))),
+            false,
+            None,
+        )
     } else {
         // 1. Resolve / download GGUF. The bundled-llama path needs the GGUF
         // coordinates; they are optional on the CLI only so custom mode can

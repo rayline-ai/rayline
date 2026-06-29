@@ -111,11 +111,23 @@ pub enum EndpointProtocol {
     OpenAIChat,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouteTarget {
     pub endpoint: String,
     #[serde(default)]
     pub model: String,
+    /// v2 (`rayline`-only): which rayline decider runs — `"rayline-cloud"` (the
+    /// hosted RCR) or `"rayline-local"` (the on-device LSR). `None` defaults to
+    /// `rayline-cloud` behavior. Ignored for non-`rayline` endpoints. The LSR's
+    /// own routing does not read this; the CLI inspects it to wire the run.
+    #[serde(default)]
+    pub router: Option<String>,
+    /// v2 (`router: rayline-cloud` only): local model ids the hosted RCR may
+    /// redirect this class to ("may-local"). A non-empty list turns may-local ON
+    /// and advertises `local_models[0]`; today only the first entry is used.
+    /// `N/A` (ignored) for `rayline-local` and for `anthropic`/`local` endpoints.
+    #[serde(default)]
+    pub local_models: Vec<String>,
 }
 
 impl RouteTarget {
@@ -123,6 +135,7 @@ impl RouteTarget {
         Self {
             endpoint: "local".to_owned(),
             model: model.into(),
+            ..Default::default()
         }
     }
 }
@@ -360,11 +373,13 @@ fn default_config(local_model_id: &str) -> RouterConfig {
             main: Some(RouteTarget {
                 endpoint: "anthropic".to_owned(),
                 model: "claude-sonnet-4-6".to_owned(),
+                ..Default::default()
             }),
             subagent: Some(RouteTarget::local(local_model_id)),
             default: Some(RouteTarget {
                 endpoint: "anthropic".to_owned(),
                 model: "claude-sonnet-4-6".to_owned(),
+                ..Default::default()
             }),
             model_routes: HashMap::from([
                 (
@@ -391,7 +406,11 @@ fn apply_env_overrides(config: &mut RouterConfig) {
                 .map(|route| route.endpoint.clone())
                 .unwrap_or_else(|| "anthropic".to_owned())
         });
-        config.routes.main = Some(RouteTarget { endpoint, model });
+        config.routes.main = Some(RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        });
     } else if let Ok(endpoint) = std::env::var(MAIN_ENDPOINT_ENV) {
         if let Some(route) = config.routes.main.as_mut() {
             route.endpoint = endpoint;
@@ -407,7 +426,11 @@ fn apply_env_overrides(config: &mut RouterConfig) {
                 .map(|route| route.endpoint.clone())
                 .unwrap_or_else(|| "local".to_owned())
         });
-        config.routes.subagent = Some(RouteTarget { endpoint, model });
+        config.routes.subagent = Some(RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        });
     } else if let Ok(endpoint) = std::env::var(SUBAGENT_ENDPOINT_ENV) {
         if let Some(route) = config.routes.subagent.as_mut() {
             route.endpoint = endpoint;
@@ -695,7 +718,11 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
             .unwrap_or_else(default_main_route)
     } else if let Some((endpoint, model)) = route_direct_model(&state.config, &requested_model) {
         policy = "direct-model".to_owned();
-        RouteTarget { endpoint, model }
+        RouteTarget {
+            endpoint,
+            model,
+            ..Default::default()
+        }
     } else {
         state
             .config
@@ -799,6 +826,7 @@ fn default_main_route() -> RouteTarget {
     RouteTarget {
         endpoint: "anthropic".to_owned(),
         model: "claude-sonnet-4-6".to_owned(),
+        ..Default::default()
     }
 }
 
@@ -2509,6 +2537,157 @@ mod tests {
         }
     }
 
+    /// End-to-end: each `examples/routing-modes/*.json` config (the `--config`
+    /// fixtures) must route the MAIN agent and SUBAGENTS to the endpoints/models it
+    /// declares. A `subscription` main is stripped first (the proxy handles it),
+    /// mirroring the CLI's `materialize_for_local_router`.
+    #[test]
+    fn config_mode_examples_route_main_and_subagents() {
+        fn load_state(raw: &str) -> AppState {
+            let mut cfg: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let main_passthrough = cfg["routes"]
+                .get("main")
+                .and_then(|main| main.get("endpoint"))
+                .and_then(serde_json::Value::as_str)
+                == Some("subscription");
+            if main_passthrough {
+                cfg["routes"].as_object_mut().unwrap().remove("main");
+            }
+            let path = std::env::temp_dir().join(format!(
+                "rl-mode-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let opts = LocalRouterOptions {
+                local_model_id: "local-model".to_owned(),
+                config_path: Some(path.clone()),
+                ..LocalRouterOptions::default()
+            };
+            let config = load_config(&opts).unwrap();
+            let _ = fs::remove_file(path);
+            state(config)
+        }
+        fn main_route(st: &AppState) -> (RouteSelection, String) {
+            let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+            let decision = select_route(st, &HeaderMap::new(), &body);
+            (decision.target, decision.selected_model)
+        }
+        fn sub_route(st: &AppState, agent_type: &str) -> (RouteSelection, String) {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CLAUDE_CODE_AGENT_ID_HEADER,
+                HeaderValue::from_static("abc123"),
+            );
+            headers.insert(
+                RAYLINE_AGENT_TYPE_HEADER,
+                HeaderValue::from_str(agent_type).unwrap(),
+            );
+            let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+            let decision = select_route(st, &headers, &body);
+            (decision.target, decision.selected_model)
+        }
+        fn ep(id: &str) -> RouteSelection {
+            RouteSelection::Endpoint(id.to_owned())
+        }
+        let cloud = || (ep("rayline-cloud"), "rayline-router".to_owned());
+        let ollama_def = || (ep("ollama"), "qwen3.5:9b".to_owned());
+        let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
+
+        // main routed + subagent routed (the routes the local router executes):
+        let st = load_state(include_str!("../../../examples/routing-modes/RRC.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        // RRL: `router: rayline-local` makes the LSR the router; it forwards to the
+        // `rayline-cloud` endpoint but pins each class's `model` on-device instead of
+        // sending the `rayline-router` virtual model for the RCR to pick. Covers all
+        // three routing slots — main, default subagent, and a per-type override —
+        // each a distinct model, proving the LSR (not the RCR) is choosing.
+        let st = load_state(include_str!("../../../examples/routing-modes/RRL.json"));
+        assert_eq!(main_route(&st), (ep("rayline-cloud"), "GLM-5.2".to_owned()));
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned())
+        );
+        assert_eq!(
+            sub_route(&st, "Explore"),
+            (ep("rayline-cloud"), "deepseek/deepseek-v4-flash".to_owned())
+        );
+
+        // RRCL: `router`/`local_models` are may-local advertisement metadata; they do
+        // not change the LSR's routing — main + subagents still resolve to cloud.
+        let st = load_state(include_str!("../../../examples/routing-modes/RRCL.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RLC.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LRC.json"));
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LL.json"));
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RAC.json"));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LA.json"));
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        // subscription main (stripped) → assert subagents only:
+        let st = load_state(include_str!("../../../examples/routing-modes/ARC.json"));
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/AL.json"));
+        assert_eq!(sub_route(&st, "reviewer"), ollama_def());
+
+        // per-type: Explore/Plan → distinct local models, anything else → cloud catch-all:
+        let st = load_state(include_str!(
+            "../../../examples/routing-modes/RLC-per-type.json"
+        ));
+        assert_eq!(main_route(&st), cloud());
+        assert_eq!(
+            sub_route(&st, "Explore"),
+            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
+        );
+        assert_eq!(sub_route(&st, "Plan"), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
+
+        // router: rayline-local on the rayline class (RAL/RLL/ARL/LRL) — the LSR
+        // routes that class to rayline-cloud and pins its model; the other class is
+        // anthropic (API key) / ollama / subscription, per the JSON.
+        let glm = || (ep("rayline-cloud"), "GLM-5.2".to_owned());
+        let ds_pro = || (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned());
+        let st = load_state(include_str!("../../../examples/routing-modes/RAL.json"));
+        assert_eq!(main_route(&st), glm());
+        assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        let st = load_state(include_str!("../../../examples/routing-modes/RLL.json"));
+        assert_eq!(main_route(&st), glm());
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
+        );
+
+        let st = load_state(include_str!("../../../examples/routing-modes/LRL.json"));
+        assert_eq!(main_route(&st), ollama_def());
+        assert_eq!(sub_route(&st, "reviewer"), ds_pro());
+
+        // ARL: subscription main (stripped) → assert the rayline-local subagent only.
+        let st = load_state(include_str!("../../../examples/routing-modes/ARL.json"));
+        assert_eq!(sub_route(&st, "reviewer"), ds_pro());
+    }
+
     #[test]
     fn explicit_missing_config_path_errors() {
         let path = std::env::temp_dir().join(format!(
@@ -2583,6 +2762,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);
@@ -2615,6 +2795,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);
@@ -2648,6 +2829,7 @@ mod tests {
             RouteTarget {
                 endpoint: "openrouter".to_owned(),
                 model: "openai/gpt-5.2".to_owned(),
+                ..Default::default()
             },
         );
         let state = state(config);

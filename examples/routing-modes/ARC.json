@@ -1,0 +1,23 @@
+{
+  "endpoints": [
+    {
+      "id": "rayline-cloud",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "auth": "api_key",
+      "models": [
+        "rayline-router"
+      ]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "subscription"
+    },
+    "subagent": {
+      "endpoint": "rayline-cloud",
+      "model": "rayline-router"
+    }
+  }
+}

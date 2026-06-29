@@ -1,0 +1,25 @@
+{
+  "endpoints": [
+    {
+      "id": "rayline-cloud",
+      "protocol": "anthropic_messages",
+      "base_url": "https://api.rayline.ai",
+      "api_key_env": "RAYLINE_ROUTER_API_KEY",
+      "auth": "api_key",
+      "models": [
+        "rayline-router",
+        "deepseek/deepseek-v4-pro"
+      ]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "subscription"
+    },
+    "subagent": {
+      "endpoint": "rayline-cloud",
+      "model": "deepseek/deepseek-v4-pro",
+      "router": "rayline-local"
+    }
+  }
+}
