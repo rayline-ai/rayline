@@ -462,6 +462,9 @@ mod tests {
             ("RLL.json", false, true, true),
             ("ARL.json", true, true, true),
             ("LRL.json", false, true, true),
+            // LRCL: main local engages the LSR; the rayline-cloud subagent declares
+            // local_models, and the LSR sends Explore subagents local on-device.
+            ("LRCL.json", false, true, true),
             ("ARC.json", true, false, true),
             ("AL.json", true, true, false),
             ("LRC.json", false, true, true),
