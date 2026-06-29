@@ -69,7 +69,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Supported | Config |
 |---|---|---|---|---|---|---|---|:--:|---|
 | **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ Y | [`RRC.json`](./RRC.json) |
-| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | RCR may send a subagent → local | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud model (RCR may send a subagent → local) | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
 | **RACL** ² | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
@@ -78,11 +78,11 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **RLCL** ² | `rayline` | `local` | rayline-cloud | on | cloud (RCR) | local model | rayline | ❌ N | — (may-local) |
 | **RLL** | `rayline` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ Y | [`RLL.json`](./RLL.json) |
 | **ARC** | `anthropic` | `rayline` | rayline-cloud | off | Anthropic (subscription) | cloud (RCR) | subscription + rayline | ✅ Y | [`ARC.json`](./ARC.json) |
-| **ARCL** § | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | RCR may send a subagent → local | subscription + rayline | ✅ Y | [`ARCL.json`](./ARCL.json) |
+| **ARCL** § | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | cloud model (RCR may send a subagent → local) | subscription + rayline | ✅ Y | [`ARCL.json`](./ARCL.json) |
 | **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | cloud model (via local router) | subscription + rayline | ✅ Y | [`ARL.json`](./ARL.json) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ Y | [`AL.json`](./AL.json) |
 | **LRC** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | 🟡 R | [`LRC.json`](./LRC.json) |
-| **LRCL** ³ | `local` | `rayline` | rayline-cloud | on | local model | RCR may send a subagent → local | rayline | ❌ N | — (may-local) |
+| **LRCL** ³ | `local` | `rayline` | rayline-cloud | on | local model | cloud model (RCR may send a subagent → local) | rayline | ❌ N | — (may-local) |
 | **LRL** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | 🟡 R | [`LRL.json`](./LRL.json) |
 | **LA** ¹ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | 🟡 R | [`LA.json`](./LA.json) |
 | **LL** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | 🟡 R | [`LL.json`](./LL.json) |
@@ -110,13 +110,14 @@ limit, not a routing bug, and it applies equally to the existing
 model would spawn subagents and lift all four to ✅ Y. The live e2e test
 (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
 
-**² ❌ N — may-local is inert (`RACL`/`RLCL`).** Both ask for may-local (`CL`) on a
-subagent that is **statically pinned to a non-cloud provider** — Anthropic API key
-(`RACL`) or a local model (`RLCL`). There is no cloud-routed subagent for the RCR
-to redirect to local, so the `CL` flag does nothing: `RACL` ≡ `RAC` and
-`RLCL` ≡ `RLC`. They aren't shipped as distinct modes, to avoid implying a behavior
-that doesn't exist. (Contrast `RRCL`/`ARCL`, where the subagent **is** cloud-routed,
-so may-local applies and they ship — see §.)
+**² ❌ N — may-local is inert (`RACL`/`RLCL`).** may-local (`CL`) only ever redirects
+**cloud-routed `Explore` subagents** to local — never the main agent. In `RACL`/`RLCL`
+the only `rayline-cloud` class is the **main** (the subagent is Anthropic in `RACL`,
+already local in `RLCL`), so the `CL` lands on the main, where it has no effect — and
+there is no cloud-routed subagent to carry it instead. The flag does nothing:
+`RACL` ≡ `RAC` and `RLCL` ≡ `RLC`. They aren't shipped as distinct modes, to avoid
+implying a behavior that doesn't exist. (Contrast `RRCL`/`ARCL`, whose subagent
+**is** cloud-routed, so may-local applies and they ship — see §.)
 
 **³ ❌ N — may-local handoff not built (`LRCL`).** Different reason from ²: here the
 **main** is local, which engages the **on-device** router for the whole run. Making
@@ -161,9 +162,9 @@ is exercised only by the ignored live test.
   The local main runs and works for direct work, but current small local models
   can't drive Claude Code's `Task` tool, so **no subagents spawn** — see ¹.
 - **❌ N** — a `rayline`-only sub-axis isn't wired yet, for two distinct reasons:
-  - **may-local is inert** when the subagent is statically pinned to a non-cloud
-    provider (`RACL` ≡ `RAC`, `RLCL` ≡ `RLC`) — see ². (`RRCL`/`ARCL` are
-    cloud-routed, so may-local applies and they ship.)
+  - **may-local is inert** — the `CL` lands on the main agent (the only `rayline-cloud`
+    class), where may-local never applies (`RACL` ≡ `RAC`, `RLCL` ≡ `RLC`) — see ².
+    (`RRCL`/`ARCL` are cloud-routed on the subagent, so may-local applies and they ship.)
   - **may-local handoff not built** for a local main (`LRCL`) — see ³.
 
 ## Files ↔ modes
