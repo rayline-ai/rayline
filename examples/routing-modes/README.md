@@ -72,10 +72,10 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud model (RCR may send a subagent → local) | rayline | ✅ Y | [`RRCL.json`](./RRCL.json) |
 | **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ Y | [`RRL.json`](./RRL.json) |
 | **RAC** † | `rayline` | `anthropic` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAC.json`](./RAC.json) |
-| **RACL** ² | `rayline` | `anthropic` | rayline-cloud | on | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
+| **RACL** ² | `rayline` | `anthropic` | rayline-cloud | on | cloud model (RCR may send a agent → local) | Anthropic (API key) | rayline + Anthropic key | ❌ N | — (may-local) |
 | **RAL** † | `rayline` | `anthropic` | rayline-local | N/A | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ Y | [`RAL.json`](./RAL.json) |
 | **RLC** | `rayline` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ Y | [`RLC.json`](./RLC.json) |
-| **RLCL** ² | `rayline` | `local` | rayline-cloud | on | cloud (RCR) | local model | rayline | ❌ N | — (may-local) |
+| **RLCL** ² | `rayline` | `local` | rayline-cloud | on | cloud model (RCR may send a agent → local) | local model | rayline | ❌ N | — (may-local) |
 | **RLL** | `rayline` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ Y | [`RLL.json`](./RLL.json) |
 | **ARC** | `anthropic` | `rayline` | rayline-cloud | off | Anthropic (subscription) | cloud (RCR) | subscription + rayline | ✅ Y | [`ARC.json`](./ARC.json) |
 | **ARCL** § | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | cloud model (RCR may send a subagent → local) | subscription + rayline | ✅ Y | [`ARCL.json`](./ARCL.json) |
