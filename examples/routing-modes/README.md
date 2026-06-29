@@ -21,6 +21,37 @@ the *intent*; they are not CLI flags today — the one real surface is the
 `CLI command` column (`rayline claude --config <file>`). Configs live in
 `./examples/routing-modes/`.
 
+### `rayline` is both a router *and* a provider
+
+`anthropic` and `local` are fixed **destinations** — the provider *is* the
+endpoint, so there is nothing more to decide. **`rayline` is different: it is a
+routing *system*, not a destination.** Choosing `rayline` for a class therefore
+opens **two independent sub-axes that apply only to `rayline`** — which is exactly
+why the `--local-model` and `--router` columns exist and are `N/A` for
+`anthropic` / `local`:
+
+- **`--router`** — *which rayline decider runs*: `cloud` = the hosted **RCR**
+  (intelligent ML pick) vs `local` = the on-device **LSR** (your static rules).
+  Two genuinely different deciders.
+- **`--local-model`** — *may that decider use a local model*: `on` = may redirect
+  to local, `off` = cloud only.
+
+A `rayline` class is fully specified only by **provider `rayline` + `--router` +
+`--local-model`** — these four behaviours are all distinct, so the provider letter
+alone underspecifies it (the two are required, not redundant):
+
+| `--router` | `--local-model` | a `rayline` class then… |
+|---|---|---|
+| cloud | off | RCR picks a **cloud** model |
+| cloud | on | RCR picks cloud **or redirects to local** (may-local) |
+| local | off | **your static (on-device) rules** decide, cloud only |
+| local | on | your static rules decide, **may use local** |
+
+How they are surfaced today (vs the intent above): `--router` is currently *derived*
+from the endpoint a route targets, and `--local-model` is the account-level
+`rayline local on/off` toggle (see [Toggling may-local](#toggling-may-local-the-1--2-modes)) —
+not yet first-class per-class controls.
+
 | agent | subagent | local-model | router | Mode | Config | Main agent → | Subagents → | Local model | Auth | CLI command |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `rayline` | `rayline` | off | cloud / local | **RR1** | [`RR.json`](./RR.json) | cloud model (via cloud router) | cloud model (via cloud router) | — | rayline | `rayline claude --config RR.json` |
