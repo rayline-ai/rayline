@@ -82,7 +82,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | cloud model (via local router) | subscription + rayline | ✅ Y | [`ARL.json`](./ARL.json) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ Y | [`AL.json`](./AL.json) |
 | **LRC** ‡ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ Y | [`LRC.json`](./LRC.json) |
-| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | subagents → local (on-device, per `local_models`) | rayline | ✅ Y | [`LRCL.json`](./LRCL.json) |
+| **LRCL** ‡ | `local` | `rayline` | rayline-cloud | on | local model | RCR may send a subagent → local | rayline | ❌ N | — (may-local) |
 | **LRL** ‡ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | ✅ Y | [`LRL.json`](./LRL.json) |
 | **LA** † ‡ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | ✅ Y | [`LA.json`](./LA.json) |
 | **LL** ‡ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ Y | [`LL.json`](./LL.json) |
@@ -141,23 +141,15 @@ combined with the same advertisement — tracked separately.
   All `router: rayline-local` modes (`RRL`/`RAL`/`RLL`/`ARL`/`LRL`) are supported:
   `router: rayline-local` is **static LSR routing** — the JSON is the decider (the
   LSR routes each class per the config and pins its `model`), no ML policy needed.
-  **`LRCL`** is supported too: when a `rayline-cloud` **subagent** route carries
-  `local_models` *and* the run is LSR-routed (main is local), the LSR sends those
-  subagents to the local model on-device (`policy=subagent:may-local`). Which
-  subagents is **config-driven** — `local_models` on `routes.subagent` covers all
-  subagents; on a `routes.subagents.<type>` entry covers just that type (no
-  hard-coded agent type). On-device and deterministic, unlike the hosted RCR's
-  discretionary, Explore-only redirect for cloud-routed `RRCL`/`ARCL`.
-- **❌ N** — by design, not a gap:
-  - **may-local on the `main` (agent) class** (`RACL`/`RLCL`) — `--local-model=on`
-    is on the *agent*, but the main agent never goes local (may-local is
-    Explore-subagents-only). So the `CL` distinction is inert — these behave exactly
-    like `RAC`/`RLC`. Unsupported-by-design until main-agent may-local exists
-    (hosted-side).
+- **❌ N** — needs a `rayline`-only sub-axis not yet wired:
+  - **may-local when a class is statically local/anthropic** (`RACL`/`RLCL`/`LRCL`)
+    — these route a class to a non-cloud endpoint, engaging the on-device router,
+    where may-local advertisement is not yet wired. (`RRCL`/`ARCL` are cloud-only
+    routed, so they already work.)
 
 ## Files ↔ modes
 
-The supported modes ship as **17 config files** (the `❌` modes have none yet):
+The supported modes ship as **16 config files** (the `❌` modes have none yet):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
@@ -173,7 +165,6 @@ The supported modes ship as **17 config files** (the `❌` modes have none yet):
 | [`ARL.json`](./ARL.json) | subscription (passthrough) | rayline-cloud, `router: rayline-local` (model pinned) | ARL |
 | [`AL.json`](./AL.json) | subscription (passthrough) | ollama (local) | AL |
 | [`LRC.json`](./LRC.json) | ollama (local) | rayline-cloud | LRC |
-| [`LRCL.json`](./LRCL.json) | ollama (local) | rayline-cloud (+ `local_models` → subagents local on-device) | LRCL |
 | [`LRL.json`](./LRL.json) | ollama (local) | rayline-cloud, `router: rayline-local` (model pinned) | LRL |
 | [`LA.json`](./LA.json) | ollama (local) | anthropic (API key) | LA |
 | [`LL.json`](./LL.json) | ollama (local) | ollama (local) | LL |

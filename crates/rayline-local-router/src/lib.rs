@@ -733,26 +733,6 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
             .unwrap_or_else(default_main_route)
     };
 
-    // LRCL — may-local under the on-device router. When the LSR routes a subagent
-    // whose matched route declares `local_models` (subagent `--local-model=on`),
-    // send that turn to the declared local model on-device. Which subagents this
-    // covers is **config-driven**: put `local_models` on `routes.subagent` (the
-    // default, i.e. all subagents) or on a `routes.subagents.<type>` entry (just
-    // that type) — the LSR honors whatever route matched, no hard-coded agent type.
-    // (Decided on-device because the LSR is the router for this config, e.g. main
-    // routes to a local model.)
-    if is_subagent && !route.local_models.is_empty() {
-        if let Some((endpoint_id, model)) = local_model_endpoint(&state.config, &route.local_models)
-        {
-            policy.push_str(":may-local");
-            route = RouteTarget {
-                endpoint: endpoint_id,
-                model,
-                ..Default::default()
-            };
-        }
-    }
-
     if route.endpoint == "local" && !local_available(headers) {
         policy.push_str(":local-unavailable-fallback");
         route = state
@@ -857,20 +837,6 @@ fn route_direct_model(config: &RouterConfig, requested_model: &str) -> Option<(S
         }
     }
     None
-}
-
-/// Resolve the (endpoint id, model) that serves the first of `local_models` — the
-/// local target a may-local subagent route redirects exploration subagents to.
-fn local_model_endpoint(
-    config: &RouterConfig,
-    local_models: &[String],
-) -> Option<(String, String)> {
-    let model = local_models.first()?;
-    let endpoint = config
-        .endpoints
-        .iter()
-        .find(|endpoint| endpoint.models.iter().any(|m| m == model))?;
-    Some((endpoint.id.clone(), model.clone()))
 }
 
 fn local_available(headers: &HeaderMap) -> bool {
@@ -2652,17 +2618,11 @@ mod tests {
             (ep("rayline-cloud"), "deepseek/deepseek-v4-flash".to_owned())
         );
 
-        // RRCL is cloud-path in production (config_needs_local_router=false → the LSR
-        // is not engaged; the proxy advertises may-local to the hosted RCR). Loaded
-        // directly into the LSR here for completeness: main stays cloud, and the
-        // subagent's `local_models` triggers the same on-device may-local override as
-        // LRCL — harmless, since the LSR never executes RRCL in production.
+        // RRCL: `router`/`local_models` are may-local advertisement metadata; they do
+        // not change the LSR's routing — main + subagents still resolve to cloud.
         let st = load_state(include_str!("../../../examples/routing-modes/RRCL.json"));
         assert_eq!(main_route(&st), cloud());
-        assert_eq!(
-            sub_route(&st, "reviewer"),
-            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
-        );
+        assert_eq!(sub_route(&st, "reviewer"), cloud());
 
         let st = load_state(include_str!("../../../examples/routing-modes/RLC.json"));
         assert_eq!(main_route(&st), cloud());
@@ -2726,15 +2686,6 @@ mod tests {
         // ARL: subscription main (stripped) → assert the rayline-local subagent only.
         let st = load_state(include_str!("../../../examples/routing-modes/ARL.json"));
         assert_eq!(sub_route(&st, "reviewer"), ds_pro());
-
-        // LRCL — may-local under the LSR: main local; the *default* subagent route
-        // carries `local_models`, so the LSR sends subagents to local on-device
-        // (config-driven — any subagent matching that route, not a hard-coded type).
-        let st = load_state(include_str!("../../../examples/routing-modes/LRCL.json"));
-        let qwen_coder = || (ep("ollama"), "qwen2.5-coder:7b".to_owned());
-        assert_eq!(main_route(&st), ollama_def());
-        assert_eq!(sub_route(&st, "Explore"), qwen_coder());
-        assert_eq!(sub_route(&st, "reviewer"), qwen_coder());
     }
 
     #[test]
