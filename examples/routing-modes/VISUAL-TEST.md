@@ -1,7 +1,7 @@
 # Routing-mode verification runbook (for an agent or a human)
 
 This is a self-contained runbook for **you (the agent) to execute**: run each
-supported `--config` routing mode end-to-end with `visual-verify.sh`, **one at a
+supported `--config` routing mode end-to-end with `visual-test.sh`, **one at a
 time**, observe the routing, judge it against the criteria here, and write a report.
 Run modes individually — do **not** wrap them in one long script: local-main modes
 hang, and a per-mode loop lets you recover and continue.
@@ -48,7 +48,7 @@ ARCL AL LRC LRL LA LL RLL ARL` (skip `RACL RLCL LRCL`, see §5) — do exactly t
 # a) clean slate so `rayline top` reflects only this mode (each run restarts rld)
 pkill -9 -f "rld serve|rld proxy"; sleep 1
 # b) run the mode's demo headless, with a ~100s timeout (local-main modes hang — expected)
-DEMO_HEADLESS=1 RAYLINE_BIN="$RB" ./examples/routing-modes/visual-verify.sh "$MODE" "$PROMPT" >/tmp/v-$MODE.out 2>&1 &
+DEMO_HEADLESS=1 RAYLINE_BIN="$RB" ./examples/routing-modes/visual-test.sh "$MODE" "$PROMPT" >/tmp/v-$MODE.out 2>&1 &
 P=$!; for i in $(seq 1 20); do sleep 5; kill -0 $P 2>/dev/null || break; done; kill -9 $P 2>/dev/null
 # c) read what actually routed (do NOT trust the demo's own summary if it was killed):
 "$RB" top --json --all     # per request: agent_type, target, selected_model, policy

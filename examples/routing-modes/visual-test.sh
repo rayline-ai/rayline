@@ -10,7 +10,7 @@
 #                               verification.
 #
 # Usage:
-#   ./visual-verify.sh [MODE] [PROMPT]
+#   ./visual-test.sh [MODE] [PROMPT]
 #     MODE    one of the configs in this dir (default: RRC), e.g. RRC RLC ARCL RRL LL AL ...
 #     PROMPT  the prompt sent to Claude Code in print mode; overrides the default.
 #             The default spawns subagents so subagent routing — may-local
