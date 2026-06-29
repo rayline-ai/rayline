@@ -114,7 +114,7 @@ model would spawn subagents and lift all four to ✅ Y. The live e2e test
 subagent that is **statically pinned to a non-cloud provider** — Anthropic API key
 (`RACL`) or a local model (`RLCL`). There is no cloud-routed subagent for the RCR
 to redirect to local, so the `CL` flag does nothing: `RACL` ≡ `RAC` and
-`RLCL` ≡ `RLC`. We don't ship them as distinct modes rather than imply a behavior
+`RLCL` ≡ `RLC`. They aren't shipped as distinct modes, to avoid implying a behavior
 that doesn't exist. (Contrast `RRCL`/`ARCL`, where the subagent **is** cloud-routed,
 so may-local applies and they ship — see §.)
 
@@ -122,8 +122,7 @@ so may-local applies and they ship — see §.)
 **main** is local, which engages the **on-device** router for the whole run. Making
 the cloud subagent honor may-local would require the on-device LSR to advertise the
 local model and **defer the decision back to the hosted RCR** (a 307 handoff) —
-that path isn't implemented. The naive on-device shortcut collapsed to `LL`
-(everything local) and was reverted.
+that path isn't implemented, so `LRCL` is not shipped as a distinct mode.
 
 **§ may-local from config — custom-endpoint scope + hosted decision.**
 `RRCL` wires the **client** contract from config: a `rayline-cloud` route carrying
@@ -148,9 +147,7 @@ task → adapter forwards to `http://<endpoint>/v1/messages` and `rayline top` s
 **`ARCL`** works the same way (main passes through to the subscription; the cloud
 subagent advertises may-local) and is likewise verified on-device. The
 advertisement + redirect *plumbing* is hermetically tested; the end-to-end redirect
-is exercised only by the ignored live test. The remaining `*CL` modes
-(`RACL`/`RLCL`/`LRCL`) reuse this once their non-may-local base (`RAC`/`RLC`/…) is
-combined with the same advertisement — tracked separately.
+is exercised only by the ignored live test.
 
 ### What "Supported" means
 
@@ -228,7 +225,7 @@ Real `EndpointConfig` fields only: `id`, `protocol`
 > Note: `routes.subagent` (singular) is the subagent **default**;
 > `routes.subagents` (the map) is **only** for per-type overrides.
 
-### `rayline`-only route fields (v2)
+### `rayline`-only route fields
 
 A route targeting the `rayline` cloud endpoint accepts two optional fields:
 
