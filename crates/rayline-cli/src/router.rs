@@ -34,6 +34,8 @@ const PROXIED_TRAFFIC_POLICY: &str = "selective_passthrough_path";
 pub const PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS: &str = "selective-subagents";
 pub const DECISION_PLANE_HOSTED: &str = "hosted";
 pub const DECISION_PLANE_LOCAL: &str = "local";
+pub const ROUTER_API_MODE_ANTHROPIC: &str = "anthropic";
+pub const ROUTER_API_MODE_CODEX: &str = "codex";
 
 fn daemon_name() -> &'static str {
     crate::DAEMON_BIN
@@ -128,6 +130,10 @@ pub struct RouterStopRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterStartCliRequest {
+    /// Inbound API surface to expose for user-facing clients. `anthropic`
+    /// preserves the transparent Claude proxy startup; `codex` starts the same
+    /// local router without the proxy and expects clients to use /v1/responses.
+    pub api_mode: String,
     /// Proxy routing mode: `PROXY_ROUTING_MODE_ALL` or
     /// `PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS`. Ignored when `config_path` is set
     /// (the scope is then derived from the config's `routes.main`).
@@ -136,6 +142,9 @@ pub struct RouterStartCliRequest {
     /// headless/agent use. When set, the daemon runs config-driven (decision plane
     /// local, scope from `routes.main`).
     pub config_path: Option<PathBuf>,
+    /// Codex provider auth behavior. `Auto` mirrors `rayline codex`: subscription
+    /// passthrough when no config is supplied, no client auth for explicit configs.
+    pub codex_auth_mode: crate::codex::CodexAuthMode,
     pub root_env_explicit: bool,
 }
 
@@ -1594,7 +1603,13 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     let bin_path = resolve_rld_bin(&home)?;
     let mut start_request = RouterStartRequest::local_router_defaults(request.root_env_explicit);
-    start_request.enable_proxy = true;
+    let codex_mode = request.api_mode == ROUTER_API_MODE_CODEX;
+    let codex_subscription_auth = codex_mode
+        && request
+            .codex_auth_mode
+            .effective_for_run(request.config_path.as_ref())
+            == crate::codex::EffectiveCodexAuthMode::Subscription;
+    start_request.enable_proxy = !codex_mode;
 
     // v2: `--config <file>` drives BOTH main + subagents for headless/agent use.
     // The local router reads the config's `endpoints` + `routes` directly; scope is
@@ -1608,9 +1623,13 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         // config's local endpoint with a custom adapter and advertise it, so the RCR
         // may 307-redirect to it. Cloud decision plane + custom upstream; the daemon
         // reads `RAYLINE_ROUTER_API_KEY` from the env for the RCR.
-        if let Some(may_local) = crate::router_config::config_may_local(path) {
-            let mut start_request = RouterStartRequest::defaults(request.root_env_explicit);
-            start_request.enable_proxy = true;
+        if !codex_mode && let Some(may_local) = crate::router_config::config_may_local(path) {
+            let mut start_request = if codex_mode {
+                RouterStartRequest::local_router_defaults(request.root_env_explicit)
+            } else {
+                RouterStartRequest::defaults(request.root_env_explicit)
+            };
+            start_request.enable_proxy = !codex_mode;
             start_request.proxy_routing_mode =
                 if crate::router_config::config_main_is_passthrough(path) {
                     PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
@@ -1621,11 +1640,13 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             start_request.upstream_url = Some(may_local.upstream_url);
             start_request.upstream_model = Some(may_local.model.clone());
             start_request.local_model_id = may_local.model;
-            return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+            return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
         }
-        start_request.router_config_path = Some(
-            crate::router_config::materialize_for_local_router(path, &home)?,
-        );
+        start_request.router_config_path = Some(if codex_subscription_auth {
+            crate::router_config::materialize_codex_subscription_for_local_router(path, &home)?
+        } else {
+            crate::router_config::materialize_for_local_router(path, &home)?
+        });
         start_request.proxy_routing_mode =
             if crate::router_config::config_main_is_passthrough(path) {
                 PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
@@ -1635,10 +1656,17 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             .to_owned();
         if crate::router_config::config_uses_local_endpoint(path) {
             let start_request = resolve_start_model(&home, start_request).await?;
-            return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+            return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
         }
         start_request.no_local_model = true;
-        return start_from_home_with_rld_bin(&home, &start_request, &bin_path).await;
+        return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
+    }
+
+    if codex_subscription_auth {
+        start_request.router_config_path =
+            Some(crate::codex::write_subscription_router_config(&home)?);
+        start_request.no_local_model = true;
+        return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
     }
 
     start_request.proxy_routing_mode = request.proxy_routing_mode.clone();
@@ -1654,7 +1682,23 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         );
     }
     let start_request = resolve_start_model(&home, start_request).await?;
-    start_from_home_with_rld_bin(&home, &start_request, &bin_path).await
+    finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await
+}
+
+async fn finish_start_from_cli(
+    home: &Path,
+    start_request: &RouterStartRequest,
+    bin_path: &Path,
+    codex_mode: bool,
+) -> io::Result<String> {
+    let mut output = start_from_home_with_rld_bin(home, start_request, bin_path).await?;
+    if codex_mode {
+        output.push_str(&format!(
+            "Codex base URL: http://127.0.0.1:{}/v1\n",
+            start_request.local_router_port
+        ));
+    }
+    Ok(output)
 }
 
 pub async fn stop(_request: &RouterStopRequest) -> io::Result<String> {

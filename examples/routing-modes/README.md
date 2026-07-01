@@ -6,6 +6,10 @@ either entry point:
 - **interactive:** `rayline claude --config ./examples/routing-modes/RLC.json`
 - **headless / agents:** `rayline router start --config ./examples/routing-modes/RLC.json`
   (then point an Anthropic SDK client at the proxy on `127.0.0.1:20810`)
+- **Codex subscription:** `rayline codex --auth subscription --config ./examples/routing-modes/AL.json`
+  materializes the same `subscription` sentinel into a Codex
+  `client_bearer` endpoint, so Codex's ChatGPT subscription auth is reused while
+  routed legs can still target local/API-key endpoints.
 
 `--config` drives **both** the main agent (`routes.main`) and subagents
 (`routes.subagent`) from one file — the thing the old `--router-config-path` /
@@ -201,9 +205,9 @@ The proxy **scope** is derived from `routes.main`:
 ## Config model — `endpoints` + `routes`
 
 Real `EndpointConfig` fields only: `id`, `protocol`
-(`anthropic_messages` | `openai_chat`), `base_url`, `models`, `api_key_env`,
-`auth` (`api_key` | `bearer`), `headers`. A route's `endpoint` is looked up by
-`id`; its `model` is rewritten into the request body.
+(`anthropic_messages` | `openai_chat` | `openai_responses`), `base_url`,
+`models`, `api_key_env`, `auth` (`api_key` | `bearer`), `headers`. A route's
+`endpoint` is looked up by `id`; its `model` is rewritten into the request body.
 
 ```jsonc
 {

@@ -290,6 +290,132 @@ pub fn materialize_for_local_router(path: &Path, home: &Path) -> io::Result<Path
     Ok(out)
 }
 
+/// Codex has no transparent MITM passthrough layer: Codex is explicitly pointed
+/// at Rayline as a custom Responses provider. In subscription mode, materialize
+/// the shared `subscription` sentinel into a real client-bearer endpoint that
+/// forwards Codex's ChatGPT auth headers to the ChatGPT Codex backend.
+pub fn materialize_codex_subscription_for_local_router(
+    path: &Path,
+    home: &Path,
+) -> io::Result<PathBuf> {
+    let raw = std::fs::read(path)?;
+    let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    let mut changed = ensure_codex_subscription_endpoint(&mut cfg);
+    changed |= ensure_codex_subscription_main_route(&mut cfg);
+    changed |= rewrite_subscription_routes_for_codex(&mut cfg);
+    if !changed {
+        return Ok(path.to_path_buf());
+    }
+    let out = home
+        .join(".rayline")
+        .join("rld")
+        .join("codex-config-routes.json");
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::to_vec_pretty(&cfg).map_err(io::Error::other)?;
+    std::fs::write(&out, body)?;
+    Ok(out)
+}
+
+fn ensure_codex_subscription_endpoint(cfg: &mut Value) -> bool {
+    let endpoint_id = crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID;
+    let endpoints = cfg
+        .as_object_mut()
+        .map(|object| {
+            object
+                .entry("endpoints")
+                .or_insert_with(|| Value::Array(Vec::new()))
+        })
+        .and_then(Value::as_array_mut);
+    let Some(endpoints) = endpoints else {
+        return false;
+    };
+    if endpoints
+        .iter()
+        .any(|endpoint| endpoint.get("id").and_then(Value::as_str) == Some(endpoint_id))
+    {
+        return false;
+    }
+    endpoints.push(json!({
+        "id": endpoint_id,
+        "protocol": "openai_responses",
+        "base_url": crate::codex::CODEX_SUBSCRIPTION_BASE_URL,
+        "auth": "client_bearer",
+        "models": [
+            crate::codex::CODEX_SUBSCRIPTION_DEFAULT_MODEL,
+            "gpt-5.4-mini",
+            "gpt-5.5"
+        ]
+    }));
+    true
+}
+
+fn ensure_codex_subscription_main_route(cfg: &mut Value) -> bool {
+    let routes = cfg
+        .as_object_mut()
+        .map(|object| object.entry("routes").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut);
+    let Some(routes) = routes else {
+        return false;
+    };
+    if routes.contains_key("main") {
+        return false;
+    }
+    routes.insert(
+        "main".to_owned(),
+        json!({
+            "endpoint": crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID,
+            "model": crate::codex::CODEX_SUBSCRIPTION_DEFAULT_MODEL
+        }),
+    );
+    true
+}
+
+fn rewrite_subscription_routes_for_codex(cfg: &mut Value) -> bool {
+    let Some(routes) = cfg.get_mut("routes") else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["main", "default", "subagent"] {
+        if let Some(route) = routes.get_mut(key) {
+            changed |= rewrite_subscription_route_for_codex(route);
+        }
+    }
+    for key in ["subagents", "model_routes"] {
+        if let Some(map) = routes.get_mut(key).and_then(Value::as_object_mut) {
+            for route in map.values_mut() {
+                changed |= rewrite_subscription_route_for_codex(route);
+            }
+        }
+    }
+    changed
+}
+
+fn rewrite_subscription_route_for_codex(route: &mut Value) -> bool {
+    let Some(object) = route.as_object_mut() else {
+        return false;
+    };
+    if object.get("endpoint").and_then(Value::as_str) != Some(SUBSCRIPTION_MAIN) {
+        return false;
+    }
+    object.insert(
+        "endpoint".to_owned(),
+        Value::String(crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID.to_owned()),
+    );
+    if object
+        .get("model")
+        .and_then(Value::as_str)
+        .is_none_or(|model| model.trim().is_empty())
+    {
+        object.insert(
+            "model".to_owned(),
+            Value::String(crate::codex::CODEX_SUBSCRIPTION_DEFAULT_MODEL.to_owned()),
+        );
+    }
+    true
+}
+
 /// Endpoint ids whose `base_url` host is the hosted cloud router.
 fn cloud_router_endpoint_ids(cfg: &Value) -> Vec<String> {
     let cloud_host = host_of(crate::ROUTER_PROD_URL);
@@ -604,6 +730,45 @@ mod tests {
         // RLC: main is a real endpoint → file used verbatim (path unchanged).
         let rl = examples_dir().join("RLC.json");
         assert_eq!(materialize_for_local_router(&rl, &home).unwrap(), rl);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn materialize_codex_subscription_rewrites_sentinel_to_client_bearer_endpoint() {
+        let home = tmp_home();
+        let path = home.join("codex-router.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "endpoints": [{
+                    "id": "ollama",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "models": ["qwen"]
+                }],
+                "routes": {
+                    "main": {"endpoint": "subscription", "model": "gpt-5.5"},
+                    "subagent": {"endpoint": "ollama", "model": "qwen"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_subscription_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(
+            cfg["routes"]["main"]["endpoint"],
+            crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID
+        );
+        assert_eq!(cfg["routes"]["main"]["model"], "gpt-5.5");
+        assert!(cfg["endpoints"].as_array().unwrap().iter().any(|endpoint| {
+            endpoint["id"] == crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID
+                && endpoint["auth"] == "client_bearer"
+                && endpoint["base_url"] == crate::codex::CODEX_SUBSCRIPTION_BASE_URL
+        }));
+        assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -41,6 +41,8 @@ pub const SUBAGENT_ENDPOINT_ENV: &str = "RAYLINE_SUBAGENT_ENDPOINT";
 pub const SUBAGENT_MODEL_ENV: &str = "RAYLINE_SUBAGENT_MODEL";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
+const OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
+const OPENAI_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 
 #[derive(Clone)]
 pub struct LocalRouterOptions {
@@ -95,12 +97,16 @@ fn default_endpoint_kind() -> String {
     "provider".to_owned()
 }
 
-/// Optional per-endpoint auth override (serialized as `"bearer"` / `"api_key"`).
+/// Optional per-endpoint auth override.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     Bearer,
     ApiKey,
+    /// Forward the inbound client's bearer identity to the upstream. This is for
+    /// Codex subscription passthrough and is intentionally restricted to the
+    /// ChatGPT Codex backend or loopback development endpoints.
+    ClientBearer,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,6 +115,8 @@ pub enum EndpointProtocol {
     AnthropicMessages,
     #[serde(rename = "openai_chat", alias = "open_ai_chat")]
     OpenAIChat,
+    #[serde(rename = "openai_responses", alias = "responses")]
+    OpenAIResponses,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -159,6 +167,7 @@ struct AppState {
     opts: Arc<LocalRouterOptions>,
     config: Arc<RouterConfig>,
     http: reqwest::Client,
+    http_ipv4: reqwest::Client,
     route_counter: Arc<AtomicU64>,
     started_at: String,
 }
@@ -177,6 +186,22 @@ struct RouteDecision {
 enum RouteSelection {
     Local,
     Endpoint(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyntheticOutputKind {
+    Message,
+    Compaction,
+}
+
+struct OpenAIPassthroughRequest<'a> {
+    inbound_headers: &'a HeaderMap,
+    method: Method,
+    inbound_path_and_query: &'a str,
+    body: Bytes,
+    parsed: &'a Value,
+    request_id: &'a str,
+    rewrite_model: bool,
 }
 
 pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
@@ -210,9 +235,8 @@ pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
     let state = AppState {
         opts: Arc::new(opts),
         config: Arc::new(config),
-        http: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
+        http: outbound_http_client(false)?,
+        http_ipv4: outbound_http_client(true)?,
         route_counter: Arc::new(AtomicU64::new(1)),
         started_at: chrono_like_now(),
     };
@@ -295,6 +319,9 @@ fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
 }
 
 fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<()> {
+    for endpoint in &config.endpoints {
+        validate_endpoint(endpoint)?;
+    }
     if let Some(route) = config.routes.main.as_mut() {
         normalize_route_target(route, local_model_id)?;
     }
@@ -311,6 +338,34 @@ fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<(
         normalize_route_target(route, local_model_id)?;
     }
     Ok(())
+}
+
+fn validate_endpoint(endpoint: &EndpointConfig) -> Result<()> {
+    if endpoint.auth != Some(AuthMode::ClientBearer) {
+        return Ok(());
+    }
+    if endpoint.api_key_env.is_some() {
+        return Err(anyhow!(
+            "endpoint {:?} uses auth=client_bearer and must not set api_key_env",
+            endpoint.id
+        ));
+    }
+    if !client_bearer_base_url_allowed(&endpoint.base_url) {
+        return Err(anyhow!(
+            "endpoint {:?} uses auth=client_bearer, which is only allowed for {} or loopback development endpoints",
+            endpoint.id,
+            "https://chatgpt.com/backend-api/codex"
+        ));
+    }
+    Ok(())
+}
+
+fn client_bearer_base_url_allowed(base_url: &str) -> bool {
+    let normalized = base_url.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized == "https://chatgpt.com/backend-api/codex"
+        || normalized.starts_with("http://127.0.0.1:")
+        || normalized.starts_with("http://localhost:")
+        || normalized.starts_with("http://[::1]:")
 }
 
 fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Result<()> {
@@ -455,12 +510,20 @@ fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
 
 async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
     let path = req.uri().path().to_owned();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| path.clone());
     let method = req.method().clone();
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => healthz_response(&state),
-        (Method::GET, "/v1/models" | "/v1/models/") => models_response(&state),
+        (Method::GET, "/v1/models" | "/v1/models/") => {
+            models_response(&state, req.headers(), &path_and_query).await
+        }
         (Method::GET, path) if path.starts_with("/v1/models/") => model_response(&state, path),
         (Method::POST, "/v1/messages/count_tokens") => count_tokens_response(req).await,
+        (Method::POST, "/v1/responses/count_tokens") => count_responses_tokens_response(req).await,
         (Method::POST, "/v1/usage/update") => json_response(StatusCode::OK, json!({"ok": true})),
         (Method::GET, "/v1/settings") => json_response(
             StatusCode::OK,
@@ -480,11 +543,76 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
                 )
             }
         },
+        (Method::POST, "/v1/responses") => match handle_responses(state, req).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!("local router /v1/responses error: {error:#}");
+                json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error":{"type":"api_error","message":error.to_string()}}),
+                )
+            }
+        },
+        (Method::POST, "/v1/responses/compact")
+        | (Method::POST, "/v1/memories/trace_summarize")
+        | (Method::POST, "/v1/images/generations")
+        | (Method::POST, "/v1/images/edits")
+        | (Method::POST, "/v1/alpha/search") => match handle_openai_auxiliary(state, req).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!("local router OpenAI auxiliary endpoint error: {error:#}");
+                json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error":{"type":"api_error","message":error.to_string()}}),
+                )
+            }
+        },
+        (method, path)
+            if path.starts_with("/v1/responses/")
+                && matches!(method, Method::GET | Method::DELETE | Method::POST) =>
+        {
+            match handle_openai_passthrough_family(state, req).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!("local router Responses passthrough endpoint error: {error:#}");
+                    json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error":{"type":"api_error","message":error.to_string()}}),
+                    )
+                }
+            }
+        }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(full_body("not found"))
             .unwrap(),
     }
+}
+
+fn outbound_http_client(ipv4_only: bool) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = if ipv4_only {
+        builder
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .http1_only()
+            .connect_timeout(Duration::from_secs(10))
+    } else {
+        builder
+    };
+    if ipv4_only {
+        let addrs = ("chatgpt.com", 443)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .filter(|addr| addr.is_ipv4())
+                    .collect::<Vec<SocketAddr>>()
+            })
+            .unwrap_or_default();
+        if !addrs.is_empty() {
+            builder = builder.resolve_to_addrs("chatgpt.com", &addrs);
+        }
+    }
+    Ok(builder.build()?)
 }
 
 fn healthz_response(state: &AppState) -> Response<BoxBody> {
@@ -501,10 +629,29 @@ fn healthz_response(state: &AppState) -> Response<BoxBody> {
     )
 }
 
-fn models_response(state: &AppState) -> Response<BoxBody> {
+async fn models_response(
+    state: &AppState,
+    inbound_headers: &HeaderMap,
+    path_and_query: &str,
+) -> Response<BoxBody> {
+    if let Some(endpoint) = client_bearer_models_endpoint(&state.config) {
+        match proxy_client_bearer_models(state, endpoint, inbound_headers, path_and_query).await {
+            Ok(response) => return response,
+            Err(error) => warn!("local router client-bearer /models proxy failed: {error:#}"),
+        }
+    }
+    static_models_response(state)
+}
+
+fn static_models_response(state: &AppState) -> Response<BoxBody> {
+    json_response(StatusCode::OK, static_models_value(state))
+}
+
+fn static_model_values(state: &AppState) -> Vec<Value> {
     let mut models = vec![
         model_json(DEFAULT_VIRTUAL_MODEL),
         model_json(DEFAULT_SUBAGENT_MODEL),
+        model_json("rayline-codex"),
         model_json("rayline-local"),
     ];
     for endpoint in &state.config.endpoints {
@@ -512,14 +659,148 @@ fn models_response(state: &AppState) -> Response<BoxBody> {
             models.push(model_json(model));
         }
     }
-    json_response(
-        StatusCode::OK,
-        json!({
-            "object": "list",
-            "data": models,
-            "has_more": false,
-        }),
-    )
+    models
+}
+
+fn static_models_value(state: &AppState) -> Value {
+    let models = static_model_values(state);
+    let codex_models = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .map(codex_model_json)
+        .collect::<Vec<_>>();
+    json!({
+        "object": "list",
+        "data": models,
+        "models": codex_models,
+        "has_more": false,
+    })
+}
+
+fn client_bearer_models_endpoint(config: &RouterConfig) -> Option<&EndpointConfig> {
+    let route_endpoint = [
+        config.routes.main.as_ref(),
+        config.routes.default.as_ref(),
+        config.routes.subagent.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|route| endpoint_by_id(config, &route.endpoint))
+    .filter(|endpoint| {
+        endpoint.protocol == EndpointProtocol::OpenAIResponses
+            && endpoint.auth == Some(AuthMode::ClientBearer)
+    });
+    route_endpoint.or_else(|| {
+        config.endpoints.iter().find(|endpoint| {
+            endpoint.protocol == EndpointProtocol::OpenAIResponses
+                && endpoint.auth == Some(AuthMode::ClientBearer)
+        })
+    })
+}
+
+fn endpoint_by_id<'a>(config: &'a RouterConfig, id: &str) -> Option<&'a EndpointConfig> {
+    config.endpoints.iter().find(|endpoint| endpoint.id == id)
+}
+
+async fn proxy_client_bearer_models(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    inbound_headers: &HeaderMap,
+    path_and_query: &str,
+) -> Result<Response<BoxBody>> {
+    let upstream_path = path_and_query
+        .strip_prefix("/v1/")
+        .or_else(|| path_and_query.strip_prefix('/'))
+        .unwrap_or(path_and_query);
+    let url = format!(
+        "{}/{}",
+        endpoint.base_url.trim_end_matches('/'),
+        upstream_path
+    );
+    let mut outbound = state.http_ipv4.get(url).timeout(Duration::from_secs(2));
+    copy_openai_passthrough_headers(&mut outbound, inbound_headers, false, true);
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return response_from_reqwest(resp, status, None, None, None, None).await;
+    }
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await?;
+    let mut value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(raw_response(status, &headers, body)),
+    };
+    merge_static_models(&mut value, state);
+    Ok(json_response(StatusCode::OK, value))
+}
+
+fn raw_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: Bytes,
+) -> Response<BoxBody> {
+    let mut builder = Response::builder().status(status);
+    for (name, value) in headers {
+        if is_hop_by_hop_str(name.as_str()) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    builder.body(full_body(body)).unwrap()
+}
+
+fn merge_static_models(value: &mut Value, state: &AppState) {
+    let Some(object) = value.as_object_mut() else {
+        *value = static_models_value(state);
+        return;
+    };
+
+    let static_models = static_model_values(state);
+    let data = object
+        .entry("data")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(data) = data.as_array_mut() {
+        for model in &static_models {
+            let Some(id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !data
+                .iter()
+                .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+            {
+                data.push(model.clone());
+            }
+        }
+    }
+
+    let models = object
+        .entry("models")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(models) = models.as_array_mut() {
+        for model in static_models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .map(codex_model_json)
+        {
+            let Some(slug) = model.get("slug").and_then(Value::as_str) else {
+                continue;
+            };
+            if !models
+                .iter()
+                .any(|existing| existing.get("slug").and_then(Value::as_str) == Some(slug))
+            {
+                models.push(model);
+            }
+        }
+    }
+
+    object
+        .entry("object")
+        .or_insert_with(|| Value::String("list".to_owned()));
+    object
+        .entry("has_more")
+        .or_insert_with(|| Value::Bool(false));
 }
 
 fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
@@ -532,6 +813,7 @@ fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
     let model = percent_decode_minimal(model);
     if model == DEFAULT_VIRTUAL_MODEL
         || model == DEFAULT_SUBAGENT_MODEL
+        || model == "rayline-codex"
         || model == "rayline-local"
         || state
             .config
@@ -556,6 +838,40 @@ fn model_json(id: &str) -> Value {
     })
 }
 
+fn codex_model_json(id: &str) -> Value {
+    json!({
+        "slug": id,
+        "display_name": id,
+        "description": "Rayline-routed model",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Low"},
+            {"effort": "medium", "description": "Medium"},
+            {"effort": "high", "description": "High"}
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 1,
+        "additional_speed_tiers": [],
+        "availability_nux": Value::Null,
+        "upgrade": Value::Null,
+        "base_instructions": "",
+        "supports_reasoning_summaries": false,
+        "support_verbosity": false,
+        "default_verbosity": Value::Null,
+        "apply_patch_tool_type": Value::Null,
+        "truncation_policy": {"mode": "tokens", "limit": 128000},
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": false,
+        "context_window": 128000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": false
+    })
+}
+
 async fn count_tokens_response(req: Request<Incoming>) -> Response<BoxBody> {
     let bytes = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -570,6 +886,23 @@ async fn count_tokens_response(req: Request<Incoming>) -> Response<BoxBody> {
     json_response(
         StatusCode::OK,
         json!({"input_tokens": approximate_input_tokens(&value)}),
+    )
+}
+
+async fn count_responses_tokens_response(req: Request<Incoming>) -> Response<BoxBody> {
+    let bytes = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":{"type":"invalid_request_error","message":error.to_string()}}),
+            );
+        }
+    };
+    let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+    json_response(
+        StatusCode::OK,
+        json!({"input_tokens": approximate_responses_input_tokens(&value)}),
     )
 }
 
@@ -660,6 +993,10 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                     forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
                         .await
                 }
+                EndpointProtocol::OpenAIResponses => Err(anyhow!(
+                    "endpoint {:?} uses openai_responses, which is only supported for /v1/responses requests",
+                    endpoint.id
+                )),
             };
             if let Err(error) = response.as_ref() {
                 record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
@@ -667,6 +1004,514 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             response
         }
     }
+}
+
+async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
+    let t_start = Instant::now();
+    let headers = req.headers().clone();
+    let body = req.into_body().collect().await?.to_bytes();
+    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let request_id = request_id_from_headers(&headers);
+    let output_kind = responses_output_kind(&parsed);
+    let subagent = headers
+        .get(OPENAI_SUBAGENT_HEADER)
+        .and_then(header_str)
+        .unwrap_or("<none>");
+    info!(
+        "codex route {} requested={} selected={} policy={} task={} subagent={} elapsed_ms={}",
+        route_target_label(&decision.target),
+        decision.requested_model,
+        decision.selected_model,
+        decision.policy,
+        decision.task_class,
+        subagent,
+        t_start.elapsed().as_millis()
+    );
+    if let Some(metrics) = state.opts.metrics.as_ref() {
+        metrics.record(MetricsUpdate::RouteDecided {
+            request_id: request_id.clone(),
+            route_id: Some(decision.route_id.clone()),
+            target: match &decision.target {
+                RouteSelection::Local => "local".to_owned(),
+                RouteSelection::Endpoint(_) => "remote".to_owned(),
+            },
+            endpoint_id: match &decision.target {
+                RouteSelection::Local => Some("local".to_owned()),
+                RouteSelection::Endpoint(endpoint_id) => Some(endpoint_id.clone()),
+            },
+            selected_model: Some(decision.selected_model.clone()),
+            requested_model: Some(decision.requested_model.clone()),
+            policy: Some(decision.policy.clone()),
+            task_class: Some(decision.task_class.clone()),
+            agent_id: (subagent != "<none>").then(|| subagent.to_owned()),
+            agent_type: (subagent != "<none>").then(|| subagent.to_owned()),
+        });
+    }
+
+    let response = match &decision.target {
+        RouteSelection::Local => {
+            forward_responses_to_local_adapter(&state, &decision, &parsed, &request_id, output_kind)
+                .await
+        }
+        RouteSelection::Endpoint(endpoint_id) => {
+            let endpoint = state
+                .config
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == *endpoint_id)
+                .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
+            match endpoint.protocol {
+                EndpointProtocol::OpenAIResponses => {
+                    forward_openai_responses_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &headers,
+                        body,
+                        &parsed,
+                        &request_id,
+                    )
+                    .await
+                }
+                EndpointProtocol::AnthropicMessages => {
+                    forward_responses_to_anthropic_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &headers,
+                        &parsed,
+                        &request_id,
+                        output_kind,
+                    )
+                    .await
+                }
+                EndpointProtocol::OpenAIChat => {
+                    forward_responses_to_openai_chat_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &parsed,
+                        &request_id,
+                        output_kind,
+                    )
+                    .await
+                }
+            }
+        }
+    };
+    if let Err(error) = response.as_ref() {
+        record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
+    }
+    response
+}
+
+async fn handle_openai_passthrough_family(
+    state: AppState,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>> {
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let headers = req.headers().clone();
+    let body = req.into_body().collect().await?.to_bytes();
+    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let request_id = request_id_from_headers(&headers);
+    forward_openai_family_or_unsupported(
+        &state,
+        &decision,
+        OpenAIPassthroughRequest {
+            inbound_headers: &headers,
+            method,
+            inbound_path_and_query: &path_and_query,
+            body,
+            parsed: &parsed,
+            request_id: &request_id,
+            rewrite_model: true,
+        },
+    )
+    .await
+}
+
+async fn handle_openai_auxiliary(
+    state: AppState,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>> {
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let headers = req.headers().clone();
+    let body = req.into_body().collect().await?.to_bytes();
+    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let request_id = request_id_from_headers(&headers);
+
+    if let Some(response) = maybe_handle_synthetic_auxiliary(
+        &state,
+        &decision,
+        &headers,
+        &path_and_query,
+        &parsed,
+        &request_id,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
+    forward_openai_family_or_unsupported(
+        &state,
+        &decision,
+        OpenAIPassthroughRequest {
+            inbound_headers: &headers,
+            method,
+            inbound_path_and_query: &path_and_query,
+            body,
+            parsed: &parsed,
+            request_id: &request_id,
+            rewrite_model: true,
+        },
+    )
+    .await
+}
+
+async fn forward_openai_family_or_unsupported(
+    state: &AppState,
+    decision: &RouteDecision,
+    passthrough: OpenAIPassthroughRequest<'_>,
+) -> Result<Response<BoxBody>> {
+    let RouteSelection::Endpoint(endpoint_id) = &decision.target else {
+        return Ok(unsupported_openai_endpoint_response(
+            decision,
+            passthrough.inbound_path_and_query,
+        ));
+    };
+    let endpoint = state
+        .config
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == *endpoint_id)
+        .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
+    if endpoint.protocol != EndpointProtocol::OpenAIResponses {
+        return Ok(unsupported_openai_endpoint_response(
+            decision,
+            passthrough.inbound_path_and_query,
+        ));
+    }
+    forward_openai_passthrough_endpoint(state, endpoint, decision, passthrough).await
+}
+
+fn unsupported_openai_endpoint_response(
+    decision: &RouteDecision,
+    inbound_path_and_query: &str,
+) -> Response<BoxBody> {
+    let mut response = json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        json!({
+            "error": {
+                "type": "unsupported_endpoint",
+                "message": format!(
+                    "{inbound_path_and_query} requires an endpoint using protocol=openai_responses for this route"
+                )
+            }
+        }),
+    );
+    add_decision_headers(response.headers_mut(), decision);
+    response
+}
+
+async fn maybe_handle_synthetic_auxiliary(
+    state: &AppState,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    path_and_query: &str,
+    body: &Value,
+    request_id: &str,
+) -> Result<Option<Response<BoxBody>>> {
+    if let RouteSelection::Endpoint(endpoint_id) = &decision.target
+        && state
+            .config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == *endpoint_id)
+            .is_some_and(|endpoint| endpoint.protocol == EndpointProtocol::OpenAIResponses)
+    {
+        return Ok(None);
+    }
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    match path {
+        "/v1/responses/compact" => synthetic_compact_response(
+            state,
+            decision,
+            inbound_headers,
+            body,
+            request_id,
+            SyntheticOutputKind::Compaction,
+        )
+        .await
+        .map(Some),
+        "/v1/memories/trace_summarize" => {
+            synthetic_memory_summarize_response(state, decision, inbound_headers, body, request_id)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn synthetic_compact_response(
+    state: &AppState,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: &Value,
+    request_id: &str,
+    output_kind: SyntheticOutputKind,
+) -> Result<Response<BoxBody>> {
+    let mut request_body = body.clone();
+    if let Some(obj) = request_body.as_object_mut() {
+        obj.insert("stream".to_owned(), Value::Bool(false));
+    }
+    let (anthropic_message, estimated_input_tokens) =
+        run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+            .await?;
+    let text = anthropic_message_text(&anthropic_message);
+    let item = match output_kind {
+        SyntheticOutputKind::Compaction => json!({
+            "type": "compaction",
+            "encrypted_content": text,
+        }),
+        SyntheticOutputKind::Message => json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+            "phase": "final_answer",
+        }),
+    };
+    let input_tokens = anthropic_message
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(estimated_input_tokens);
+    let output_tokens = anthropic_message
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| (content_to_text(&item).len() as u64 / 4).max(1));
+    record_remote_completion(
+        state.opts.metrics.as_ref(),
+        request_id,
+        StatusCode::OK.as_u16(),
+        Some(input_tokens),
+        Some(output_tokens),
+        Some(decision.selected_model.clone()),
+    );
+    let mut response = json_response(StatusCode::OK, json!({"output": [item]}));
+    add_decision_headers(response.headers_mut(), decision);
+    Ok(response)
+}
+
+async fn synthetic_memory_summarize_response(
+    state: &AppState,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: &Value,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    let request_body = memory_summarize_to_responses_request(body, &decision.requested_model);
+    let (anthropic_message, estimated_input_tokens) =
+        run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+            .await?;
+    let text = anthropic_message_text(&anthropic_message);
+    let output = parse_memory_summarize_output(body, &text);
+    let output_tokens = anthropic_message
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| (text.len() as u64 / 4).max(1));
+    record_remote_completion(
+        state.opts.metrics.as_ref(),
+        request_id,
+        StatusCode::OK.as_u16(),
+        anthropic_message
+            .pointer("/usage/input_tokens")
+            .and_then(Value::as_u64)
+            .or(Some(estimated_input_tokens)),
+        Some(output_tokens),
+        Some(decision.selected_model.clone()),
+    );
+    let mut response = json_response(StatusCode::OK, json!({"output": output}));
+    add_decision_headers(response.headers_mut(), decision);
+    Ok(response)
+}
+
+async fn run_synthetic_unary_response(
+    state: &AppState,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: &Value,
+    request_id: &str,
+) -> Result<(Value, u64)> {
+    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let estimated_input_tokens = approximate_input_tokens(&anthropic);
+    match &decision.target {
+        RouteSelection::Local => {
+            let url = format!(
+                "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}&rayline_request_id={}",
+                state.opts.local_adapter_port,
+                query_escape(&decision.route_id),
+                query_escape(request_id)
+            );
+            let resp = state
+                .http
+                .post(url)
+                .header("content-type", "application/json")
+                .json(&anthropic)
+                .send()
+                .await?;
+            parse_anthropic_unary_response(resp, estimated_input_tokens).await
+        }
+        RouteSelection::Endpoint(endpoint_id) => {
+            let endpoint = state
+                .config
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == *endpoint_id)
+                .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
+            match endpoint.protocol {
+                EndpointProtocol::AnthropicMessages => {
+                    let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
+                    let mut outbound = state
+                        .http
+                        .post(url)
+                        .header("content-type", "application/json")
+                        .header(
+                            "anthropic-version",
+                            inbound_headers
+                                .get("anthropic-version")
+                                .and_then(header_str)
+                                .unwrap_or("2023-06-01"),
+                        )
+                        .json(&anthropic);
+                    if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
+                        outbound = outbound.header("anthropic-beta", beta);
+                    }
+                    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
+                    let resp = outbound.send().await?;
+                    parse_anthropic_unary_response(resp, estimated_input_tokens).await
+                }
+                EndpointProtocol::OpenAIChat => {
+                    let request_body =
+                        build_openai_chat_request(&anthropic, &decision.selected_model, false);
+                    let url = format!(
+                        "{}/chat/completions",
+                        endpoint.base_url.trim_end_matches('/')
+                    );
+                    let mut outbound = state
+                        .http
+                        .post(url)
+                        .header("content-type", "application/json")
+                        .json(&request_body);
+                    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
+                    let resp = outbound.send().await?;
+                    if !resp.status().is_success() {
+                        return Err(anyhow!("upstream returned HTTP {}", resp.status().as_u16()));
+                    }
+                    let value = resp.json::<Value>().await?;
+                    Ok((
+                        openai_chat_response_to_anthropic(&value, &decision.selected_model),
+                        estimated_input_tokens,
+                    ))
+                }
+                EndpointProtocol::OpenAIResponses => Err(anyhow!(
+                    "native OpenAI Responses endpoint should have used passthrough"
+                )),
+            }
+        }
+    }
+}
+
+async fn parse_anthropic_unary_response(
+    resp: reqwest::Response,
+    estimated_input_tokens: u64,
+) -> Result<(Value, u64)> {
+    if !resp.status().is_success() {
+        return Err(anyhow!("upstream returned HTTP {}", resp.status().as_u16()));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.contains("text/event-stream") {
+        let text = resp.text().await?;
+        Ok((
+            anthropic_sse_text_to_message(&text, estimated_input_tokens),
+            estimated_input_tokens,
+        ))
+    } else {
+        Ok((resp.json::<Value>().await?, estimated_input_tokens))
+    }
+}
+
+fn memory_summarize_to_responses_request(body: &Value, model: &str) -> Value {
+    let traces = body.get("traces").cloned().unwrap_or_else(|| json!([]));
+    json!({
+        "model": model,
+        "instructions": "Summarize the supplied memory traces. Return concise durable memory summaries. If possible, return JSON with an output array of objects containing trace_summary and memory_summary.",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("Summarize these memory traces:\n{}", traces)
+            }]
+        }],
+        "stream": false,
+        "max_output_tokens": 2048,
+    })
+}
+
+fn parse_memory_summarize_output(request_body: &Value, text: &str) -> Value {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        if let Some(output) = value.get("output").and_then(Value::as_array) {
+            return Value::Array(output.clone());
+        }
+        if let Some(items) = value.as_array() {
+            return Value::Array(items.clone());
+        }
+    }
+    let trace_count = request_body
+        .get("traces")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(1)
+        .max(1);
+    Value::Array(
+        (0..trace_count)
+            .map(|_| json!({"trace_summary": text, "memory_summary": text}))
+            .collect(),
+    )
+}
+
+fn anthropic_message_text(message: &Value) -> String {
+    message
+        .get("content")
+        .map(content_to_text)
+        .unwrap_or_else(|| content_to_text(message))
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .or_else(|| headers.get(OPENAI_CLIENT_REQUEST_ID_HEADER))
+        .and_then(header_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(new_request_id)
 }
 
 fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
@@ -677,8 +1522,12 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         .unwrap_or_else(|| DEFAULT_VIRTUAL_MODEL.to_owned());
     let agent_id = headers
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
         .and_then(header_str);
-    let agent_type = headers.get(RAYLINE_AGENT_TYPE_HEADER).and_then(header_str);
+    let agent_type = headers
+        .get(RAYLINE_AGENT_TYPE_HEADER)
+        .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
+        .and_then(header_str);
     // Guard: a bare `agent_id` header on a main-virtual-model request is
     // treated as stray and does NOT trigger subagent classification. Only a
     // confirmed `agent_type` (set by the proxy after successful meta-file
@@ -779,6 +1628,7 @@ fn select_route_with_warn(state: &AppState, headers: &HeaderMap, body: &Value) -
     let decision = select_route(state, headers, body);
     let agent_id = headers
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
         .and_then(header_str);
     if decision.task_class == "subagent" && agent_id.is_none() {
         warn!(
@@ -880,6 +1730,285 @@ fn query_escape(value: &str) -> String {
         }
     }
     out
+}
+
+async fn forward_openai_responses_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: Bytes,
+    parsed: &Value,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    forward_openai_passthrough_endpoint(
+        state,
+        endpoint,
+        decision,
+        OpenAIPassthroughRequest {
+            inbound_headers,
+            method: Method::POST,
+            inbound_path_and_query: "/v1/responses",
+            body,
+            parsed,
+            request_id,
+            rewrite_model: true,
+        },
+    )
+    .await
+}
+
+async fn forward_openai_passthrough_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    passthrough: OpenAIPassthroughRequest<'_>,
+) -> Result<Response<BoxBody>> {
+    let estimated_input_tokens = approximate_responses_input_tokens(passthrough.parsed);
+    let mut outbound_value = passthrough.parsed.clone();
+    let outbound_body = if passthrough.rewrite_model && outbound_value.is_object() {
+        rewrite_body_model(&mut outbound_value, &decision.selected_model);
+        serde_json::to_vec(&outbound_value).unwrap_or_else(|_| passthrough.body.to_vec())
+    } else {
+        passthrough.body.to_vec()
+    };
+    let upstream_path = passthrough
+        .inbound_path_and_query
+        .strip_prefix("/v1/")
+        .or_else(|| passthrough.inbound_path_and_query.strip_prefix('/'))
+        .unwrap_or(passthrough.inbound_path_and_query);
+    let url = format!(
+        "{}/{}",
+        endpoint.base_url.trim_end_matches('/'),
+        upstream_path
+    );
+    let http = if endpoint.auth == Some(AuthMode::ClientBearer) {
+        &state.http_ipv4
+    } else {
+        &state.http
+    };
+    let mut outbound = http.request(passthrough.method, url).body(outbound_body);
+    copy_openai_passthrough_headers(
+        &mut outbound,
+        passthrough.inbound_headers,
+        !passthrough.body.is_empty(),
+        endpoint.auth == Some(AuthMode::ClientBearer),
+    );
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    response_from_reqwest(
+        resp,
+        status,
+        Some(decision),
+        state.opts.metrics.clone(),
+        Some(passthrough.request_id.to_owned()),
+        Some(estimated_input_tokens),
+    )
+    .await
+}
+
+fn copy_openai_passthrough_headers(
+    outbound: &mut reqwest::RequestBuilder,
+    inbound_headers: &HeaderMap,
+    has_body: bool,
+    forward_client_auth: bool,
+) {
+    if has_body {
+        if let Some(content_type) = inbound_headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(header_str)
+        {
+            let next = std::mem::replace(outbound, reqwest::Client::new().get("http://127.0.0.1"));
+            *outbound = next.header("content-type", content_type);
+        } else {
+            let next = std::mem::replace(outbound, reqwest::Client::new().get("http://127.0.0.1"));
+            *outbound = next.header("content-type", "application/json");
+        }
+    }
+    if let Some(accept) = inbound_headers
+        .get(hyper::header::ACCEPT)
+        .and_then(header_str)
+    {
+        let next = std::mem::replace(outbound, reqwest::Client::new().get("http://127.0.0.1"));
+        *outbound = next.header("accept", accept);
+    } else {
+        let next = std::mem::replace(outbound, reqwest::Client::new().get("http://127.0.0.1"));
+        *outbound = next.header("accept", "text/event-stream, application/json");
+    }
+    for (name, value) in inbound_headers {
+        let name_str = name.as_str();
+        if !is_openai_passthrough_request_header(name_str, forward_client_auth) {
+            continue;
+        }
+        if let Some(value) = header_str(value) {
+            let next = std::mem::replace(outbound, reqwest::Client::new().get("http://127.0.0.1"));
+            *outbound = next.header(name_str, value);
+        }
+    }
+}
+
+fn is_openai_passthrough_request_header(name: &str, forward_client_auth: bool) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if forward_client_auth
+        && (lower == "authorization"
+            || lower == "chatgpt-account-id"
+            || lower == "x-openai-fedramp"
+            || lower == "version")
+    {
+        return true;
+    }
+    lower == OPENAI_CLIENT_REQUEST_ID_HEADER
+        || lower == OPENAI_SUBAGENT_HEADER
+        || lower == "x-codex-parent-thread-id"
+        || lower == "x-codex-window-id"
+        || lower == "x-codex-beta-features"
+        || lower == "x-codex-turn-state"
+        || lower == "originator"
+        || lower == "traceparent"
+        || lower == "tracestate"
+        || lower.starts_with("openai-")
+        || lower.starts_with("x-openai-")
+        || lower.starts_with("x-stainless-")
+        || lower.starts_with("anthropic-dangerous-direct-browser-access")
+}
+
+async fn forward_responses_to_anthropic_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
+    body: &Value,
+    request_id: &str,
+    output_kind: SyntheticOutputKind,
+) -> Result<Response<BoxBody>> {
+    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let estimated_input_tokens = approximate_input_tokens(&anthropic);
+    let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
+    let mut outbound = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .header(
+            "anthropic-version",
+            inbound_headers
+                .get("anthropic-version")
+                .and_then(header_str)
+                .unwrap_or("2023-06-01"),
+        )
+        .json(&anthropic);
+    if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
+        outbound = outbound.header("anthropic-beta", beta);
+    }
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
+    let resp = outbound.send().await?;
+    anthropic_response_to_responses(
+        resp,
+        decision,
+        state.opts.metrics.clone(),
+        request_id.to_owned(),
+        estimated_input_tokens,
+        output_kind,
+        responses_wants_stream(body),
+    )
+    .await
+}
+
+async fn forward_responses_to_local_adapter(
+    state: &AppState,
+    decision: &RouteDecision,
+    body: &Value,
+    request_id: &str,
+    output_kind: SyntheticOutputKind,
+) -> Result<Response<BoxBody>> {
+    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let estimated_input_tokens = approximate_input_tokens(&anthropic);
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}&rayline_request_id={}",
+        state.opts.local_adapter_port,
+        query_escape(&decision.route_id),
+        query_escape(request_id)
+    );
+    let resp = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .json(&anthropic)
+        .send()
+        .await?;
+    anthropic_response_to_responses(
+        resp,
+        decision,
+        state.opts.metrics.clone(),
+        request_id.to_owned(),
+        estimated_input_tokens,
+        output_kind,
+        responses_wants_stream(body),
+    )
+    .await
+}
+
+async fn forward_responses_to_openai_chat_endpoint(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    decision: &RouteDecision,
+    body: &Value,
+    request_id: &str,
+    output_kind: SyntheticOutputKind,
+) -> Result<Response<BoxBody>> {
+    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let estimated_input_tokens = approximate_input_tokens(&anthropic);
+    let request_body = build_openai_chat_request(&anthropic, &decision.selected_model, false);
+    let url = format!(
+        "{}/chat/completions",
+        endpoint.base_url.trim_end_matches('/')
+    );
+    let mut outbound = state
+        .http
+        .post(url)
+        .header("content-type", "application/json")
+        .json(&request_body);
+    outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return response_from_reqwest(
+            resp,
+            status,
+            Some(decision),
+            state.opts.metrics.clone(),
+            Some(request_id.to_owned()),
+            Some(estimated_input_tokens),
+        )
+        .await;
+    }
+    let value = resp.json::<Value>().await?;
+    let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
+    record_remote_completion(
+        state.opts.metrics.as_ref(),
+        request_id,
+        StatusCode::OK.as_u16(),
+        usage_u64(&anthropic, "input_tokens").or(Some(estimated_input_tokens)),
+        usage_u64(&anthropic, "output_tokens"),
+        Some(decision.selected_model.clone()),
+    );
+    if responses_wants_stream(body) {
+        Ok(synthetic_responses_sse(
+            decision,
+            &anthropic,
+            request_id,
+            estimated_input_tokens,
+            output_kind,
+        ))
+    } else {
+        Ok(synthetic_responses_json(
+            decision,
+            &anthropic,
+            request_id,
+            estimated_input_tokens,
+            output_kind,
+        ))
+    }
 }
 
 async fn forward_anthropic_endpoint(
@@ -993,6 +2122,7 @@ async fn forward_openai_chat_endpoint(
 enum AuthStyle {
     Anthropic,
     Bearer,
+    ClientBearer,
 }
 
 /// Resolve the auth scheme actually used for an endpoint: an explicit `auth`
@@ -1001,6 +2131,7 @@ fn resolve_auth_style(endpoint: &EndpointConfig, protocol_default: AuthStyle) ->
     match endpoint.auth {
         Some(AuthMode::Bearer) => AuthStyle::Bearer,
         Some(AuthMode::ApiKey) => AuthStyle::Anthropic,
+        Some(AuthMode::ClientBearer) => AuthStyle::ClientBearer,
         None => protocol_default,
     }
 }
@@ -1023,6 +2154,7 @@ fn apply_endpoint_headers(
         request = match resolve_auth_style(endpoint, protocol_default) {
             AuthStyle::Anthropic => request.header("x-api-key", key),
             AuthStyle::Bearer => request.bearer_auth(key),
+            AuthStyle::ClientBearer => request,
         };
     }
     Ok(request)
@@ -1059,6 +2191,10 @@ async fn response_from_reqwest(
     }
     if let Some(decision) = decision {
         add_decision_headers(&mut headers_out, decision);
+        if let Ok(value) = HeaderValue::from_str(&decision.requested_model) {
+            headers_out.insert("openai-model", value);
+        }
+        headers_out.remove("x-openai-model");
     }
 
     let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
@@ -1490,6 +2626,1031 @@ fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
     headers.insert("x-rayline-policy", policy);
     headers.insert("x-rayline-task-class", task);
     headers.insert("x-rayline-route-id", route_id);
+}
+
+fn responses_to_anthropic_request(body: &Value, model: &str) -> Value {
+    let mut messages = Vec::new();
+    let mut system_parts = Vec::new();
+    let mut converted_tools = Vec::new();
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        for item in input {
+            append_responses_input_as_anthropic(
+                &mut messages,
+                &mut system_parts,
+                &mut converted_tools,
+                item,
+            );
+        }
+    } else if let Some(input) = body.get("input") {
+        let text = content_to_text(input);
+        if !text.is_empty() {
+            messages.push(json!({"role": "user", "content": [{"type": "text", "text": text}]}));
+        }
+    }
+    if messages.is_empty() {
+        messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+    }
+
+    let mut out = Map::new();
+    out.insert("model".to_owned(), Value::String(model.to_owned()));
+    out.insert("messages".to_owned(), Value::Array(messages));
+    out.insert(
+        "stream".to_owned(),
+        Value::Bool(responses_wants_stream(body)),
+    );
+    out.insert(
+        "max_tokens".to_owned(),
+        body.get("max_output_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(4096)),
+    );
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str)
+        && !instructions.trim().is_empty()
+    {
+        system_parts.push(instructions.to_owned());
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools.iter().filter_map(responses_tool_to_anthropic) {
+            converted_tools.push(tool);
+        }
+    }
+    if responses_has_compaction_trigger(body) {
+        system_parts.push(
+            "This is a context compaction request. Return only a concise, durable summary of the conversation state, decisions, pending work, commands, files, and constraints needed to continue later."
+                .to_owned(),
+        );
+    }
+    if !system_parts.is_empty() {
+        out.insert(
+            "system".to_owned(),
+            Value::String(system_parts.join("\n\n")),
+        );
+    }
+    if !converted_tools.is_empty() {
+        out.insert("tools".to_owned(), Value::Array(converted_tools));
+    }
+    Value::Object(out)
+}
+
+fn responses_wants_stream(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn responses_has_compaction_trigger(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+}
+
+fn responses_output_kind(body: &Value) -> SyntheticOutputKind {
+    if responses_has_compaction_trigger(body) {
+        SyntheticOutputKind::Compaction
+    } else {
+        SyntheticOutputKind::Message
+    }
+}
+
+fn append_responses_input_as_anthropic(
+    messages: &mut Vec<Value>,
+    system_parts: &mut Vec<String>,
+    converted_tools: &mut Vec<Value>,
+    item: &Value,
+) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("additional_tools") => {
+            if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                for tool in tools.iter().filter_map(responses_tool_to_anthropic) {
+                    converted_tools.push(tool);
+                }
+            }
+        }
+        Some("message") => {
+            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+            if matches!(role, "system" | "developer") {
+                let text = item
+                    .get("content")
+                    .map(content_to_text)
+                    .unwrap_or_else(|| content_to_text(item));
+                if !text.trim().is_empty() {
+                    system_parts.push(text);
+                }
+                return;
+            }
+            let role = if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            let content = item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|items| responses_content_to_anthropic(items))
+                .unwrap_or_else(|| vec![json!({"type": "text", "text": content_to_text(item)})]);
+            messages.push(json!({"role": role, "content": content}));
+        }
+        Some("agent_message") => {
+            let author = item
+                .get("author")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            let recipient = item
+                .get("recipient")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let text = item
+                .get("content")
+                .map(content_to_text)
+                .unwrap_or_else(|| content_to_text(item));
+            if !text.trim().is_empty() {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": format!("[{author} -> {recipient}]\n{text}")}]
+                }));
+            }
+        }
+        Some("function_call") | Some("custom_tool_call") => {
+            let id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_rayline");
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let arguments = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .unwrap_or_else(|| json!({}));
+            messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": arguments}]
+            }));
+        }
+        Some("local_shell_call") => {
+            let text = content_to_text(item);
+            if !text.trim().is_empty() {
+                messages.push(
+                    json!({"role": "assistant", "content": [{"type": "text", "text": text}]}),
+                );
+            }
+        }
+        Some("function_call_output")
+        | Some("custom_tool_call_output")
+        | Some("mcp_tool_call_output") => {
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_rayline");
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": function_output_to_text(item.get("output").unwrap_or(&Value::Null)),
+                }]
+            }));
+        }
+        Some("tool_search_output") => {
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_rayline");
+            let content = format!(
+                "status: {}\nexecution: {}\ntools: {}",
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed"),
+                item.get("execution").and_then(Value::as_str).unwrap_or(""),
+                item.get("tools").cloned().unwrap_or_else(|| json!([]))
+            );
+            messages.push(json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}]
+            }));
+        }
+        Some("compaction") | Some("compaction_summary") | Some("context_compaction") => {
+            let text = item
+                .get("encrypted_content")
+                .or_else(|| item.get("content"))
+                .map(content_to_text)
+                .unwrap_or_else(|| content_to_text(item));
+            if !text.trim().is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("Context compaction summary:\n{text}")}]
+                }));
+            }
+        }
+        Some("reasoning") | Some("compaction_trigger") => {}
+        _ => {
+            let text = content_to_text(item);
+            if !text.is_empty() {
+                messages.push(json!({"role": "user", "content": [{"type": "text", "text": text}]}));
+            }
+        }
+    }
+}
+
+fn responses_content_to_anthropic(items: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("input_text") | Some("output_text") | Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    out.push(json!({"type": "text", "text": text}));
+                }
+            }
+            Some("input_image") => {
+                if let Some(url) = item.get("image_url").and_then(Value::as_str) {
+                    out.push(openai_image_url_to_anthropic(url));
+                }
+            }
+            Some("input_file") => {
+                let label = item
+                    .get("filename")
+                    .or_else(|| item.get("file_id"))
+                    .or_else(|| item.get("file_data"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("attached file");
+                out.push(json!({"type": "text", "text": format!("[file: {label}]")}));
+            }
+            Some("computer_screenshot") => {
+                let text = item
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(|url| format!("[computer screenshot: {url}]"))
+                    .unwrap_or_else(|| "[computer screenshot]".to_owned());
+                out.push(json!({"type": "text", "text": text}));
+            }
+            _ => {
+                let text = content_to_text(item);
+                if !text.is_empty() {
+                    out.push(json!({"type": "text", "text": text}));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(json!({"type": "text", "text": ""}));
+    }
+    out
+}
+
+fn openai_image_url_to_anthropic(url: &str) -> Value {
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((media_type, data)) = rest.split_once(";base64,")
+    {
+        return json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data}
+        });
+    }
+    json!({"type": "image", "source": {"type": "url", "url": url}})
+}
+
+fn responses_tool_to_anthropic(tool: &Value) -> Option<Value> {
+    if tool.get("type").and_then(Value::as_str) != Some("function") {
+        return None;
+    }
+    let name = tool
+        .get("name")
+        .or_else(|| tool.pointer("/function/name"))?
+        .as_str()?;
+    let description = tool
+        .get("description")
+        .or_else(|| tool.pointer("/function/description"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let input_schema = tool
+        .get("parameters")
+        .or_else(|| tool.pointer("/function/parameters"))
+        .cloned()
+        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+    Some(json!({
+        "name": name,
+        "description": description,
+        "input_schema": input_schema
+    }))
+}
+
+fn function_output_to_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    if let Some(items) = value.get("content").and_then(Value::as_array) {
+        return items
+            .iter()
+            .map(content_to_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if let Some(items) = value.get("content_items").and_then(Value::as_array) {
+        return items
+            .iter()
+            .map(content_to_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    content_to_text(value)
+}
+
+async fn anthropic_response_to_responses(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    request_id: String,
+    estimated_input_tokens: u64,
+    output_kind: SyntheticOutputKind,
+    want_stream: bool,
+) -> Result<Response<BoxBody>> {
+    let status = resp.status();
+    if !status.is_success() {
+        return response_from_reqwest(
+            resp,
+            status,
+            Some(decision),
+            metrics,
+            Some(request_id),
+            Some(estimated_input_tokens),
+        )
+        .await;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.contains("text/event-stream") {
+        if want_stream {
+            return Ok(anthropic_stream_to_responses(
+                resp,
+                decision,
+                metrics,
+                request_id,
+                estimated_input_tokens,
+                output_kind,
+            ));
+        }
+        let text = resp.text().await?;
+        let value = anthropic_sse_text_to_message(&text, estimated_input_tokens);
+        Ok(synthetic_responses_json(
+            decision,
+            &value,
+            &request_id,
+            estimated_input_tokens,
+            output_kind,
+        ))
+    } else {
+        let value = resp.json::<Value>().await?;
+        if !want_stream {
+            Ok(synthetic_responses_json(
+                decision,
+                &value,
+                &request_id,
+                estimated_input_tokens,
+                output_kind,
+            ))
+        } else {
+            Ok(synthetic_responses_sse(
+                decision,
+                &value,
+                &request_id,
+                estimated_input_tokens,
+                output_kind,
+            ))
+        }
+    }
+}
+
+fn anthropic_stream_to_responses(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    request_id: String,
+    estimated_input_tokens: u64,
+    output_kind: SyntheticOutputKind,
+) -> Response<BoxBody> {
+    let selected_model = decision.selected_model.clone();
+    let response_id = format!("resp_{}", decision.route_id.replace('-', "_"));
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut translator = AnthropicToResponsesTranslator::new(
+            response_id,
+            selected_model.clone(),
+            estimated_input_tokens,
+            output_kind,
+        );
+        let mut stream = resp.bytes_stream();
+        let mut downstream_open = true;
+        let mut saw_first_token = false;
+        let mut stream_error = None;
+        let initial = translator.start();
+        if tx
+            .send(Ok(Frame::data(Bytes::from(initial))))
+            .await
+            .is_err()
+        {
+            downstream_open = false;
+        }
+        record_remote_token_usage(
+            metrics.as_ref(),
+            Some(&request_id),
+            Some(estimated_input_tokens),
+            None,
+            Some(selected_model.clone()),
+        );
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let emitted = translator.push_bytes(&bytes);
+                    if !emitted.is_empty() {
+                        if !saw_first_token && translator.saw_content {
+                            saw_first_token = true;
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record(MetricsUpdate::FirstToken {
+                                    request_id: request_id.clone(),
+                                });
+                            }
+                        }
+                        if downstream_open
+                            && tx
+                                .send(Ok(Frame::data(Bytes::from(emitted))))
+                                .await
+                                .is_err()
+                        {
+                            downstream_open = false;
+                        }
+                        record_remote_token_usage(
+                            metrics.as_ref(),
+                            Some(&request_id),
+                            Some(translator.input_tokens),
+                            Some(translator.output_tokens_estimate()),
+                            Some(selected_model.clone()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    if downstream_open {
+                        let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let tail = translator.finish();
+        if downstream_open && !tail.is_empty() && stream_error.is_none() {
+            let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+        }
+        if let Some(metrics) = metrics.as_ref() {
+            if let Some(error) = stream_error {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    error,
+                });
+            } else {
+                if !saw_first_token {
+                    metrics.record(MetricsUpdate::FirstToken {
+                        request_id: request_id.clone(),
+                    });
+                }
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    input_tokens: Some(translator.input_tokens),
+                    output_tokens: Some(translator.output_tokens_estimate()),
+                    selected_model: Some(selected_model),
+                });
+            }
+        }
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("openai-model", &decision.requested_model)
+        .body(body_out)
+        .unwrap();
+    add_decision_headers(response.headers_mut(), decision);
+    response
+}
+
+#[derive(Default)]
+struct AnthropicToolBlock {
+    id: String,
+    name: String,
+    input_json: String,
+}
+
+struct AnthropicToResponsesTranslator {
+    response_id: String,
+    selected_model: String,
+    output_kind: SyntheticOutputKind,
+    buffer: String,
+    text: String,
+    tools: HashMap<usize, AnthropicToolBlock>,
+    input_tokens: u64,
+    output_tokens: Option<u64>,
+    running_output_chars: usize,
+    completed: bool,
+    saw_content: bool,
+    text_item_started: bool,
+}
+
+impl AnthropicToResponsesTranslator {
+    fn new(
+        response_id: String,
+        selected_model: String,
+        estimated_input_tokens: u64,
+        output_kind: SyntheticOutputKind,
+    ) -> Self {
+        Self {
+            response_id,
+            selected_model,
+            output_kind,
+            buffer: String::new(),
+            text: String::new(),
+            tools: HashMap::new(),
+            input_tokens: estimated_input_tokens,
+            output_tokens: None,
+            running_output_chars: 0,
+            completed: false,
+            saw_content: false,
+            text_item_started: false,
+        }
+    }
+
+    fn start(&self) -> String {
+        let mut out = String::new();
+        push_sse(
+            &mut out,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.selected_model,
+                }
+            }),
+        );
+        out
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        let mut out = String::new();
+        while let Some(idx) = self.buffer.find("\n\n") {
+            let raw = self.buffer[..idx].to_owned();
+            self.buffer.replace_range(..idx + 2, "");
+            if let Some((event, data)) = parse_sse_event(&raw) {
+                self.process_event(&event, &data, &mut out);
+            }
+        }
+        out
+    }
+
+    fn process_event(&mut self, event: &str, data: &str, out: &mut String) {
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match event {
+            "message_start" => {
+                if let Some(input) = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.input_tokens = input;
+                }
+            }
+            "content_block_start" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use")
+                {
+                    let id = value
+                        .pointer("/content_block/id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("call_rayline")
+                        .to_owned();
+                    let name = value
+                        .pointer("/content_block/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let input_json = value
+                        .pointer("/content_block/input")
+                        .filter(|input| !input.is_null())
+                        .map(Value::to_string)
+                        .unwrap_or_default();
+                    self.tools.insert(
+                        index,
+                        AnthropicToolBlock {
+                            id,
+                            name,
+                            input_json,
+                        },
+                    );
+                }
+            }
+            "content_block_delta" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                match value.pointer("/delta/type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            self.text.push_str(text);
+                            self.running_output_chars += text.len();
+                            self.saw_content = true;
+                            if self.output_kind == SyntheticOutputKind::Message {
+                                self.start_text_item(out);
+                                push_sse(
+                                    out,
+                                    "response.output_text.delta",
+                                    json!({"type": "response.output_text.delta", "delta": text}),
+                                );
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) =
+                            value.pointer("/delta/partial_json").and_then(Value::as_str)
+                            && let Some(tool) = self.tools.get_mut(&index)
+                        {
+                            tool.input_json.push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(tool) = self.tools.remove(&index) {
+                    self.saw_content = true;
+                    let arguments = if tool.input_json.trim().is_empty() {
+                        "{}".to_owned()
+                    } else {
+                        tool.input_json
+                    };
+                    let item = json!({
+                        "type": "function_call",
+                        "name": tool.name,
+                        "arguments": arguments,
+                        "call_id": tool.id,
+                    });
+                    push_sse(
+                        out,
+                        "response.output_item.added",
+                        json!({"type": "response.output_item.added", "item": item}),
+                    );
+                    push_sse(
+                        out,
+                        "response.output_item.done",
+                        json!({"type": "response.output_item.done", "item": item}),
+                    );
+                }
+            }
+            "message_delta" => {
+                if let Some(output) = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.output_tokens = Some(output);
+                }
+            }
+            "message_stop" => {
+                out.push_str(&self.finish());
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if self.completed {
+            return String::new();
+        }
+        self.completed = true;
+        let mut out = String::new();
+        if !self.text.is_empty() {
+            let item = match self.output_kind {
+                SyntheticOutputKind::Message => json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": self.text}],
+                    "phase": "final_answer",
+                }),
+                SyntheticOutputKind::Compaction => json!({
+                    "type": "compaction",
+                    "encrypted_content": self.text,
+                }),
+            };
+            push_sse(
+                &mut out,
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "item": item}),
+            );
+        }
+        let output_tokens = self.output_tokens_estimate();
+        push_sse(
+            &mut out,
+            "response.completed",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": self.response_id,
+                    "status": "completed",
+                    "model": self.selected_model,
+                    "usage": {
+                        "input_tokens": self.input_tokens,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": output_tokens,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": self.input_tokens + output_tokens,
+                    }
+                }
+            }),
+        );
+        out
+    }
+
+    fn start_text_item(&mut self, out: &mut String) {
+        if self.text_item_started {
+            return;
+        }
+        self.text_item_started = true;
+        let item = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "phase": "final_answer",
+        });
+        push_sse(
+            out,
+            "response.output_item.added",
+            json!({"type": "response.output_item.added", "item": item}),
+        );
+    }
+
+    fn output_tokens_estimate(&self) -> u64 {
+        self.output_tokens
+            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1))
+    }
+}
+
+fn parse_sse_event(raw: &str) -> Option<(String, String)> {
+    let mut event = None;
+    let mut data = String::new();
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim());
+        }
+    }
+    Some((event?, data))
+}
+
+fn synthetic_responses_sse(
+    decision: &RouteDecision,
+    anthropic_message: &Value,
+    request_id: &str,
+    estimated_input_tokens: u64,
+    output_kind: SyntheticOutputKind,
+) -> Response<BoxBody> {
+    let response_id = format!("resp_{}", request_id.replace('-', "_"));
+    let mut translator = AnthropicToResponsesTranslator::new(
+        response_id,
+        decision.selected_model.clone(),
+        estimated_input_tokens,
+        output_kind,
+    );
+    let mut events = translator.start();
+    if let Some(usage) = anthropic_message.get("usage") {
+        if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
+            translator.input_tokens = input;
+        }
+        translator.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+    }
+    for (index, block) in anthropic_message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                let tool = AnthropicToolBlock {
+                    id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("call_rayline")
+                        .to_owned(),
+                    name: block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned(),
+                    input_json: block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                        .to_string(),
+                };
+                translator.tools.insert(index, tool);
+                translator.process_event(
+                    "content_block_stop",
+                    &json!({"index": index}).to_string(),
+                    &mut events,
+                );
+            }
+            _ => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    translator.process_event(
+                        "content_block_delta",
+                        &json!({"index": index, "delta": {"type": "text_delta", "text": text}})
+                            .to_string(),
+                        &mut events,
+                    );
+                }
+            }
+        }
+    }
+    events.push_str(&translator.finish());
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("openai-model", &decision.requested_model)
+        .body(full_body(events))
+        .unwrap();
+    add_decision_headers(response.headers_mut(), decision);
+    response
+}
+
+fn synthetic_responses_json(
+    decision: &RouteDecision,
+    anthropic_message: &Value,
+    request_id: &str,
+    estimated_input_tokens: u64,
+    output_kind: SyntheticOutputKind,
+) -> Response<BoxBody> {
+    let response_id = format!("resp_{}", request_id.replace('-', "_"));
+    let output = synthetic_response_items(anthropic_message, output_kind);
+    let output_text = output
+        .iter()
+        .filter_map(|item| {
+            item.get("content")
+                .map(content_to_text)
+                .or_else(|| item.get("encrypted_content").map(content_to_text))
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_tokens = anthropic_message
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(estimated_input_tokens);
+    let output_tokens = anthropic_message
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| (output_text.len() as u64 / 4).max(1));
+    let mut response = json_response(
+        StatusCode::OK,
+        json!({
+            "id": response_id,
+            "object": "response",
+            "created_at": unix_now_secs(),
+            "status": "completed",
+            "model": decision.requested_model,
+            "output": output,
+            "output_text": output_text,
+            "usage": {
+                "input_tokens": input_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": output_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": input_tokens + output_tokens,
+            },
+        }),
+    );
+    response.headers_mut().insert(
+        "openai-model",
+        HeaderValue::from_str(&decision.requested_model)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_VIRTUAL_MODEL)),
+    );
+    add_decision_headers(response.headers_mut(), decision);
+    response
+}
+
+fn synthetic_response_items(
+    anthropic_message: &Value,
+    output_kind: SyntheticOutputKind,
+) -> Vec<Value> {
+    let mut text = String::new();
+    let mut output = Vec::new();
+    for block in anthropic_message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") if output_kind == SyntheticOutputKind::Message => {
+                output.push(json!({
+                    "type": "function_call",
+                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "arguments": block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                        .to_string(),
+                    "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_rayline"),
+                }));
+            }
+            _ => {
+                if let Some(part) = block.get("text").and_then(Value::as_str)
+                    && !part.is_empty()
+                {
+                    text.push_str(part);
+                }
+            }
+        }
+    }
+    if !text.is_empty() {
+        match output_kind {
+            SyntheticOutputKind::Message => output.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+                "phase": "final_answer",
+            })),
+            SyntheticOutputKind::Compaction => output.push(json!({
+                "type": "compaction",
+                "encrypted_content": text,
+            })),
+        }
+    }
+    output
+}
+
+fn anthropic_sse_text_to_message(sse_text: &str, estimated_input_tokens: u64) -> Value {
+    let mut text = String::new();
+    let mut input_tokens = estimated_input_tokens;
+    let mut output_tokens = None;
+    let mut buffer = sse_text.to_owned();
+    while let Some(event) = drain_sse_event(&mut buffer) {
+        let Some((_event, data)) = parse_sse_event(&event) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(input) = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    input_tokens = input;
+                }
+            }
+            Some("content_block_delta") => {
+                if value.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                    && let Some(delta) = value.pointer("/delta/text").and_then(Value::as_str)
+                {
+                    text.push_str(delta);
+                }
+            }
+            Some("message_delta") => {
+                output_tokens = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64);
+            }
+            _ => {}
+        }
+    }
+    let output_tokens = output_tokens.unwrap_or_else(|| (text.len() as u64 / 4).max(1));
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    })
 }
 
 fn build_openai_chat_request(body: &Value, model: &str, want_stream: bool) -> Value {
@@ -2332,6 +4493,15 @@ fn approximate_input_tokens(value: &Value) -> u64 {
     ((system.len() + messages.len()) as u64 / 4).max(1)
 }
 
+fn approximate_responses_input_tokens(value: &Value) -> u64 {
+    let instructions = value
+        .get("instructions")
+        .map(content_to_text)
+        .unwrap_or_default();
+    let input = value.get("input").map(content_to_text).unwrap_or_default();
+    ((instructions.len() + input.len()) as u64 / 4).max(1)
+}
+
 fn content_to_text(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         return text.to_owned();
@@ -2347,8 +4517,23 @@ fn content_to_text(value: &Value) -> String {
         if let Some(text) = obj.get("text").and_then(Value::as_str) {
             return text.to_owned();
         }
+        if let Some(text) = obj.get("output_text").and_then(Value::as_str) {
+            return text.to_owned();
+        }
+        if let Some(text) = obj.get("encrypted_content").and_then(Value::as_str) {
+            return text.to_owned();
+        }
+        if let Some(text) = obj.get("input").and_then(Value::as_str) {
+            return text.to_owned();
+        }
+        if let Some(text) = obj.get("arguments").and_then(Value::as_str) {
+            return text.to_owned();
+        }
         if let Some(content) = obj.get("content") {
             return content_to_text(content);
+        }
+        if let Some(output) = obj.get("output") {
+            return content_to_text(output);
         }
     }
     if value.is_null() {
@@ -2409,6 +4594,13 @@ fn chrono_like_now() -> String {
     }
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2422,6 +4614,7 @@ mod tests {
             }),
             config: Arc::new(config),
             http: reqwest::Client::new(),
+            http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
         }
@@ -2720,6 +4913,211 @@ mod tests {
             config.endpoints.first().unwrap().protocol,
             EndpointProtocol::OpenAIChat
         );
+    }
+
+    #[test]
+    fn openai_responses_protocol_spelling_is_accepted() {
+        let config = serde_json::from_str::<RouterConfig>(
+            r#"{"endpoints":[{"id":"openai","protocol":"openai_responses","base_url":"http://127.0.0.1:1234/v1"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.endpoints.first().unwrap().protocol,
+            EndpointProtocol::OpenAIResponses
+        );
+    }
+
+    #[test]
+    fn responses_request_converts_to_anthropic_messages_and_tools() {
+        let request = json!({
+            "model": "rayline-codex",
+            "instructions": "You are concise.",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Run a command"}
+                ]},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "shell",
+                "description": "Run shell",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }]
+        });
+
+        let converted = responses_to_anthropic_request(&request, "claude-test");
+
+        assert_eq!(converted["model"], "claude-test");
+        assert_eq!(converted["system"], "You are concise.");
+        assert_eq!(converted["messages"][0]["role"], "user");
+        assert_eq!(
+            converted["messages"][0]["content"][0]["text"],
+            "Run a command"
+        );
+        assert_eq!(
+            converted["messages"][1]["content"][0]["type"],
+            "tool_result"
+        );
+        assert_eq!(
+            converted["messages"][1]["content"][0]["tool_use_id"],
+            "call_1"
+        );
+        assert_eq!(converted["tools"][0]["name"], "shell");
+        assert_eq!(
+            converted["tools"][0]["input_schema"]["properties"]["cmd"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn responses_lite_input_converts_developer_messages_and_additional_tools() {
+        let request = json!({
+            "model": "rayline-codex",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [{
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+                }]},
+                {"type": "message", "role": "developer", "content": [
+                    {"type": "input_text", "text": "Follow repo rules."}
+                ]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hello"}
+                ]}
+            ],
+            "stream": false
+        });
+
+        let converted = responses_to_anthropic_request(&request, "claude-test");
+
+        assert_eq!(converted["stream"], false);
+        assert_eq!(converted["system"], "Follow repo rules.");
+        assert_eq!(converted["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(converted["tools"][0]["name"], "exec_command");
+    }
+
+    #[test]
+    fn anthropic_stream_translator_emits_responses_events() {
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "rayline-codex".to_owned(),
+            3,
+            SyntheticOutputKind::Message,
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"shell","input":{}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"date\"}"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_delta",
+            json!({"type":"message_delta","usage":{"output_tokens":7}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+
+        let emitted = format!(
+            "{}{}",
+            translator.start(),
+            translator.push_bytes(upstream.as_bytes())
+        );
+
+        assert!(emitted.contains("\"type\":\"response.created\""));
+        assert!(emitted.contains("\"type\":\"response.output_text.delta\""));
+        assert!(emitted.contains("\"type\":\"function_call\""));
+        assert!(emitted.contains("\"name\":\"shell\""));
+        assert!(emitted.contains("\"type\":\"response.completed\""));
+        assert!(emitted.contains("\"input_tokens\":5"));
+        assert!(emitted.contains("\"output_tokens\":7"));
+    }
+
+    #[test]
+    fn anthropic_stream_translator_can_emit_compaction_output() {
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_compact".to_owned(),
+            "rayline-codex".to_owned(),
+            3,
+            SyntheticOutputKind::Compaction,
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"summary"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+
+        let emitted = format!(
+            "{}{}",
+            translator.start(),
+            translator.push_bytes(upstream.as_bytes())
+        );
+
+        assert!(emitted.contains("\"type\":\"compaction\""));
+        assert!(emitted.contains("\"encrypted_content\":\"summary\""));
+        assert!(!emitted.contains("response.output_text.delta"));
+    }
+
+    #[test]
+    fn synthetic_responses_json_returns_completed_response() {
+        let decision = RouteDecision {
+            target: RouteSelection::Local,
+            requested_model: "rayline-codex".to_owned(),
+            selected_model: "local-model".to_owned(),
+            policy: "main".to_owned(),
+            task_class: "main".to_owned(),
+            route_id: "local-1".to_owned(),
+        };
+        let response = synthetic_responses_json(
+            &decision,
+            &json!({
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            }),
+            "req-test",
+            2,
+            SyntheticOutputKind::Message,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -3054,6 +5452,7 @@ mod tests {
             opts: Arc::new(opts),
             config: Arc::new(default_config("local-model")),
             http: reqwest::Client::new(),
+            http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
         };
@@ -3518,6 +5917,36 @@ mod tests {
             resolve_auth_style(&endpoint, AuthStyle::Bearer),
             AuthStyle::Anthropic
         ));
+        endpoint.auth = Some(AuthMode::ClientBearer);
+        assert!(matches!(
+            resolve_auth_style(&endpoint, AuthStyle::Bearer),
+            AuthStyle::ClientBearer
+        ));
+    }
+
+    #[test]
+    fn client_bearer_endpoint_is_restricted_to_chatgpt_or_loopback() {
+        let mut endpoint = EndpointConfig {
+            id: "codex-subscription".to_owned(),
+            kind: "provider".to_owned(),
+            protocol: EndpointProtocol::OpenAIResponses,
+            base_url: "https://chatgpt.com/backend-api/codex".to_owned(),
+            api_key_env: None,
+            models: vec![],
+            headers: HashMap::new(),
+            auth: Some(AuthMode::ClientBearer),
+        };
+        validate_endpoint(&endpoint).unwrap();
+
+        endpoint.base_url = "http://127.0.0.1:1234/v1".to_owned();
+        validate_endpoint(&endpoint).unwrap();
+
+        endpoint.base_url = "https://example.com/v1".to_owned();
+        assert!(validate_endpoint(&endpoint).is_err());
+
+        endpoint.base_url = "https://chatgpt.com/backend-api/codex".to_owned();
+        endpoint.api_key_env = Some("OPENAI_API_KEY".to_owned());
+        assert!(validate_endpoint(&endpoint).is_err());
     }
 
     /// Feed bytes through the translator one byte at a time to stress the
