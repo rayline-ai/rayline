@@ -14,6 +14,7 @@ use rayline_local_router::{LocalRouterOptions, serve};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 fn free_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -39,9 +40,29 @@ async fn serve_once(listener: TcpListener, response: String) {
     }
 }
 
+async fn serve_once_capture(listener: TcpListener, response: String, tx: oneshot::Sender<String>) {
+    if let Ok((mut sock, _)) = listener.accept().await {
+        let mut buf = [0u8; 16384];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+    }
+}
+
 fn http_sse(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n{body}"
+    )
+}
+
+fn http_json(body: &Value) -> String {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
     )
 }
 
@@ -244,7 +265,11 @@ async fn anthropic_messages_passthrough_preserves_deltas_through_mock() {
         .send()
         .await
         .expect("router request");
-    assert_eq!(resp.status(), 200);
+    if resp.status() != 200 {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        panic!("unexpected status {status}: {body}");
+    }
 
     let events = collect_sse(resp).await;
     let text_deltas = events
@@ -266,6 +291,354 @@ async fn anthropic_messages_passthrough_preserves_deltas_through_mock() {
 
     let _ = std::fs::remove_file(path);
     println!("PASS mock anthropic_messages passthrough: deltas={text_deltas} text={text:?}");
+}
+
+/// Codex/OpenAI Responses mode: a request to the router's `/v1/responses` should
+/// route to an `openai_responses` endpoint, rewrite the upstream model, preserve
+/// SSE events, and keep Codex-facing model identity on the response headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_responses_passthrough_through_mock_no_auth() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_mock\",\"status\":\"in_progress\",\"model\":\"mock-model\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"phase\":\"final_answer\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello Codex\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello Codex\"}],\"phase\":\"final_answer\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_mock\",\"status\":\"completed\",\"model\":\"mock-model\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":5}}}\n\n",
+    );
+    tokio::spawn(serve_once(upstream, http_sse(sse)));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "mock-openai",
+            "protocol": "openai_responses",
+            "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+            "models": ["mock-model"]
+        }],
+        "routes": {
+            "main": {"endpoint": "mock-openai", "model": "mock-model"},
+            "default": {"endpoint": "mock-openai", "model": "mock-model"},
+            "model_routes": {
+                "rayline-local": {"endpoint": "mock-openai", "model": "mock-model"}
+            }
+        }
+    });
+    let path = write_config("openai-responses", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("x-client-request-id", "req_codex_mock")
+        .json(&json!({
+            "model": "rayline-local",
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "tools": []
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "x-rayline-selected-model"),
+        Some("mock-model")
+    );
+    assert_eq!(header(&resp, "openai-model"), Some("rayline-local"));
+
+    let events = collect_sse(resp).await;
+    let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert!(types.contains(&"response.created"));
+    assert!(types.contains(&"response.output_item.added"));
+    assert!(types.contains(&"response.output_text.delta"));
+    assert!(types.contains(&"response.output_item.done"));
+    assert!(types.contains(&"response.completed"));
+    let text: String = events
+        .iter()
+        .filter(|e| e["type"] == "response.output_text.delta")
+        .filter_map(|e| e["delta"].as_str())
+        .collect();
+    assert_eq!(text, "Hello Codex");
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS mock openai_responses passthrough: text={text:?}");
+}
+
+/// Codex subscription mode: Codex owns ChatGPT auth and sends it to Rayline's
+/// custom Responses provider. Rayline must forward those client auth headers only
+/// when the selected endpoint explicitly opts into `auth: client_bearer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_responses_client_bearer_forwards_codex_subscription_headers() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_mock\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_mock\",\"status\":\"completed\",\"model\":\"gpt-5.4\"}}\n\n",
+    );
+    tokio::spawn(serve_once_capture(upstream, http_sse(sse), tx));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "codex-subscription",
+            "protocol": "openai_responses",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "auth": "client_bearer",
+            "models": ["gpt-5.4"]
+        }],
+        "routes": {
+            "main": {"endpoint": "codex-subscription", "model": "gpt-5.4"},
+            "default": {"endpoint": "codex-subscription", "model": "gpt-5.4"},
+            "model_routes": {
+                "rayline-codex": {"endpoint": "codex-subscription", "model": "gpt-5.4"}
+            }
+        }
+    });
+    let path = write_config("openai-client-bearer", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("authorization", "Bearer codex-token")
+        .header("chatgpt-account-id", "workspace-123")
+        .header("x-openai-fedramp", "true")
+        .header("version", "0.142.0")
+        .json(&json!({
+            "model": "rayline-codex",
+            "stream": true,
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    let events = collect_sse(resp).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "response.completed")
+    );
+
+    let captured = rx.await.expect("captured upstream request");
+    assert!(captured.starts_with("POST /responses "));
+    assert!(captured.contains("authorization: Bearer codex-token\r\n"));
+    assert!(captured.contains("chatgpt-account-id: workspace-123\r\n"));
+    assert!(captured.contains("x-openai-fedramp: true\r\n"));
+    assert!(captured.contains("version: 0.142.0\r\n"));
+    assert!(captured.contains("\"model\":\"gpt-5.4\""));
+    assert!(!captured.contains("\"model\":\"rayline-codex\""));
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS mock openai_responses client bearer forwards subscription headers");
+}
+
+/// In client-bearer subscription mode `/v1/models` should be authoritative from
+/// the Codex backend, while still appending Rayline's virtual models so users can
+/// select `rayline-codex` / `rayline-local` in Codex UI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "models": [{
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "supported_in_api": true
+            }]
+        })),
+        tx,
+    ));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "codex-subscription",
+            "protocol": "openai_responses",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "auth": "client_bearer",
+            "models": ["gpt-5.4"]
+        }],
+        "routes": {
+            "main": {"endpoint": "codex-subscription", "model": "gpt-5.4"},
+            "default": {"endpoint": "codex-subscription", "model": "gpt-5.4"}
+        }
+    });
+    let path = write_config("models-client-bearer", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{port}/v1/models?client_version=9.9.9"
+        ))
+        .header("authorization", "Bearer codex-token")
+        .header("chatgpt-account-id", "workspace-123")
+        .header("version", "0.142.0")
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    let body = resp.json::<Value>().await.unwrap();
+    let slugs = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["slug"].as_str())
+        .collect::<Vec<_>>();
+    assert!(slugs.contains(&"gpt-5.4"));
+    assert!(slugs.contains(&"rayline-codex"));
+    assert!(slugs.contains(&"rayline-local"));
+
+    let captured = rx.await.expect("captured upstream request");
+    assert!(captured.starts_with("GET /models?client_version=9.9.9 "));
+    assert!(captured.contains("authorization: Bearer codex-token\r\n"));
+    assert!(captured.contains("chatgpt-account-id: workspace-123\r\n"));
+    assert!(captured.contains("version: 0.142.0\r\n"));
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS mock models client bearer proxies and merges Rayline models");
+}
+
+/// Codex auxiliary Responses endpoint: native `openai_responses` routes should
+/// pass `/v1/responses/compact` through to the upstream and rewrite the model to
+/// the selected upstream model. This keeps native Codex backends authoritative
+/// for non-turn endpoints while synthetic handling only applies to non-native
+/// routes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_responses_compact_passthrough_rewrites_model() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({"output": [{"type": "compaction", "encrypted_content": "summary"}]})),
+        tx,
+    ));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "mock-openai",
+            "protocol": "openai_responses",
+            "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+            "models": ["mock-model"]
+        }],
+        "routes": {
+            "main": {"endpoint": "mock-openai", "model": "mock-model"},
+            "default": {"endpoint": "mock-openai", "model": "mock-model"},
+            "model_routes": {
+                "rayline-local": {"endpoint": "mock-openai", "model": "mock-model"}
+            }
+        }
+    });
+    let path = write_config("openai-compact", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses/compact"))
+        .json(&json!({
+            "model": "rayline-local",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "compact"}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["output"][0]["encrypted_content"],
+        "summary"
+    );
+
+    let captured = rx.await.expect("captured upstream request");
+    assert!(captured.starts_with("POST /v1/responses/compact "));
+    assert!(captured.contains("\"model\":\"mock-model\""));
+    assert!(!captured.contains("\"model\":\"rayline-local\""));
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS mock openai_responses compact passthrough rewrites model");
+}
+
+/// Latest Codex remote compaction uses the regular `/v1/responses` stream with a
+/// `compaction_trigger` input item and expects exactly one `compaction` output
+/// item. Non-native routes synthesize that Responses item from the upstream text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_route_responses_compaction_trigger_emits_compaction_item() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(serve_once(upstream, anthropic_sse("compact summary")));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "anthropic-compatible",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["claude-mock"]
+        }],
+        "routes": {
+            "main": {"endpoint": "anthropic-compatible", "model": "claude-mock"},
+            "default": {"endpoint": "anthropic-compatible", "model": "claude-mock"},
+            "model_routes": {
+                "rayline-local": {"endpoint": "anthropic-compatible", "model": "claude-mock"}
+            }
+        }
+    });
+    let path = write_config("anthropic-responses-compact", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({
+            "model": "rayline-local",
+            "stream": true,
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "compact this"}
+                ]},
+                {"type": "compaction_trigger"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    if resp.status() != 200 {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        panic!("unexpected status {status}: {body}");
+    }
+
+    let events = collect_sse(resp).await;
+    let compaction = events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .expect("output item done");
+    assert_eq!(compaction["item"]["type"], "compaction");
+    assert_eq!(compaction["item"]["encrypted_content"], "compact summary");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "response.completed")
+    );
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS anthropic responses compaction trigger emits compaction item");
 }
 
 /// A minimal Anthropic SSE stream whose single text delta is `text`, so a test can

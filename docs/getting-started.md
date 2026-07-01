@@ -43,6 +43,63 @@ rayline router stop                  # stop it when done
 See [examples/cloud](../examples/cloud) and [examples/local](../examples/local)
 for runnable Python and TypeScript clients.
 
+## Codex CLI And App
+
+Rayline can also expose a local OpenAI Responses-compatible endpoint for Codex.
+This path does not use the Anthropic transparent proxy or a local CA; Codex talks
+directly to Rayline over HTTP on `127.0.0.1`.
+
+For a one-off Codex CLI run, let Rayline start the router and pass temporary
+Codex provider overrides:
+
+```bash
+rayline codex -- exec "summarize this repo"
+```
+
+With no `--config`, `rayline codex` runs in subscription passthrough mode:
+Codex reuses its existing ChatGPT/Codex login, sends those auth headers to
+Rayline, and Rayline forwards them to the ChatGPT Codex backend. This mirrors the
+default `rayline claude` proxy shape: the default stays on the user's
+subscription, and a config can override selected routes to local/API-key
+endpoints.
+
+Use `--model <name>` before `--` to request a different Rayline virtual or
+configured model. Use `--auth none --config <path>` when the config is fully
+API-key/local and should not require Codex ChatGPT auth.
+
+For the Codex desktop app or a reusable CLI profile, write a Codex profile and
+start the Responses router:
+
+```bash
+rayline codex configure
+rayline router start --mode codex --auth subscription
+```
+
+`rayline codex configure` writes `$CODEX_HOME/rayline.config.toml` when
+`CODEX_HOME` is set, otherwise `~/.codex/rayline.config.toml`. The generated
+profile points Codex at:
+
+```text
+http://127.0.0.1:20811/v1
+```
+
+Equivalent manual Codex config:
+
+```toml
+model = "rayline-local"
+model_provider = "rayline"
+forced_login_method = "chatgpt"
+
+[model_providers.rayline]
+name = "Rayline Local"
+base_url = "http://127.0.0.1:20811/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+The router command also accepts `rayline router --mode openai` as shorthand for
+`rayline router start --mode codex`.
+
 Check for CLI updates:
 
 ```bash
@@ -201,16 +258,68 @@ Notes:
 Provider endpoints go in the same static router config. Keep API keys in env vars
 so secrets never live in JSON. By default the local router sends `api_key_env` as
 `x-api-key` for `anthropic_messages` endpoints and as bearer auth for
-`openai_chat` endpoints. Set the optional per-endpoint `auth` field (`"bearer"`
-or `"api_key"`) to override that — for example, OpenRouter's Anthropic-native
-endpoint expects `"bearer"`.
+`openai_chat` and `openai_responses` endpoints. Set the optional per-endpoint
+`auth` field (`"bearer"`, `"api_key"`, or `"client_bearer"`) to override that.
+`client_bearer` forwards Codex's inbound `Authorization` and
+`ChatGPT-Account-ID` headers to the selected upstream and is restricted to the
+ChatGPT Codex backend or loopback development endpoints.
 
-Both protocols stream incrementally: `anthropic_messages` forwards the upstream's
-native Anthropic SSE verbatim, and `openai_chat` translates the upstream OpenAI
-Chat SSE into Anthropic SSE chunk by chunk (one `content_block_delta` per
-fragment) so tokens reach Claude Code as they arrive. `openai_chat` also forwards
-image blocks: Anthropic `image` blocks become OpenAI `image_url` content parts
-(base64 sources become `data:` URLs).
+All protocols stream incrementally on their native path: `anthropic_messages`
+forwards the upstream's native Anthropic SSE verbatim, `openai_chat` translates
+the upstream OpenAI Chat SSE into Anthropic SSE for Claude Code, and
+`openai_responses` forwards OpenAI Responses SSE for Codex/OpenAI-compatible
+clients. `openai_chat` also forwards image blocks: Anthropic `image` blocks
+become OpenAI `image_url` content parts (base64 sources become `data:` URLs).
+
+When Codex talks to the local router, Rayline handles the provider paths Codex
+uses today:
+
+- `GET /v1/models`
+- `POST /v1/responses`
+- `POST /v1/responses/count_tokens`
+- `POST /v1/responses/compact`
+- `POST /v1/memories/trace_summarize`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/alpha/search`
+
+For routes that select an `openai_responses` endpoint, Rayline passes OpenAI
+Responses-family requests through to the upstream and rewrites only the selected
+model. For Anthropic, OpenAI Chat, or local-adapter routes, Rayline translates
+Codex Responses create requests into the target protocol and synthesizes Codex
+Responses SSE/JSON back to the client, including `compaction` output items for
+Codex remote compaction turns.
+
+**Codex subscription passthrough** uses Codex's own ChatGPT login. In a
+`rayline codex --auth subscription --config <path>` config, the shared
+`subscription` sentinel from Claude configs is materialized into this endpoint:
+
+```json
+{
+  "endpoints": [
+    {
+      "id": "codex-subscription",
+      "protocol": "openai_responses",
+      "base_url": "https://chatgpt.com/backend-api/codex",
+      "auth": "client_bearer",
+      "models": ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+    }
+  ],
+  "routes": {
+    "main": {
+      "endpoint": "codex-subscription",
+      "model": "gpt-5.4"
+    },
+    "subagent": {
+      "endpoint": "local",
+      "model": ""
+    }
+  }
+}
+```
+
+That shape keeps the main Codex turn on the user's subscription while allowing a
+local or API-key route for subagents/model overrides.
 
 **Anthropic-compatible endpoint:**
 
@@ -266,10 +375,10 @@ router appends `/v1/messages`) and `auth: "bearer"` so the key is sent as
 }
 ```
 
-**OpenAI** (which has no Anthropic-native endpoint) uses the `openai_chat`
-protocol with `https://api.openai.com/v1` and `OPENAI_API_KEY`. The router opens
-the upstream with `stream: true` and translates the OpenAI Chat SSE into Anthropic
-SSE in real time, so OpenAI also streams token by token:
+**OpenAI for Claude Code** (which has no Anthropic-native endpoint) uses the
+`openai_chat` protocol with `https://api.openai.com/v1` and `OPENAI_API_KEY`.
+The router opens the upstream with `stream: true` and translates the OpenAI Chat
+SSE into Anthropic SSE in real time, so OpenAI also streams token by token:
 
 ```json
 {
@@ -292,6 +401,13 @@ SSE in real time, so OpenAI also streams token by token:
   }
 }
 ```
+
+**OpenAI-compatible Responses for Codex** uses the `openai_responses` protocol
+with a `/v1` base URL. The router opens `/responses`, uses bearer auth when
+`api_key_env` is set, and streams Responses SSE through to Codex. Auxiliary
+Codex provider endpoints under `/responses/*`, `/memories/trace_summarize`,
+`/images/*`, and `/alpha/search` pass through on native `openai_responses`
+routes.
 
 **Arbitrary local OpenAI-compatible endpoint**, including a separately managed
 llama.cpp server:

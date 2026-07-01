@@ -67,6 +67,22 @@ rayline router logs --lines 120
 rayline router stop
 ```
 
+Run Codex CLI through Rayline's local OpenAI Responses-compatible router. With
+no `--config`, Rayline reuses Codex's existing ChatGPT/Codex subscription login
+and forwards through the ChatGPT Codex backend:
+
+```bash
+rayline codex -- exec "summarize this repo"
+```
+
+For the Codex desktop app, write a reusable profile and start the Responses
+router in subscription passthrough mode:
+
+```bash
+rayline codex configure
+rayline router start --mode codex --auth subscription
+```
+
 Check for CLI updates:
 
 ```bash
@@ -111,10 +127,20 @@ and TypeScript, grouped by routing path:
   the call lands on your on-device model:
   [examples/local/python](examples/local/python) ·
   [examples/local/typescript](examples/local/typescript)
+- **Codex / OpenAI Responses** — start the router with
+  `rayline router start --mode codex` and point Codex at
+  `http://127.0.0.1:20811/v1`, or run `rayline codex ...` to have Rayline pass
+  the provider overrides automatically. The default no-config path reuses
+  Codex's ChatGPT subscription auth; explicit configs can route selected
+  requests to local/API-key endpoints. Rayline supports Codex's Responses create
+  stream, model catalog, compaction, memory-summary, images, and search provider
+  calls, with native passthrough when the selected route is an `openai_responses`
+  endpoint.
 
 ## Supported Clients
 
 - Claude Code, Anthropic's CLI coding agent.
+- Codex CLI and Codex app via OpenAI Responses-compatible local routing.
 
 More clients may be supported over time.
 

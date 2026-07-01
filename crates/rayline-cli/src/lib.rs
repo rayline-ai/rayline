@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode};
 pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
+pub mod codex;
 pub mod discover;
 pub mod local_model;
 pub mod onboarding;
@@ -51,6 +52,7 @@ Commands:
   auth       Sign in to hosted Rayline
   status     Show current CLI auth status
   claude     Run Claude Code through Rayline routing
+  codex      Run Codex CLI through Rayline local Responses routing
   router     Start, inspect, or stop the local Rayline router runtime
   top        Show live router request metrics
   local      Configure local model routing
@@ -135,6 +137,39 @@ Options:
   --help                            Show this message and exit
 ";
 
+const CODEX_HELP: &str = "\
+Usage: rayline codex [OPTIONS] [--] [CODEX_ARGS]...
+       rayline codex configure [OPTIONS]
+
+Start Rayline's local OpenAI Responses router and run Codex CLI against it.
+
+Options:
+  --model <model>         Codex model to request through Rayline
+                          (default: rayline-local)
+  --config <path>         Rayline router config (endpoints + routes)
+  --auth <mode>           Codex auth source: auto|subscription|none.
+                          auto uses subscription when --config is absent and
+                          no client auth when --config is present.
+  --subscription          Alias for --auth subscription
+  --help                  Show this message and exit
+";
+
+const CODEX_CONFIGURE_HELP: &str = "\
+Usage: rayline codex configure [OPTIONS]
+
+Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex).
+
+Options:
+  --model <model>         Codex model to request through Rayline
+                          (default: rayline-local)
+  --base-url <url>        Rayline OpenAI Responses base URL
+                          (default: http://127.0.0.1:20811/v1)
+  --auth <mode>           Codex auth source: subscription|none
+                          (default: subscription)
+  --subscription          Alias for --auth subscription
+  --help                  Show this message and exit
+";
+
 const ROUTER_HELP: &str = "\
 Usage: rayline router COMMAND
 
@@ -147,7 +182,7 @@ Commands:
 ";
 
 const ROUTER_START_HELP: &str = "\
-Usage: rayline router start [--route <all|subagents>] [--config <path>]
+Usage: rayline router start [--mode <anthropic|codex>] [--route <all|subagents>] [--config <path>]
 
 Start the local router + transparent proxy daemon and exit, leaving it running.
 Point an Anthropic SDK client at the proxy on http://127.0.0.1:20810 (and trust
@@ -155,6 +190,13 @@ the proxy CA cert) to route requests through it. The on-device model comes from
 your `rayline local` configuration.
 
 Options:
+  --mode <anthropic|codex>  Inbound API surface (default: anthropic). `codex`
+                            exposes OpenAI Responses at http://127.0.0.1:20811/v1.
+  --auth <mode>             Codex auth source when --mode codex:
+                            auto|subscription|none. auto uses subscription
+                            when --config is absent and no client auth when
+                            --config is present.
+  --subscription            Alias for --auth subscription
   --route <all|subagents>   What the proxy routes through the router
                             (default: all). With `all`, request model
                             `rayline-local` to reach the on-device model.
@@ -392,6 +434,17 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
+        RaylineDispatch::CodexRun(request) => codex::run(request).await,
+        RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
+            Ok(message) => {
+                print!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Error: failed to configure Codex profile: {error}");
+                ExitCode::from(1)
+            }
+        },
         RaylineDispatch::RouterStart(request) => {
             match crate::router::start_from_cli(&request).await {
                 Ok(message) => {
@@ -626,6 +679,8 @@ pub enum RaylineDispatch {
     AuthToken(status::AuthTokenRequest),
     AuthLogout(status::AuthLogoutRequest),
     ClaudeRun(claude::RunRequest),
+    CodexRun(codex::RunRequest),
+    CodexConfigure(codex::ConfigureRequest),
     RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
     RouterLogs(router::RouterLogsRequest),
@@ -746,6 +801,8 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
                 .unwrap_or(RaylineDispatch::Unavailable),
             "claude" => parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::ClaudeRun)
+                .unwrap_or(RaylineDispatch::Unavailable),
+            "codex" => parse_codex_dispatch(args, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
                 .unwrap_or(RaylineDispatch::Unavailable),
@@ -1286,6 +1343,142 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
     )
 }
 
+fn parse_codex_dispatch<'a, I>(
+    mut args: std::iter::Peekable<I>,
+    root_env_explicit: bool,
+) -> Option<RaylineDispatch>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    if args
+        .peek()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| arg == "configure")
+    {
+        let _ = args.next();
+        return parse_codex_configure_request(args).map(RaylineDispatch::CodexConfigure);
+    }
+    parse_codex_request(args, root_env_explicit).map(RaylineDispatch::CodexRun)
+}
+
+fn parse_codex_request<'a, I>(
+    mut args: std::iter::Peekable<I>,
+    root_env_explicit: bool,
+) -> Option<crate::codex::RunRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut model = "rayline-local".to_owned();
+    let mut config_path = None;
+    let mut auth_mode = crate::codex::CodexAuthMode::Auto;
+    let mut codex_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        let Some(arg_str) = arg.to_str() else {
+            codex_args.push(arg.clone());
+            codex_args.extend(args.cloned());
+            break;
+        };
+        if arg_str == "--help" {
+            return None;
+        }
+        if arg_str == "--" {
+            codex_args.extend(args.cloned());
+            break;
+        }
+        if let Some((option, value)) = arg_str.split_once('=') {
+            match option {
+                "--model" => {
+                    model = value.to_owned();
+                    continue;
+                }
+                "--config" => {
+                    config_path = Some(PathBuf::from(value));
+                    continue;
+                }
+                "--auth" => {
+                    auth_mode = crate::codex::CodexAuthMode::parse(value)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match arg_str {
+            "--model" => {
+                model = args.next()?.to_str()?.to_owned();
+            }
+            "--config" => {
+                config_path = Some(PathBuf::from(args.next()?));
+            }
+            "--auth" => {
+                auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?;
+            }
+            "--subscription" => {
+                auth_mode = crate::codex::CodexAuthMode::Subscription;
+            }
+            _ => {
+                codex_args.push(arg.clone());
+                codex_args.extend(args.cloned());
+                break;
+            }
+        }
+    }
+
+    Some(crate::codex::RunRequest {
+        model,
+        config_path,
+        auth_mode,
+        codex_args,
+        root_env_explicit,
+    })
+}
+
+fn parse_codex_configure_request<'a, I>(
+    mut args: std::iter::Peekable<I>,
+) -> Option<crate::codex::ConfigureRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut model = "rayline-local".to_owned();
+    let mut base_url = None;
+    let mut auth_mode = crate::codex::CodexAuthMode::Subscription;
+    while let Some(arg) = args.next() {
+        let arg = arg.to_str()?;
+        if arg == "--help" {
+            return None;
+        }
+        if let Some((option, value)) = arg.split_once('=') {
+            match option {
+                "--model" => {
+                    model = value.to_owned();
+                    continue;
+                }
+                "--base-url" => {
+                    base_url = Some(value.to_owned());
+                    continue;
+                }
+                "--auth" => {
+                    auth_mode = crate::codex::CodexAuthMode::parse(value)?;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        match arg {
+            "--model" => model = args.next()?.to_str()?.to_owned(),
+            "--base-url" => base_url = Some(args.next()?.to_str()?.to_owned()),
+            "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
+            "--subscription" => auth_mode = crate::codex::CodexAuthMode::Subscription,
+            _ => return None,
+        }
+    }
+    Some(crate::codex::ConfigureRequest {
+        model,
+        base_url,
+        auth_mode,
+    })
+}
+
 fn parse_router_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env_explicit: bool,
@@ -1293,7 +1486,8 @@ fn parse_router_dispatch<'a, I>(
 where
     I: Iterator<Item = &'a OsString>,
 {
-    match args.next()?.to_str()? {
+    let first_arg = args.next()?;
+    match first_arg.to_str()? {
         "start" => {
             parse_router_start_request(args, root_env_explicit).map(RaylineDispatch::RouterStart)
         }
@@ -1317,6 +1511,12 @@ where
                 crate::router::RouterStopRequest { root_env_explicit },
             ))
         }
+        value if value.starts_with("--") => {
+            let mut start_args = vec![first_arg];
+            start_args.extend(args);
+            parse_router_start_request(start_args.into_iter().peekable(), root_env_explicit)
+                .map(RaylineDispatch::RouterStart)
+        }
         _ => None,
     }
 }
@@ -1334,6 +1534,8 @@ where
     // v2: `--config <file>` drives BOTH main + subagents for headless/agent use;
     // scope is then derived from the config's `routes.main`, so `--route` is ignored.
     let mut config_path = None;
+    let mut api_mode = crate::router::ROUTER_API_MODE_ANTHROPIC.to_owned();
+    let mut codex_auth_mode = crate::codex::CodexAuthMode::Auto;
     while let Some(arg) = args.next() {
         let arg = arg.to_str()?;
         if arg == "--help" {
@@ -1342,6 +1544,26 @@ where
         // Accepted for symmetry with the routing surface; the router daemon is
         // inherently local, so this is a no-op.
         if arg == "--local" {
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--mode=") {
+            api_mode = parse_router_api_mode(value)?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--auth=") {
+            codex_auth_mode = crate::codex::CodexAuthMode::parse(value)?;
+            continue;
+        }
+        if arg == "--mode" {
+            api_mode = parse_router_api_mode(args.next()?.to_str()?)?;
+            continue;
+        }
+        if arg == "--auth" {
+            codex_auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?;
+            continue;
+        }
+        if arg == "--subscription" {
+            codex_auth_mode = crate::codex::CodexAuthMode::Subscription;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--route=") {
@@ -1368,10 +1590,22 @@ where
     }
     .to_owned();
     Some(crate::router::RouterStartCliRequest {
+        api_mode,
         proxy_routing_mode,
         config_path,
+        codex_auth_mode,
         root_env_explicit,
     })
+}
+
+fn parse_router_api_mode(value: &str) -> Option<String> {
+    match value {
+        "anthropic" | "claude" => Some(crate::router::ROUTER_API_MODE_ANTHROPIC.to_owned()),
+        "codex" | "openai" | "responses" | "openai_responses" => {
+            Some(crate::router::ROUTER_API_MODE_CODEX.to_owned())
+        }
+        _ => None,
+    }
 }
 
 fn parse_router_logs_request<'a, I>(
@@ -1760,6 +1994,8 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["auth", "status"] => Some(AUTH_STATUS_HELP),
         ["auth", "token"] => Some(AUTH_TOKEN_HELP),
         ["claude"] | ["claude", "run"] => Some(CLAUDE_HELP),
+        ["codex"] => Some(CODEX_HELP),
+        ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
         ["local"] => Some(LOCAL_HELP),
         ["local", "models"] => Some(LOCAL_MODELS_HELP),
         ["local", "download"] => Some(LOCAL_DOWNLOAD_HELP),
@@ -2429,6 +2665,53 @@ mod tests {
                     request.proxy_routing_mode,
                     crate::router::PROXY_ROUTING_MODE_ALL
                 );
+                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_ANTHROPIC);
+                assert_eq!(request.codex_auth_mode, crate::codex::CodexAuthMode::Auto);
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_start_accepts_codex_mode_aliases() {
+        for mode in ["codex", "openai", "responses"] {
+            match rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--mode", mode]))
+            {
+                RaylineDispatch::RouterStart(request) => {
+                    assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
+                }
+                other => panic!("expected RouterStart for {mode}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn router_mode_shorthand_starts_router() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "router", "--mode", "openai"])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_start_accepts_codex_subscription_auth() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "router",
+            "start",
+            "--mode",
+            "codex",
+            "--auth",
+            "subscription",
+        ])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
+                assert_eq!(
+                    request.codex_auth_mode,
+                    crate::codex::CodexAuthMode::Subscription
+                );
             }
             other => panic!("expected RouterStart, got {other:?}"),
         }
@@ -2482,6 +2765,59 @@ mod tests {
                 );
             }
             other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_dispatch_defaults_to_rayline_local_and_passes_args() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "codex", "--", "exec", "hello"])) {
+            RaylineDispatch::CodexRun(request) => {
+                assert_eq!(request.model, "rayline-local");
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Auto);
+                assert_eq!(request.codex_args, argv(&["exec", "hello"]));
+            }
+            other => panic!("expected CodexRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_dispatch_accepts_subscription_auth() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "codex",
+            "--subscription",
+            "--",
+            "exec",
+            "hello",
+        ])) {
+            RaylineDispatch::CodexRun(request) => {
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
+                assert_eq!(request.codex_args, argv(&["exec", "hello"]));
+            }
+            other => panic!("expected CodexRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_configure_dispatch_accepts_model_and_base_url() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "codex",
+            "configure",
+            "--model",
+            "rayline-codex",
+            "--base-url",
+            "http://127.0.0.1:29999/v1",
+        ])) {
+            RaylineDispatch::CodexConfigure(request) => {
+                assert_eq!(request.model, "rayline-codex");
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
+                assert_eq!(
+                    request.base_url.as_deref(),
+                    Some("http://127.0.0.1:29999/v1")
+                );
+            }
+            other => panic!("expected CodexConfigure, got {other:?}"),
         }
     }
 }
