@@ -68,8 +68,11 @@ pub async fn run(request: RunRequest) -> ExitCode {
         root_env_explicit: request.root_env_explicit,
     };
     match crate::router::start_from_cli(&start_request).await {
-        Ok(message) => {
-            eprint!("{message}");
+        Ok(_) => {
+            eprintln!(
+                "Rayline Codex router ready at http://127.0.0.1:{}/v1",
+                crate::router::DEFAULT_LOCAL_ROUTER_PORT
+            );
         }
         Err(error) => {
             eprintln!("Error: failed to start Rayline Codex router: {error}");
