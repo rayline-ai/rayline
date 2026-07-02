@@ -302,6 +302,7 @@ pub fn materialize_codex_subscription_for_local_router(
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
     let mut changed = ensure_codex_subscription_endpoint(&mut cfg);
     changed |= ensure_codex_subscription_main_route(&mut cfg);
+    changed |= ensure_codex_subscription_model_routes(&mut cfg);
     changed |= rewrite_subscription_routes_for_codex(&mut cfg);
     if !changed {
         return Ok(path.to_path_buf());
@@ -370,6 +371,42 @@ fn ensure_codex_subscription_main_route(cfg: &mut Value) -> bool {
         }),
     );
     true
+}
+
+/// Codex requests carry the sentinel `--model` (`rayline-local` by default, or
+/// `rayline-codex`) rather than a concrete model id. Without an explicit
+/// `model_routes` entry those sentinels match the local router's built-in
+/// `model:rayline-local` policy and land on the (unreachable) local adapter
+/// instead of `routes.main`, so the subscription passthrough 502s. Pin both
+/// sentinels to the Codex subscription endpoint, mirroring the no-`--config`
+/// `subscription_router_config_json`. Existing entries are left untouched.
+fn ensure_codex_subscription_model_routes(cfg: &mut Value) -> bool {
+    let routes = cfg
+        .as_object_mut()
+        .map(|object| object.entry("routes").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut);
+    let Some(routes) = routes else {
+        return false;
+    };
+    let model_routes = routes.entry("model_routes").or_insert_with(|| json!({}));
+    let Some(model_routes) = model_routes.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for model in ["rayline-local", "rayline-codex"] {
+        if model_routes.contains_key(model) {
+            continue;
+        }
+        model_routes.insert(
+            model.to_owned(),
+            json!({
+                "endpoint": crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID,
+                "model": crate::codex::CODEX_SUBSCRIPTION_DEFAULT_MODEL
+            }),
+        );
+        changed = true;
+    }
+    changed
 }
 
 fn rewrite_subscription_routes_for_codex(cfg: &mut Value) -> bool {
@@ -776,6 +813,15 @@ mod tests {
                 && endpoint["base_url"] == crate::codex::CODEX_SUBSCRIPTION_BASE_URL
         }));
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
+        // Codex's default sentinel models must pin to the subscription endpoint,
+        // else they fall through to the built-in local route and 502.
+        for model in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][model]["endpoint"],
+                crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID,
+                "model_route {model} should target the subscription endpoint"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&home);
     }
