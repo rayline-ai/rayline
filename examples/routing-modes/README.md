@@ -91,7 +91,7 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 | **LA** ¹ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | 🟡 R | [`LA.json`](./LA.json) |
 | **LL** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | 🟡 R | [`LL.json`](./LL.json) |
 
-Plus two granular **per-type** variants that split subagents by **type**
+Plus three granular **per-type** variants that split subagents by **type**
 instead of one blanket default:
 
 - [`RLC-per-type.json`](./RLC-per-type.json) — `RLC-per-type`: main cloud;
@@ -104,6 +104,13 @@ instead of one blanket default:
   non-local ones are left un-routed so they pass through with the main. Verified
   on-device: main + `general-purpose` → `target=anthropic` (subscription),
   `Explore` → `target=remote model=qwen2.5-coder:7b` (local).
+- [`ARC-per-type.json`](./ARC-per-type.json) — `ARC-per-type`: main on your Claude
+  **subscription**; only `Explore` → the **cloud router (RCR)**, every other
+  subagent passes through to the subscription (no `routes.subagent` default).
+  ✅ supported. Selective counterpart of `ARC` (which sends *all* subagents to the
+  RCR) — same "un-routed ⇒ passthrough" trick as `AL-per-type`, pointed at
+  `rayline-cloud` instead of local. Verified on-device: main + `general-purpose`
+  → `target=anthropic` (subscription), `Explore` → the cloud router.
 
 **† subscription on the subagent side is not expressible.** Subagents are the
 *routed* class and the router cannot forward your Claude subscription OAuth, so
@@ -183,7 +190,7 @@ is exercised only by the ignored live test.
 
 ## Files ↔ modes
 
-The supported modes ship as **17 config files** (the `❌` modes have none yet):
+The supported modes ship as **18 config files** (the `❌` modes have none yet):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
@@ -204,6 +211,7 @@ The supported modes ship as **17 config files** (the `❌` modes have none yet):
 | [`LL.json`](./LL.json) | ollama (local) | ollama (local) | LL |
 | [`RLC-per-type.json`](./RLC-per-type.json) | rayline-cloud | per-type: `Explore`/`Plan` → ollama, default → rayline-cloud | RLC\* |
 | [`AL-per-type.json`](./AL-per-type.json) | subscription (passthrough) | per-type: `Explore` → ollama, all other subagents → subscription (passthrough) | AL\* |
+| [`ARC-per-type.json`](./ARC-per-type.json) | subscription (passthrough) | per-type: `Explore` → rayline-cloud (RCR), all other subagents → subscription (passthrough) | ARC\* |
 
 The proxy **scope** is derived from `routes.main`:
 

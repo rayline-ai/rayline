@@ -4891,6 +4891,14 @@ mod tests {
             sub_route(&st, "Explore"),
             (ep("ollama"), "qwen2.5-coder:7b".to_owned())
         );
+
+        // ARC-per-type: subscription main (stripped) + no default subagent; only the
+        // Explore type is routed to the cloud router. Cloud-only, so production routes
+        // it via the proxy allowlist (not the LSR); this asserts the one routed leg.
+        let st = load_state(include_str!(
+            "../../../examples/routing-modes/ARC-per-type.json"
+        ));
+        assert_eq!(sub_route(&st, "Explore"), cloud());
     }
 
     #[test]
