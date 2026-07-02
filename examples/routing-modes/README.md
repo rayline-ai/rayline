@@ -93,11 +93,11 @@ proxy). Per column: ✅ = works end-to-end · 🟡 = routes correctly, main only
 | **ARCL** § | `anthropic` | `rayline` | rayline-cloud | on | Anthropic (subscription) | cloud model (RCR may send a subagent → local) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`ARCL.json`](./ARCL.json) |
 | **ARL** | `anthropic` | `rayline` | rayline-local | N/A | Anthropic (subscription) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`ARL.json`](./ARL.json) |
 | **AL** | `anthropic` | `local` | N/A | N/A | Anthropic (subscription) | local model | subscription | ✅ | ✅ ⁵ | ✅ | [`AL.json`](./AL.json) |
-| **LRC** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | 🟡 | ❌ ⁴ | ✅ | [`LRC.json`](./LRC.json) |
+| **LRC** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | 🟡 | ❌ ⁴ | 🟡 | [`LRC.json`](./LRC.json) |
 | **LRCL** ³ | `local` | `rayline` | rayline-cloud | on | local model | cloud model (RCR may send a subagent → local) | rayline | ❌ | ❌ | ❌ | — (may-local) |
-| **LRL** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | 🟡 | ❌ ⁴ | ✅ | [`LRL.json`](./LRL.json) |
-| **LA** ¹ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | 🟡 | ❌ ⁴ | ✅ | [`LA.json`](./LA.json) |
-| **LL** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | 🟡 | ❌ ⁴ | ✅ | [`LL.json`](./LL.json) |
+| **LRL** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | 🟡 | ❌ ⁴ | 🟡 | [`LRL.json`](./LRL.json) |
+| **LA** ¹ | `local` | `anthropic` | N/A | N/A | local model | Anthropic (API key) | subscription / API key | 🟡 | ❌ ⁴ | 🟡 | [`LA.json`](./LA.json) |
+| **LL** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | 🟡 | ❌ ⁴ | 🟡 | [`LL.json`](./LL.json) |
 
 Plus three granular **per-type** variants that split subagents by **type**
 instead of one blanket default:
@@ -130,17 +130,20 @@ instead of one blanket default:
 Swap in a subscription and only the subagent leg breaks; the intent columns show
 what the mode *means*.
 
-**¹ 🟡 R — routes correctly, main only (today) — `agent = local` (`LRC`/`LRL`/`LA`/`LL`).**
-These run the **main** agent on a local model, and it **works** for direct
-(non-subagent) work — but current small local models (e.g. qwen 7B/9B) cannot
-reliably drive Claude Code's tool-use protocol: they emit tool calls as plain text
-instead of invoking tools, so the main agent **does not spawn subagents** (and
-rarely uses `Read`/`Edit`/`Bash`). The subagent leg (cloud / pinned / Anthropic /
-local, per the mode) is therefore never reached. The **routing** is verified for
-the supported configs (see [Tests](#tests)); this is a local-model **capability**
-limit, not a routing bug, and it applies equally to the existing
-`rayline claude --local` / `--local --route all` commands. A more capable local
-model would spawn subagents and lift all four to ✅ Y. The live e2e test
+**¹ 🟡 — routes correctly, main only (today) — `agent = local` (`LRC`/`LRL`/`LA`/`LL`);
+applies to the Claude *and* Router columns.** These run the **main** agent on a
+local model, and it **works** for direct (non-subagent) work — but current small
+local models (e.g. qwen 7B/9B) cannot reliably drive the harness's tool-use
+protocol: they emit tool calls as plain text instead of invoking tools, so the main
+agent **does not spawn subagents** (and rarely uses `Read`/`Edit`/`Bash`). The
+subagent leg (cloud / pinned / Anthropic / local, per the mode) is therefore never
+reached. This is a property of the local **model**, not the entry point: it happens
+whether you launch via `rayline claude --config` **or** `rayline router start
+--config` with an agent client attached (and equally with the existing
+`rayline claude --local` / `--local --route all`). The **routing** itself is
+verified for these configs (see [Tests](#tests)) — the router *would* route a
+subagent-tagged request correctly; nothing generates one. A more capable local main
+would spawn subagents and lift all four to ✅ on Claude/Router. The live e2e test
 (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
 
 **² ❌ N — may-local is inert (`RACL`/`RLCL`).** may-local (`CL`) only ever redirects
@@ -221,18 +224,19 @@ The three share one routing engine, so they agree except where an entry point ad
 a constraint the engine can't lift (Codex's no-subagents + sentinel-model rule;
 Claude's local-main capability limit). Per-cell status:
 
-- **✅** — works end-to-end. Every shipped config is exercised by the hermetic tests
-  below, so **Router** is ✅ for every mode that ships a config. **Claude** is ✅ where
-  the agent path also completes; **Codex** is ✅ only for the subscription mains
-  (⁵). All `router: rayline-local` modes (`RRL`/`RAL`/`RLL`/`ARL`/`LRL`) are ✅ for
+- **✅** — works end-to-end. Every shipped config's routing is exercised by the
+  hermetic tests below, and where a *capable* main drives the run the agent loop
+  completes too. **Codex** is ✅ only for the subscription mains (⁵). Modes with a
+  cloud/capable main and `router: rayline-local` (`RRL`/`RAL`/`RLL`/`ARL`) are ✅ for
   Claude/Router: `router: rayline-local` is **static LSR routing** — the JSON is the
   decider, no ML policy needed. (`RRCL` is ✅ for the client/advertisement contract;
   its actual local redirect is hosted-gated — see §.)
-- **🟡** — *routes correctly, main only* — the **Claude** column for `agent = local`
-  (`LRC`/`LRL`/`LA`/`LL`). The local main runs and works for direct work, but current
-  small local models can't drive Claude Code's `Task` tool, so **no subagents spawn**
-  — see ¹. (Router is still ✅ for these: the routing engine itself routes every
-  class; the limit is the Claude agent, not the router.)
+- **🟡** — *routes correctly, main only* — the **Claude and Router** columns for
+  `agent = local` (`LRC`/`LRL`/`LA`/`LL`). The local main runs and works for direct
+  work, and the router routes every class correctly (hermetic tests), but current
+  small local models can't drive the harness's `Task` tool, so **no subagents spawn**
+  — regardless of whether you launch via `rayline claude` or `rayline router start`
+  (the limit is the local *model*, not the entry point). See ¹.
 - **❌** — not supported. For **Codex**, either a non-subscription main (⁴) or a mode
   that ships no config. For **Claude/Router**, a `rayline`-only sub-axis isn't wired
   yet, for two reasons:
