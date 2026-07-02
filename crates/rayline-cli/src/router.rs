@@ -1644,6 +1644,8 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         }
         start_request.router_config_path = Some(if codex_subscription_auth {
             crate::router_config::materialize_codex_subscription_for_local_router(path, &home)?
+        } else if codex_mode {
+            crate::router_config::materialize_codex_config_for_local_router(path, &home)?
         } else {
             crate::router_config::materialize_for_local_router(path, &home)?
         });
