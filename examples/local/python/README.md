@@ -11,6 +11,14 @@ with `rayline router start` (no Claude session needed); it routes every request
 through the router by default, so requesting `rayline-local` reaches the on-device
 model.
 
+**Flow.** `rayline router start` (optionally `--config <mode>.json`) → your Python
+client → the local proxy on `127.0.0.1:20810` → the router → the endpoint the
+config picks (**local**, **cloud RCR**, or **Anthropic**). With no `--config` the
+router uses Rayline's built-in local config (what this example assumes); pass
+`--config` to drive any routing mode instead. All the modes — and which entry
+points support each — are explained in the
+[routing-modes table](https://github.com/rayline-ai/rayline/blob/main/examples/routing-modes/README.md#modes).
+
 > **Caveats**
 > - The model-name routes (`rayline-local`, `rayline-subagent`) come from
 >   Rayline's built-in local config; you can add your own under
