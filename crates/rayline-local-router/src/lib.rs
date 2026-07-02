@@ -4879,6 +4879,18 @@ mod tests {
         // ARL: subscription main (stripped) → assert the rayline-local subagent only.
         let st = load_state(include_str!("../../../examples/routing-modes/ARL.json"));
         assert_eq!(sub_route(&st, "reviewer"), ds_pro());
+
+        // AL-per-type: subscription main (stripped) + no default subagent; only the
+        // Explore type is routed to a local model. Other subagents and the main pass
+        // through at the proxy layer (not modeled by the LSR), so assert just the one
+        // routed leg the LSR actually executes.
+        let st = load_state(include_str!(
+            "../../../examples/routing-modes/AL-per-type.json"
+        ));
+        assert_eq!(
+            sub_route(&st, "Explore"),
+            (ep("ollama"), "qwen2.5-coder:7b".to_owned())
+        );
     }
 
     #[test]

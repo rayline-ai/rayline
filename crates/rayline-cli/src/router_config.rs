@@ -590,6 +590,10 @@ mod tests {
             ("LRL.json", false, true, true),
             ("ARC.json", true, false, true),
             ("AL.json", true, true, false),
+            // AL-per-type: subscription main (passthrough) + only Explore routed to a
+            // local endpoint → engages the LSR; no cloud endpoint. Unlisted subagents
+            // pass through at the proxy (not a route), so no default subagent needed.
+            ("AL-per-type.json", true, true, false),
             ("LRC.json", false, true, true),
             ("LL.json", false, true, false),
             ("LA.json", false, true, false),
