@@ -9,10 +9,11 @@ any of these entry points (each is a column in the [Modes](#modes) table):
 - **Codex subscription:** `rayline codex --auth subscription --config ./examples/routing-modes/AL.json`
   materializes the same `subscription` sentinel into a Codex
   `client_bearer` endpoint, so Codex's ChatGPT subscription auth is reused for the
-  main leg. Codex has no `Task` subagents, so only `routes.main` is exercised —
-  **subscription-main (`A*`) modes work fully (⁵) and local-main (`L*`) modes
-  route to the on-device model (🟡, ⁴)**; only the cloud-RCR mains stay Codex-❌
-  (⁴).
+  main leg. Current Codex spawns subagents (observed: `collab_spawn`) and Rayline
+  routes them via `routes.subagent`/`routes.subagents`, so a main≠subagent split
+  is exercised — **subscription-main (`A*`) modes work fully (⁵) and local-main
+  (`L*`) modes route to the on-device model (🟡, ⁴)**; only the cloud-RCR mains
+  stay Codex-❌ (⁴).
 
 `--config` drives **both** the main agent (`routes.main`) and subagents
 (`routes.subagent`) from one file — the thing the old `--router-config-path` /
@@ -117,8 +118,9 @@ instead of one blanket default:
 - [`AL-per-type.json`](./AL-per-type.json) — `AL-per-type`: main on your Claude
   **subscription**; only `Explore` → local, and **every other subagent passes
   through to the subscription** (no `routes.subagent` default). Claude ✅ · Router ✅
-  · Codex ✅ (subscription main — ⁵; Codex ignores the per-type split, so it
-  collapses to main → subscription).
+  · Codex ✅ (subscription main — ⁵; Codex's subagents (`collab_spawn`) route via
+  `routes.subagent`/`routes.subagents` when their identifier matches a named
+  entry, else pass through to the subscription).
   This is the selective counterpart of `AL` (which sends *all* subagents local):
   because subagents can't be *routed* to the subscription (the `†` rule), the
   non-local ones are left un-routed so they pass through with the main. Verified
@@ -127,8 +129,9 @@ instead of one blanket default:
 - [`ARC-per-type.json`](./ARC-per-type.json) — `ARC-per-type`: main on your Claude
   **subscription**; only `Explore` → the **cloud router (RCR)**, every other
   subagent passes through to the subscription (no `routes.subagent` default).
-  Claude ✅ · Router ✅ · Codex ✅ (subscription main — ⁵; Codex ignores the per-type
-  split). Selective counterpart of `ARC` (which sends *all* subagents to the
+  Claude ✅ · Router ✅ · Codex ✅ (subscription main — ⁵; Codex's subagents route
+  via `routes.subagent`/`routes.subagents` per their identifier, else pass through
+  to the subscription). Selective counterpart of `ARC` (which sends *all* subagents to the
   RCR) — same "un-routed ⇒ passthrough" trick as `AL-per-type`, pointed at
   `rayline-cloud` instead of local. Verified on-device: main + `general-purpose`
   → `target=anthropic` (subscription), `Explore` → the cloud router.
@@ -195,13 +198,14 @@ subagent advertises may-local) and is likewise verified on-device. The
 advertisement + redirect *plumbing* is hermetically tested; the end-to-end redirect
 is exercised only by the ignored live test.
 
-**⁴ Codex, non-subscription main — depends on the main's provider.** Codex has
-**no `Task` subagents**, so a Codex run only ever exercises `routes.main`; the
-subagent axis (and every mode distinction that lives there) is inert. Codex sends a
-**sentinel `--model`** (`rayline-local` by default); the `--config` codex
-materialization pins that sentinel to `routes.main` (the same helper the
-subscription path uses), so the default model reaches the configured main. What
-then happens splits by the main's provider:
+**⁴ Codex, non-subscription main — depends on the main's provider.** Current Codex
+spawns subagents (`collab_spawn`) that Rayline routes via `routes.subagent` /
+`routes.subagents`, so the subagent axis is live. Codex sends a **sentinel
+`--model`** (`rayline-local` by default) on every turn; the `--config` codex
+materialization pins that sentinel to `routes.main` for **main** turns (the same
+helper the subscription path uses), while the router skips that model_route on
+**subagent** turns so subagent routing applies. The main leg then splits by the
+main's provider:
 
 - **🟡 local main (`L*`: `LRC`/`LRL`/`LA`/`LL`).** The sentinel now routes to the
   config's local endpoint and the on-device model answers. Marked 🟡, not ✅, for
@@ -219,9 +223,10 @@ then happens splits by the main's provider:
 **⁵ ✅ Codex — subscription main via `--auth subscription`.** The `A*` modes route
 `routes.main` to the `subscription` sentinel, which `rayline codex --auth
 subscription` materializes into a Codex `client_bearer` endpoint
-(`chatgpt.com/backend-api/codex`) and pins the sentinel model to it. Codex ignores
-the subagent leg, so `ARC`/`ARCL`/`ARL`/`AL` are **identical from Codex's POV**
-(main → your ChatGPT subscription). Verified on-device: `rayline codex --auth
+(`chatgpt.com/backend-api/codex`) and pins the sentinel model to it for main
+turns. Subagent turns skip that pin and follow `routes.subagent`/`routes.subagents`,
+so `ARC`/`ARCL`/`ARL`/`AL` **can now diverge on the subagent leg** (main → your
+ChatGPT subscription, subagents per config). Verified on-device: `rayline codex --auth
 subscription --config AL.json` (and `ARC.json`) → `codex route
 endpoint:codex-subscription requested=rayline-local selected=gpt-5.4` → reply
 returned. Run it exactly as written — the default model routes correctly (the
@@ -235,14 +240,15 @@ Each mode is scored against the **three entry points** that can drive its config
 - **Claude** — `rayline claude --config <mode>.json` (the full Claude Code agent,
   main + subagents).
 - **Codex** — `rayline codex --config <mode>.json` (Codex CLI; `--auth
-  subscription` for the `A*` modes). Codex has no `Task` subagents, so it only
-  exercises `routes.main` — the whole subagent axis is inert. See ⁴/⁵.
+  subscription` for the `A*` modes). Current Codex spawns subagents
+  (`collab_spawn`), which Rayline routes via `routes.subagent`/`routes.subagents`,
+  so a main≠subagent split is exercised. See ⁴/⁵.
 - **Router** — `rayline router start --config <mode>.json`, then point an Anthropic
   SDK client at the proxy. Pure routing engine; no Claude Code agent driving it.
 
 The three share one routing engine, so they agree except where an entry point adds
-a constraint the engine can't lift (Codex's no-subagents + sentinel-model rule;
-Claude's local-main capability limit). Per-cell status:
+a constraint the engine can't lift (Codex's sentinel-model rule; Claude's
+local-main capability limit). Per-cell status:
 
 - **✅** — works end-to-end. Every shipped config's routing is exercised by the
   hermetic tests below, and where a *capable* main drives the run the agent loop

@@ -34,6 +34,13 @@ pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
 pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-router";
 pub const DEFAULT_SUBAGENT_MODEL: &str = "rayline-subagent";
+/// Codex sentinel `--model` names — virtual "do-routing" markers (the Codex
+/// analogue of [`DEFAULT_VIRTUAL_MODEL`]). Codex must send *some* `model` on
+/// every Responses request, so the CLI stamps one of these when the user picks
+/// no `--model`; it rides on main AND subagent turns alike. The router treats
+/// them as markers, not real models: they never resolve via `model_routes` and
+/// instead fall through to main/subagent routing. See `select_route`.
+pub const CODEX_SENTINEL_MODELS: [&str; 2] = ["rayline-local", "rayline-codex"];
 pub const CONFIG_ENV: &str = "RAYLINE_ROUTER_CONFIG";
 pub const MAIN_ENDPOINT_ENV: &str = "RAYLINE_MAIN_ENDPOINT";
 pub const MAIN_MODEL_ENV: &str = "RAYLINE_MAIN_MODEL";
@@ -192,6 +199,22 @@ enum RouteSelection {
 enum SyntheticOutputKind {
     Message,
     Compaction,
+}
+
+/// Which inbound API surface a request arrived on. Codex traffic hits the
+/// OpenAI Responses endpoints (`/v1/responses` + family); Claude Code hits the
+/// Anthropic `/v1/messages` endpoint. Routing needs this because the Codex
+/// sentinel model handling (see `select_route`) applies only to Codex traffic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiSurface {
+    Anthropic,
+    Codex,
+}
+
+impl ApiSurface {
+    fn is_codex(self) -> bool {
+        matches!(self, ApiSurface::Codex)
+    }
 }
 
 struct OpenAIPassthroughRequest<'a> {
@@ -911,7 +934,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic);
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(header_str)
@@ -1011,7 +1034,7 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     let output_kind = responses_output_kind(&parsed);
     let subagent = headers
@@ -1119,7 +1142,7 @@ async fn handle_openai_passthrough_family(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     forward_openai_family_or_unsupported(
         &state,
@@ -1150,7 +1173,7 @@ async fn handle_openai_auxiliary(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed);
+    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
 
     if let Some(response) = maybe_handle_synthetic_auxiliary(
@@ -1514,7 +1537,12 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .unwrap_or_else(new_request_id)
 }
 
-fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
+fn select_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    surface: ApiSurface,
+) -> RouteDecision {
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -1528,6 +1556,16 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
         .get(RAYLINE_AGENT_TYPE_HEADER)
         .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
         .and_then(header_str);
+    // Codex's sentinel `--model` (`rayline-local`/`rayline-codex`) is a virtual
+    // "do-routing" marker: Codex must send *some* `model` on every Responses
+    // request, so the CLI stamps it when the user picks no model, and it rides on
+    // main AND subagent turns alike. The Codex analogue of Claude's `rayline-router`.
+    // Gated to Codex traffic: on the Anthropic surface these names carry no
+    // sentinel meaning, so an explicit `model: rayline-local` there keeps its
+    // ordinary `model_routes` force-local semantics.
+    let is_codex_sentinel =
+        surface.is_codex() && CODEX_SENTINEL_MODELS.contains(&requested_model.as_str());
+    let is_virtual_marker = requested_model == DEFAULT_VIRTUAL_MODEL || is_codex_sentinel;
     // Guard: a bare `agent_id` header on a main-virtual-model request is
     // treated as stray and does NOT trigger subagent classification. Only a
     // confirmed `agent_type` (set by the proxy after successful meta-file
@@ -1537,27 +1575,63 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
     // local/subagent endpoint when a stray agent-id header leaks through.
     let is_subagent = agent_type.is_some()
         || requested_model == DEFAULT_SUBAGENT_MODEL
-        || (agent_id.is_some() && requested_model != DEFAULT_VIRTUAL_MODEL);
+        || (agent_id.is_some() && !is_virtual_marker);
     let mut policy = if is_subagent { "subagent" } else { "main" }.to_owned();
-    let mut route = if let Some(route) = state.config.routes.model_routes.get(&requested_model) {
+    // Resolve the subagent-specific route (a matching `routes.subagents.<type>`
+    // entry, else the `routes.subagent` default) up front. A subagent turn has an
+    // *explicit* subagent route only when one of these exists.
+    let subagent_target = is_subagent
+        .then(|| {
+            subagent_route(&state.config.routes.subagents, agent_type, agent_id)
+                .map(|(key, route)| (Some(key), route.clone()))
+                .or_else(|| {
+                    state
+                        .config
+                        .routes
+                        .subagent
+                        .clone()
+                        .map(|route| (None, route))
+                })
+        })
+        .flatten();
+    // On a subagent turn the Codex sentinel must NOT resolve via `model_routes`
+    // when an explicit subagent route exists — otherwise that route is dead config
+    // and a main≠subagent Codex split is impossible. But when NO subagent
+    // route exists (e.g. the per-type `AL-per-type`/`ARC-per-type` configs route
+    // only `Explore` and set no `routes.subagent` default), the sentinel
+    // model_route (pinned to `routes.main`) is the intended passthrough for
+    // unmatched subagents — keep it, don't strand them on the local adapter. Main
+    // turns always keep the sentinel model_route (the no-config `default_config`
+    // maps `model_routes[rayline-local]` to the on-device adapter — the documented
+    // "request rayline-local to reach the local model" path). Real model names the
+    // user picks (e.g. `gpt-5.5`) are never sentinels and route unchanged.
+    let skip_sentinel_model_route = is_subagent && is_codex_sentinel && subagent_target.is_some();
+    let mut route = if let Some(route) = state
+        .config
+        .routes
+        .model_routes
+        .get(&requested_model)
+        .filter(|_| !skip_sentinel_model_route)
+    {
         policy = format!("model:{requested_model}");
         route.clone()
     } else if is_subagent {
-        if let Some((configured_key, route)) =
-            subagent_route(&state.config.routes.subagents, agent_type, agent_id)
-        {
-            policy = format!("subagent:{configured_key}");
-            route.clone()
-        } else {
-            state
+        match subagent_target {
+            Some((Some(configured_key), route)) => {
+                policy = format!("subagent:{configured_key}");
+                route
+            }
+            Some((None, route)) => route,
+            None => state
                 .config
                 .routes
-                .subagent
+                .default
                 .clone()
-                .or_else(|| state.config.routes.default.clone())
-                .unwrap_or_else(|| RouteTarget::local(&state.opts.local_model_id))
+                .unwrap_or_else(|| RouteTarget::local(&state.opts.local_model_id)),
         }
-    } else if requested_model == DEFAULT_VIRTUAL_MODEL {
+    } else if is_virtual_marker {
+        // Main turn with a virtual marker → `routes.main` (never direct-model:
+        // the marker is not a real model any endpoint declares).
         state
             .config
             .routes
@@ -1624,8 +1698,13 @@ fn select_route(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDec
 /// occurrence means the `agent_type` header was set by some external caller
 /// without a corresponding `agent_id`, or the subagent model name was used
 /// without an `agent_id` header.
-fn select_route_with_warn(state: &AppState, headers: &HeaderMap, body: &Value) -> RouteDecision {
-    let decision = select_route(state, headers, body);
+fn select_route_with_warn(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+    surface: ApiSurface,
+) -> RouteDecision {
+    let decision = select_route(state, headers, body, surface);
     let agent_id = headers
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
         .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
@@ -4637,7 +4716,7 @@ mod tests {
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(decision.target, RouteSelection::Local);
         assert_eq!(decision.selected_model, "local-model");
@@ -4766,7 +4845,7 @@ mod tests {
         }
         fn main_route(st: &AppState) -> (RouteSelection, String) {
             let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
-            let decision = select_route(st, &HeaderMap::new(), &body);
+            let decision = select_route(st, &HeaderMap::new(), &body, ApiSurface::Anthropic);
             (decision.target, decision.selected_model)
         }
         fn sub_route(st: &AppState, agent_type: &str) -> (RouteSelection, String) {
@@ -4780,7 +4859,7 @@ mod tests {
                 HeaderValue::from_str(agent_type).unwrap(),
             );
             let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
-            let decision = select_route(st, &headers, &body);
+            let decision = select_route(st, &headers, &body, ApiSurface::Anthropic);
             (decision.target, decision.selected_model)
         }
         fn ep(id: &str) -> RouteSelection {
@@ -5198,7 +5277,7 @@ mod tests {
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(
             decision.target,
@@ -5231,7 +5310,7 @@ mod tests {
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(
             decision.target,
@@ -5265,7 +5344,7 @@ mod tests {
         );
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(
             decision.target,
@@ -5276,12 +5355,233 @@ mod tests {
     }
 
     #[test]
+    fn codex_sentinel_subagent_turn_routes_to_subagent() {
+        // Regression: Codex sends the sentinel `rayline-local` on every turn,
+        // including subagent turns, and the CLI materialization injects
+        // `model_routes[rayline-local] = routes.main` to pin the main default.
+        // A subagent turn must still SKIP that model_route and reach
+        // `routes.subagent` — otherwise a main≠subagent Codex split is impossible.
+        let mut config = default_config("local-model");
+        let main = RouteTarget {
+            endpoint: "openai".to_owned(),
+            model: "gpt-5.4".to_owned(),
+            ..Default::default()
+        };
+        config.routes.main = Some(main.clone());
+        config.routes.subagent = Some(RouteTarget {
+            endpoint: "local".to_owned(),
+            model: "local-model".to_owned(),
+            ..Default::default()
+        });
+        // The injected sentinel model_route the subagent turn must NOT follow.
+        config
+            .routes
+            .model_routes
+            .insert("rayline-local".to_owned(), main);
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OPENAI_SUBAGENT_HEADER,
+            HeaderValue::from_static("collab_spawn"),
+        );
+        headers.insert("x-rayline-local-available", HeaderValue::from_static("1"));
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "subagent");
+        assert_eq!(decision.target, RouteSelection::Local);
+        assert_eq!(decision.selected_model, "local-model");
+        assert_eq!(decision.policy, "subagent");
+    }
+
+    /// Builds an `AL-per-type`-shaped config: `routes.main` → subscription-ish
+    /// endpoint (pinned onto the sentinel model_route by materialization), one
+    /// per-type `routes.subagents.Explore` → local, and NO `routes.subagent`
+    /// default. Clears the built-in `default_config` subagent default so the
+    /// "unmatched ⇒ passthrough" behavior is exercised faithfully.
+    fn per_type_codex_config() -> RouterConfig {
+        let mut config = default_config("local-model");
+        let main = RouteTarget {
+            endpoint: "openai".to_owned(),
+            model: "gpt-5.4".to_owned(),
+            ..Default::default()
+        };
+        config.routes.main = Some(main.clone());
+        config.routes.subagent = None;
+        config.routes.subagents.clear();
+        config.routes.subagents.insert(
+            "Explore".to_owned(),
+            RouteTarget {
+                endpoint: "local".to_owned(),
+                model: "local-model".to_owned(),
+                ..Default::default()
+            },
+        );
+        config
+            .routes
+            .model_routes
+            .insert("rayline-local".to_owned(), main);
+        config
+    }
+
+    #[test]
+    fn codex_sentinel_unmatched_subagent_passes_through_to_main() {
+        // Per-type config with no `routes.subagent` default: an UNMATCHED subagent
+        // (not `Explore`) must pass through to `routes.main` via the sentinel
+        // model_route — NOT get stranded on the local adapter.
+        let state = state(per_type_codex_config());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OPENAI_SUBAGENT_HEADER,
+            HeaderValue::from_static("collab_spawn"),
+        );
+        // No `x-rayline-local-available` — mirrors direct Codex traffic.
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "subagent");
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openai".to_owned()),
+            "unmatched subagent should pass through to routes.main, not local"
+        );
+        assert_eq!(decision.selected_model, "gpt-5.4");
+        assert_eq!(decision.policy, "model:rayline-local");
+    }
+
+    #[test]
+    fn codex_sentinel_matched_per_type_subagent_uses_its_route() {
+        // Same per-type config: a MATCHED `Explore` subagent skips the sentinel
+        // model_route and follows its per-type `routes.subagents.Explore` → local.
+        let state = state(per_type_codex_config());
+        let mut headers = HeaderMap::new();
+        headers.insert(OPENAI_SUBAGENT_HEADER, HeaderValue::from_static("Explore"));
+        headers.insert("x-rayline-local-available", HeaderValue::from_static("1"));
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "subagent");
+        assert_eq!(decision.target, RouteSelection::Local);
+        assert_eq!(decision.selected_model, "local-model");
+        assert_eq!(decision.policy, "subagent:Explore");
+    }
+
+    #[test]
+    fn codex_sentinel_main_turn_routes_to_main() {
+        // Codex `--config` case: the CLI materialization injects
+        // `model_routes[rayline-local] = routes.main`, so the MAIN sentinel turn
+        // resolves to the configured main endpoint via that model_route.
+        let mut config = default_config("local-model");
+        let main = RouteTarget {
+            endpoint: "openai".to_owned(),
+            model: "gpt-5.4".to_owned(),
+            ..Default::default()
+        };
+        config.routes.main = Some(main.clone());
+        // Model the materialized `--config`: sentinel pinned to main.
+        config
+            .routes
+            .model_routes
+            .insert("rayline-local".to_owned(), main);
+        let state = state(config);
+        let headers = HeaderMap::new();
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "main");
+        assert_eq!(
+            decision.target,
+            RouteSelection::Endpoint("openai".to_owned())
+        );
+        assert_eq!(decision.selected_model, "gpt-5.4");
+        assert_eq!(decision.policy, "model:rayline-local");
+    }
+
+    #[test]
+    fn no_config_main_rayline_local_keeps_builtin_local_model_route() {
+        // The no-config `default_config` deliberately maps
+        // `model_routes["rayline-local"]` to the on-device adapter — the documented
+        // "request rayline-local to reach the local model" path. A MAIN turn must
+        // keep resolving via that model_route (only subagent turns skip it).
+        let state = state(default_config("local-model"));
+        let headers = HeaderMap::new();
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "main");
+        assert_eq!(decision.target, RouteSelection::Local);
+        assert_eq!(decision.selected_model, "local-model");
+        assert_eq!(decision.policy, "model:rayline-local");
+    }
+
+    #[test]
+    fn no_config_subagent_rayline_local_skips_builtin_model_route() {
+        // Even against the no-config `default_config`, a SUBAGENT turn carrying the
+        // sentinel must skip `model_routes["rayline-local"]` and follow subagent
+        // routing (here `default_config`'s `routes.subagent`, the local adapter).
+        let state = state(default_config("local-model"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OPENAI_SUBAGENT_HEADER,
+            HeaderValue::from_static("collab_spawn"),
+        );
+        headers.insert("x-rayline-local-available", HeaderValue::from_static("1"));
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "subagent");
+        assert_eq!(decision.target, RouteSelection::Local);
+        // Routed by subagent policy, NOT by the `model:rayline-local` model_route.
+        assert_eq!(decision.policy, "subagent");
+    }
+
+    #[test]
+    fn anthropic_subagent_rayline_local_keeps_model_route_force_local() {
+        // On the ANTHROPIC surface, `rayline-local` is NOT a Codex sentinel: an
+        // explicit `model: rayline-local` on a subagent turn keeps its ordinary
+        // `model_routes` force-local semantics and is NOT diverted to a (remote)
+        // subagent route. Regression for the Codex-gating of the sentinel skip.
+        let mut config = default_config("local-model");
+        // A remote subagent default that MUST NOT capture the explicit sentinel.
+        config.routes.subagent = Some(RouteTarget {
+            endpoint: "openai".to_owned(),
+            model: "gpt-5.2".to_owned(),
+            ..Default::default()
+        });
+        // Built-in default_config already maps model_routes[rayline-local] → local.
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("explore"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
+        );
+        headers.insert("x-rayline-local-available", HeaderValue::from_static("1"));
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
+
+        // Honored the force-local model_route, not the remote subagent route.
+        assert_eq!(decision.target, RouteSelection::Local);
+        assert_eq!(decision.policy, "model:rayline-local");
+    }
+
+    #[test]
     fn direct_model_routes_to_declaring_endpoint() {
         let state = state(default_config("local-model"));
         let headers = HeaderMap::new();
         let body = json!({"model": "gpt-5.2", "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(
             decision.target,
@@ -5449,7 +5749,7 @@ mod tests {
         // Explicitly requesting the main virtual model
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
-        let decision = select_route(&state, &headers, &body);
+        let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
         assert_eq!(
             decision.task_class, "main",
@@ -5490,7 +5790,7 @@ mod tests {
         let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
 
         assert_eq!(metrics.snapshot().totals.routing_uncertain, 0);
-        select_route_with_warn(&app_state, &headers, &body);
+        select_route_with_warn(&app_state, &headers, &body, ApiSurface::Anthropic);
         assert_eq!(
             metrics.snapshot().totals.routing_uncertain,
             1,

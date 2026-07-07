@@ -144,8 +144,8 @@ Usage: rayline codex [OPTIONS] [--] [CODEX_ARGS]...
 Start Rayline's local OpenAI Responses router and run Codex CLI against it.
 
 Options:
-  --model <model>         Codex model to request through Rayline
-                          (default: rayline-local)
+  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+                          router config decide (main/subagent routing).
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto uses subscription when --config is absent and
@@ -160,8 +160,8 @@ Usage: rayline codex configure [OPTIONS]
 Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex).
 
 Options:
-  --model <model>         Codex model to request through Rayline
-                          (default: rayline-local)
+  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+                          router config decide (main/subagent routing).
   --base-url <url>        Rayline OpenAI Responses base URL
                           (default: http://127.0.0.1:20811/v1)
   --auth <mode>           Codex auth source: subscription|none
@@ -1368,7 +1368,7 @@ fn parse_codex_request<'a, I>(
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let mut model = "rayline-local".to_owned();
+    let mut model = None;
     let mut config_path = None;
     let mut auth_mode = crate::codex::CodexAuthMode::Auto;
     let mut codex_args = Vec::new();
@@ -1389,7 +1389,7 @@ where
         if let Some((option, value)) = arg_str.split_once('=') {
             match option {
                 "--model" => {
-                    model = value.to_owned();
+                    model = Some(value.to_owned());
                     continue;
                 }
                 "--config" => {
@@ -1405,7 +1405,7 @@ where
         }
         match arg_str {
             "--model" => {
-                model = args.next()?.to_str()?.to_owned();
+                model = Some(args.next()?.to_str()?.to_owned());
             }
             "--config" => {
                 config_path = Some(PathBuf::from(args.next()?));
@@ -1439,7 +1439,7 @@ fn parse_codex_configure_request<'a, I>(
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let mut model = "rayline-local".to_owned();
+    let mut model = None;
     let mut base_url = None;
     let mut auth_mode = crate::codex::CodexAuthMode::Subscription;
     while let Some(arg) = args.next() {
@@ -1450,7 +1450,7 @@ where
         if let Some((option, value)) = arg.split_once('=') {
             match option {
                 "--model" => {
-                    model = value.to_owned();
+                    model = Some(value.to_owned());
                     continue;
                 }
                 "--base-url" => {
@@ -1465,7 +1465,7 @@ where
             }
         }
         match arg {
-            "--model" => model = args.next()?.to_str()?.to_owned(),
+            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
             "--base-url" => base_url = Some(args.next()?.to_str()?.to_owned()),
             "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
             "--subscription" => auth_mode = crate::codex::CodexAuthMode::Subscription,
@@ -2769,12 +2769,27 @@ mod tests {
     }
 
     #[test]
-    fn codex_dispatch_defaults_to_rayline_local_and_passes_args() {
+    fn codex_dispatch_defaults_to_no_model_and_passes_args() {
         match rayline_dispatch_for_argv(&argv(&["rayline", "codex", "--", "exec", "hello"])) {
             RaylineDispatch::CodexRun(request) => {
-                assert_eq!(request.model, "rayline-local");
+                // No `--model` → None, so the CLI stamps the virtual-marker sentinel
+                // internally and the router applies config-driven routing.
+                assert_eq!(request.model, None);
                 assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Auto);
                 assert_eq!(request.codex_args, argv(&["exec", "hello"]));
+            }
+            other => panic!("expected CodexRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_dispatch_accepts_explicit_real_model() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline", "codex", "--model", "gpt-5.5", "--", "exec", "hi",
+        ])) {
+            RaylineDispatch::CodexRun(request) => {
+                assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(request.codex_args, argv(&["exec", "hi"]));
             }
             other => panic!("expected CodexRun, got {other:?}"),
         }
@@ -2805,12 +2820,12 @@ mod tests {
             "codex",
             "configure",
             "--model",
-            "rayline-codex",
+            "gpt-5.5",
             "--base-url",
             "http://127.0.0.1:29999/v1",
         ])) {
             RaylineDispatch::CodexConfigure(request) => {
-                assert_eq!(request.model, "rayline-codex");
+                assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
                 assert_eq!(
                     request.base_url.as_deref(),

@@ -10,6 +10,13 @@ const CODEX_SUBSCRIPTION_CONFIG_FILENAME: &str = "codex-subscription-router.json
 pub const CODEX_SUBSCRIPTION_ENDPOINT_ID: &str = "codex-subscription";
 pub const CODEX_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const CODEX_SUBSCRIPTION_DEFAULT_MODEL: &str = "gpt-5.4";
+/// The internal virtual-marker model Codex is pointed at when the user picks no
+/// `--model`. Codex must send *some* `model` on every Responses request, so this
+/// sentinel stands in for "no explicit model — let the router's config decide"
+/// (mirrors Claude Code's `rayline-router`). The local router recognizes it as a
+/// marker and applies main/subagent routing rather than treating it as a real
+/// model. Users select a real model (e.g. `gpt-5.5`) via `--model` instead.
+pub const CODEX_DEFAULT_SENTINEL_MODEL: &str = "rayline-local";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexAuthMode {
@@ -45,7 +52,12 @@ pub enum EffectiveCodexAuthMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
-    pub model: String,
+    /// The `--model` the user picked, or `None` when they picked none. `None`
+    /// means "route by config": the CLI stamps the internal virtual-marker
+    /// sentinel ([`CODEX_DEFAULT_SENTINEL_MODEL`]) so the local router applies
+    /// main/subagent routing. A `Some(real_model)` is passed through verbatim and
+    /// resolved by the router's direct-model routing.
+    pub model: Option<String>,
     pub config_path: Option<PathBuf>,
     pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
@@ -54,7 +66,8 @@ pub struct RunRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigureRequest {
-    pub model: String,
+    /// See [`RunRequest::model`]. `None` writes the virtual-marker sentinel.
+    pub model: Option<String>,
     pub base_url: Option<String>,
     pub auth_mode: CodexAuthMode,
 }
@@ -84,12 +97,16 @@ pub async fn run(request: RunRequest) -> ExitCode {
         "http://127.0.0.1:{}/v1",
         crate::router::DEFAULT_LOCAL_ROUTER_PORT
     );
+    let model = request
+        .model
+        .as_deref()
+        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
     let mut command = Command::new("codex");
     command
         .arg("-c")
         .arg("model_provider=\"rayline\"")
         .arg("-c")
-        .arg(format!("model={}", toml_string(&request.model)))
+        .arg(format!("model={}", toml_string(model)))
         .arg("-c")
         .arg("model_providers.rayline.name=\"Rayline Local\"")
         .arg("-c")
@@ -147,10 +164,14 @@ pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
     } else {
         String::new()
     };
+    let model = request
+        .model
+        .as_deref()
+        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
     let contents = format!(
         "model = {}\nmodel_provider = \"rayline\"\n{}\
 \n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
-        toml_string(&request.model),
+        toml_string(model),
         if subscription_auth {
             "forced_login_method = \"chatgpt\"\n"
         } else {

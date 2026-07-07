@@ -304,8 +304,9 @@ pub fn materialize_codex_subscription_for_local_router(
     changed |= ensure_codex_subscription_main_route(&mut cfg);
     changed |= rewrite_subscription_routes_for_codex(&mut cfg);
     // After the rewrite `routes.main` is the concrete codex-subscription endpoint,
-    // so the shared sentinel-pinning helper points Codex's default `--model` at it
-    // — same path the non-subscription `--config` case uses.
+    // so pinning the sentinel `--model` to it points Codex's MAIN turns there. The
+    // local router skips this model_route on subagent turns (so `routes.subagent`
+    // governs them) — see `select_route`.
     changed |= ensure_codex_config_model_routes(&mut cfg);
     if !changed {
         return Ok(path.to_path_buf());
@@ -323,10 +324,11 @@ pub fn materialize_codex_subscription_for_local_router(
 }
 
 /// Non-subscription Codex `--config` (e.g. a local/ollama or provider main): like
-/// [`materialize_for_local_router`] but also pins Codex's sentinel `--model`
-/// (`rayline-local`/`rayline-codex`) to `routes.main` (see
-/// [`ensure_codex_config_model_routes`]), so the default request reaches the
-/// configured main endpoint instead of the built-in on-device local slot.
+/// [`materialize_for_local_router`], plus pins Codex's sentinel `--model`
+/// (`rayline-local`/`rayline-codex`) to `routes.main` via [`ensure_codex_config_model_routes`]
+/// so MAIN turns reach the configured main endpoint. The local router skips this
+/// model_route on subagent turns, so `routes.subagent`/`routes.subagents` govern
+/// them (see `select_route`).
 pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io::Result<PathBuf> {
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
@@ -355,12 +357,13 @@ pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io
 }
 
 /// Pin Codex's sentinel `--model` to `routes.main`. Codex sends `rayline-local`
-/// (default) or `rayline-codex`, which would otherwise match the local router's
-/// built-in `model:rayline-local` route and land on the on-device local slot
-/// instead of `routes.main`. Clone the main route onto both sentinels so the
-/// default request reaches the configured main endpoint. Skips the `subscription`
-/// passthrough sentinel (no concrete endpoint here — that's the `--auth
-/// subscription` path) and leaves existing model_routes entries untouched.
+/// (default) or `rayline-codex` on every turn; cloning the main route onto both
+/// sentinels routes MAIN turns to the configured main endpoint. The local router
+/// skips these sentinel `model_routes` on SUBAGENT turns so `routes.subagent` /
+/// `routes.subagents` govern them (see `select_route`) — that is what makes a
+/// main≠subagent Codex split possible. Skips the `subscription` passthrough
+/// sentinel (no concrete endpoint here — that's the `--auth subscription` path)
+/// and leaves existing `model_routes` entries untouched.
 fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
     let Some(main_route) = cfg
         .get("routes")
@@ -852,8 +855,8 @@ mod tests {
                 && endpoint["base_url"] == crate::codex::CODEX_SUBSCRIPTION_BASE_URL
         }));
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
-        // Codex's default sentinel models must pin to the subscription endpoint,
-        // else they fall through to the built-in local route and 502.
+        // Sentinel `--model` pinned to the (rewritten) subscription main so Codex
+        // MAIN turns reach it; the router skips it for subagent turns.
         for model in ["rayline-local", "rayline-codex"] {
             assert_eq!(
                 cfg["routes"]["model_routes"][model]["endpoint"],
@@ -867,8 +870,9 @@ mod tests {
 
     #[test]
     fn materialize_codex_config_pins_sentinel_models_to_main() {
-        // Non-subscription Codex --config (local main): the sentinel --model must
-        // route to routes.main (ollama), not the built-in on-device local slot.
+        // Non-subscription Codex --config (local main): the sentinel `--model` pins
+        // to routes.main (ollama) so MAIN turns reach it; the router skips it on
+        // subagent turns so routes.subagent governs those.
         let home = tmp_home();
         let path = home.join("codex-local.json");
         std::fs::write(
@@ -894,11 +898,10 @@ mod tests {
         for model in ["rayline-local", "rayline-codex"] {
             assert_eq!(
                 cfg["routes"]["model_routes"][model]["endpoint"], "ollama",
-                "sentinel {model} should route to the configured main endpoint"
+                "sentinel {model} should pin to the configured main endpoint"
             );
             assert_eq!(cfg["routes"]["model_routes"][model]["model"], "qwen3.5:9b");
         }
-        // main + subagent untouched.
         assert_eq!(cfg["routes"]["main"]["endpoint"], "ollama");
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
 
