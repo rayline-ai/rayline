@@ -852,6 +852,29 @@ mod tests {
     }
 
     #[test]
+    fn recommended_without_pick_is_readable_but_not_engageable() {
+        // The Codex hybrid-default gate keys on "a non-provider local model config
+        // exists" (read_from_home + not-a-provider), NOT on is_engageable(). A
+        // Recommended config with no explicit pick is a valid on-device candidate
+        // (resolve_start_model can auto-select an already-downloaded curated
+        // model), yet is_engageable() is false. Gating on is_engageable() would
+        // wrongly skip it. Lock in the two facts the gate relies on.
+        let home = temp_home();
+        crate::status::write_settings(
+            &home,
+            &serde_json::json!({ "local_model": { "mode": "recommended" } }),
+        )
+        .unwrap();
+
+        let cfg = read_from_home(&home).expect("recommended-no-pick config must be readable");
+        assert_eq!(cfg.mode, LocalModelMode::Recommended);
+        // Not a provider-backed local → the hybrid gate would engage it.
+        assert!(crate::providers::provider_from_local_config(&cfg).is_none());
+        // But it has no pick, so is_engageable() is false — the old prefilter's bug.
+        assert!(!cfg.is_engageable());
+    }
+
+    #[test]
     fn render_show_labels_provider_configs() {
         let home = temp_home();
         set_provider_endpoint_in_home(

@@ -1665,8 +1665,54 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     }
 
     if codex_subscription_auth {
-        start_request.router_config_path =
-            Some(crate::codex::write_subscription_router_config(&home)?);
+        // Default `rayline codex` (no `--config`): mirror `rayline claude`'s
+        // graceful hybrid — main on the ChatGPT subscription, subagents on the
+        // on-device model when one is usable. Codex surfaces every subagent as a
+        // single generic `collab_spawn`, so this is a `routes.subagent → local`
+        // default (not a per-type allowlist like Claude's). When no usable local
+        // model exists — or resolving/downloading it fails — fall back to the
+        // zero-setup all-subscription behavior instead of blocking.
+        //
+        // Attempt the hybrid whenever a bundled/recommended local model config
+        // exists, and let `resolve_start_model` be the authority on whether it can
+        // actually serve — it also handles the "no explicit pick but a curated
+        // model is already downloaded" case via `auto_select_downloaded`, which a
+        // stricter `is_engageable()` prefilter would wrongly skip. If it can't
+        // resolve (nothing downloaded, GGUF missing, etc.) it returns `Err` and we
+        // fall back to all-subscription below.
+        //
+        // Scoped to bundled/recommended models: for a provider-backed local
+        // (ollama/lmstudio), `resolve_start_model` would rewrite the router config
+        // into a provider-centric one and clobber the subscription `main` route.
+        // That advanced shape is better expressed with an explicit `--config`;
+        // here we keep `main → subscription` intact.
+        let local_configured = crate::local_model::read_from_home(&home)
+            .filter(|cfg| crate::providers::provider_from_local_config(cfg).is_none())
+            .is_some();
+        if local_configured {
+            let hybrid = {
+                let mut req = start_request.clone();
+                req.router_config_path =
+                    Some(crate::codex::write_subscription_router_config(&home, true)?);
+                resolve_start_model(&home, req).await
+            };
+            match hybrid {
+                Ok(hybrid) => {
+                    return finish_start_from_cli(&home, &hybrid, &bin_path, codex_mode).await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "rayline codex: on-device subagent routing unavailable ({error}); \
+                         running subagents on your subscription. Set up a local model with \
+                         `{} local onboard` to offload them on-device.",
+                        cli_name()
+                    );
+                }
+            }
+        }
+        start_request.router_config_path = Some(crate::codex::write_subscription_router_config(
+            &home, false,
+        )?);
         start_request.no_local_model = true;
         return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
     }

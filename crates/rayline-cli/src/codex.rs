@@ -197,7 +197,7 @@ pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
     ))
 }
 
-pub fn write_subscription_router_config(home: &Path) -> io::Result<PathBuf> {
+pub fn write_subscription_router_config(home: &Path, subagents_local: bool) -> io::Result<PathBuf> {
     let path = home
         .join(".config")
         .join(crate::CONFIG_DIR)
@@ -205,13 +205,36 @@ pub fn write_subscription_router_config(home: &Path) -> io::Result<PathBuf> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let body =
-        serde_json::to_vec_pretty(&subscription_router_config_json()).map_err(io::Error::other)?;
+    let body = serde_json::to_vec_pretty(&subscription_router_config_json(subagents_local))
+        .map_err(io::Error::other)?;
     fs::write(&path, body)?;
     Ok(path)
 }
 
-pub fn subscription_router_config_json() -> serde_json::Value {
+/// The zero-config `rayline codex --auth subscription` router config.
+///
+/// `main` always routes to the ChatGPT subscription. When `subagents_local` is
+/// true (a usable on-device model is available), `subagent` routes to the local
+/// adapter — the hybrid default that mirrors `rayline claude`'s "main on cloud,
+/// subagents on-device" shape. When false (no local model), subagents stay on
+/// the subscription, preserving the zero-setup all-subscription behavior.
+///
+/// The `model_routes` sentinels stay pinned to the subscription: they resolve
+/// the sentinel `--model` on **main** turns. Subagent turns skip these sentinel
+/// model_routes and follow `routes.subagent` (see `select_route` in the local
+/// router), which is what makes the main≠subagent split take effect.
+pub fn subscription_router_config_json(subagents_local: bool) -> serde_json::Value {
+    let subscription = || {
+        json!({
+            "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
+            "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
+        })
+    };
+    let subagent = if subagents_local {
+        json!({ "endpoint": "local" })
+    } else {
+        subscription()
+    };
     json!({
         "endpoints": [{
             "id": CODEX_SUBSCRIPTION_ENDPOINT_ID,
@@ -225,27 +248,12 @@ pub fn subscription_router_config_json() -> serde_json::Value {
             ]
         }],
         "routes": {
-            "main": {
-                "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-                "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-            },
-            "subagent": {
-                "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-                "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-            },
-            "default": {
-                "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-                "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-            },
+            "main": subscription(),
+            "subagent": subagent,
+            "default": subscription(),
             "model_routes": {
-                "rayline-codex": {
-                    "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-                    "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-                },
-                "rayline-local": {
-                    "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-                    "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-                }
+                "rayline-codex": subscription(),
+                "rayline-local": subscription()
             }
         }
     })
@@ -288,7 +296,10 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_codex_version_text;
+    use super::{
+        CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, parse_codex_version_text,
+        subscription_router_config_json,
+    };
 
     #[test]
     fn parses_codex_cli_version_output() {
@@ -301,6 +312,53 @@ mod tests {
             Some("1.2.3-beta.1+build")
         );
         assert_eq!(parse_codex_version_text("codex-cli\n"), None);
+    }
+
+    #[test]
+    fn subscription_config_all_subscription_when_no_local_model() {
+        // Fallback shape (no usable local model): main AND subagent → subscription.
+        let cfg = subscription_router_config_json(false);
+        assert_eq!(
+            cfg["routes"]["main"]["endpoint"],
+            CODEX_SUBSCRIPTION_ENDPOINT_ID
+        );
+        assert_eq!(
+            cfg["routes"]["main"]["model"],
+            CODEX_SUBSCRIPTION_DEFAULT_MODEL
+        );
+        assert_eq!(
+            cfg["routes"]["subagent"]["endpoint"],
+            CODEX_SUBSCRIPTION_ENDPOINT_ID
+        );
+        // Sentinel model_routes always pin main to the subscription.
+        for m in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][m]["endpoint"],
+                CODEX_SUBSCRIPTION_ENDPOINT_ID
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_config_hybrid_routes_subagents_local() {
+        // Hybrid shape (usable local model): main → subscription, subagent → local.
+        let cfg = subscription_router_config_json(true);
+        assert_eq!(
+            cfg["routes"]["main"]["endpoint"],
+            CODEX_SUBSCRIPTION_ENDPOINT_ID
+        );
+        assert_eq!(cfg["routes"]["subagent"]["endpoint"], "local");
+        // No model pinned on the local subagent route — the router fills the
+        // configured local model id.
+        assert!(cfg["routes"]["subagent"].get("model").is_none());
+        // Sentinels still pin MAIN turns to the subscription; subagent turns skip
+        // them (see the local router's select_route).
+        for m in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][m]["endpoint"],
+                CODEX_SUBSCRIPTION_ENDPOINT_ID
+            );
+        }
     }
 }
 
