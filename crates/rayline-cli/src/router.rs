@@ -2307,6 +2307,13 @@ fn spawn_router(
             router_api_key.unwrap_or_default(),
             request.proxy_port,
         );
+    } else if let Some(key) = router_api_key.filter(|key| !key.is_empty()) {
+        // Proxy disabled (e.g. the isolated local-plane path uses a separate proxy
+        // sidecar), but the local router daemon itself still needs
+        // RAYLINE_ROUTER_API_KEY when a config route targets the hosted
+        // `rayline-cloud` endpoint (e.g. RAC/RAL). Export it directly rather than
+        // via `set_proxy_child_env`, which also scrubs proxy env not relevant here.
+        command.env("RAYLINE_ROUTER_API_KEY", key);
     }
     command.env("RUST_LOG", "info");
     command
@@ -2646,6 +2653,18 @@ fn router_meta(
     if let Some(bin_path) = bin_path {
         meta.insert("bin_path".to_owned(), bin_path.display().to_string());
     }
+    // Track the router key in BOTH proxy and non-proxy modes. The non-proxy
+    // local-plane path (isolated mixed configs like RAC/RAL) exports
+    // RAYLINE_ROUTER_API_KEY to the daemon for a `rayline-cloud` endpoint, so a
+    // key acquired (first login) or rotated after the daemon is already running
+    // counts as a config change and restarts the daemon — otherwise the reuse
+    // check keeps a stale/missing key and 502s cloud routes. This mirrors
+    // `proxy_meta`'s conditional recording (both share the "removed key isn't
+    // detected" limitation of `metadata_matches_config`, which is pre-existing
+    // and out of scope here).
+    if let Some(fingerprint) = router_key_fingerprint(router_api_key) {
+        meta.insert("router_key_sha256".to_owned(), fingerprint);
+    }
     if request.enable_proxy {
         meta.insert("proxy_enabled".to_owned(), "true".to_owned());
         meta.insert("proxy_port".to_owned(), request.proxy_port.to_string());
@@ -2653,9 +2672,6 @@ fn router_meta(
             "proxy_routing_mode".to_owned(),
             request.proxy_routing_mode.clone(),
         );
-        if let Some(fingerprint) = router_key_fingerprint(router_api_key) {
-            meta.insert("router_key_sha256".to_owned(), fingerprint);
-        }
         meta.insert(
             "ca_cert_path".to_owned(),
             proxy_ca_cert_path(home).display().to_string(),
@@ -2893,15 +2909,17 @@ fn effective_start_request(
 }
 
 fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Result<Option<String>> {
-    if !request.enable_proxy {
-        return Ok(None);
-    }
-    // Config-driven local routing can carry an explicit key (e.g. the
-    // `rayline auth login` key) so a hosted cloud-router endpoint in the config
-    // authenticates without a manual env var. The local router on :20811 itself
-    // needs no auth, so an empty override is fine too.
+    // An explicit override (e.g. the `rayline auth login` session key injected
+    // for a config whose `rayline-cloud` endpoint reads `RAYLINE_ROUTER_API_KEY`)
+    // is honored regardless of `enable_proxy`. The isolated local-plane path
+    // starts the router with `enable_proxy = false`, so gating on it here would
+    // drop the key and 502 the cloud leg with `requires $RAYLINE_ROUTER_API_KEY`
+    // for mixed configs (e.g. RAC: rayline-cloud main + anthropic subagent).
     if let Some(override_key) = request.router_api_key_override.as_deref() {
         return Ok(Some(override_key.to_owned()));
+    }
+    if !request.enable_proxy {
+        return Ok(None);
     }
     if request.decision_plane == DECISION_PLANE_LOCAL {
         // The local router on :20811 needs no auth, but a config endpoint may read
@@ -3370,6 +3388,45 @@ mod tests {
             requested.get("router_config_sha256")
         );
         assert!(!metadata_matches_config(&on_disk, &requested));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn metadata_detects_router_key_acquisition_in_non_proxy_mode() {
+        // Regression: a non-proxy local-plane router (isolated mixed configs like
+        // RAC) exports RAYLINE_ROUTER_API_KEY for a rayline-cloud endpoint. A key
+        // acquired after the daemon is already running (first launch pre-login →
+        // relaunch post-login) must be tracked in router_meta so the reuse check
+        // restarts the daemon instead of keeping a keyless env.
+        let home = unique_test_dir("router-key-meta");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.local_model_id = "local-model".to_owned();
+        assert!(
+            !request.enable_proxy,
+            "isolated local-plane runs proxy-disabled"
+        );
+
+        // Daemon first started without a key (pre-login) records no fingerprint.
+        let keyless = router_meta(&home, &request, None, None);
+        assert!(!keyless.contains_key("router_key_sha256"));
+
+        // Relaunch after ensure_router_key succeeds — now carries the session key.
+        let keyed = router_meta(&home, &request, None, Some("rlk-session-key"));
+        assert!(keyed.contains_key("router_key_sha256"));
+
+        // Acquisition (keyless → keyed) is seen as a config change → restart.
+        assert!(!metadata_matches_config(&keyless, &keyed));
+
+        // Rotation (keyed → different key) is a change.
+        let rotated = router_meta(&home, &request, None, Some("rlk-rotated-key"));
+        assert_ne!(
+            keyed.get("router_key_sha256"),
+            rotated.get("router_key_sha256")
+        );
+        assert!(!metadata_matches_config(&keyed, &rotated));
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -3948,6 +4005,45 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn router_api_key_override_survives_disabled_proxy() {
+        // Regression: the isolated local-plane path starts the router with
+        // enable_proxy = false. An explicit `router_api_key_override` (the
+        // `rayline auth login` session key injected for a config whose
+        // `rayline-cloud` endpoint reads RAYLINE_ROUTER_API_KEY, e.g. RAC/RAL)
+        // must still be resolved — not dropped by the proxy gate — so the cloud
+        // main leg authenticates instead of 502-ing.
+        let home = unique_test_dir("router-key-override");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.enable_proxy = false;
+        request.router_api_key_override = Some("rlk-test-session-key".to_owned());
+
+        let resolved = resolve_router_api_key(&home, &request).unwrap();
+        assert_eq!(resolved.as_deref(), Some("rlk-test-session-key"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn no_override_and_disabled_proxy_resolves_to_none() {
+        // Without an explicit override, a disabled proxy short-circuits to None
+        // (the local router on :20811 needs no auth of its own). The override fix
+        // only affects the has-override case.
+        let home = unique_test_dir("router-key-noneoverride");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let mut request = RouterStartRequest::local_router_defaults(false);
+        request.enable_proxy = false;
+        request.router_api_key_override = None;
+
+        let resolved = resolve_router_api_key(&home, &request).unwrap();
+        assert_eq!(resolved, None);
+
+        let _ = std::fs::remove_dir_all(home);
     }
 }
 
