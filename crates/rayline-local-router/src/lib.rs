@@ -3226,6 +3226,13 @@ fn anthropic_stream_to_responses(
     response
 }
 
+/// True for `{}` — an object with no keys. Used to reject the placeholder
+/// `input` Anthropic sends on a `tool_use` `content_block_start`, whose real
+/// arguments arrive as `input_json_delta` fragments.
+fn is_empty_json_object(value: &Value) -> bool {
+    value.as_object().is_some_and(Map::is_empty)
+}
+
 #[derive(Default)]
 struct AnthropicToolBlock {
     id: String,
@@ -3329,9 +3336,15 @@ impl AnthropicToResponsesTranslator {
                         .and_then(Value::as_str)
                         .unwrap_or("tool")
                         .to_owned();
+                    // Anthropic streams a `tool_use` block's arguments via
+                    // `input_json_delta` fragments; the `input` on
+                    // `content_block_start` is a placeholder (`{}`) that must not
+                    // seed `input_json`, or the deltas append to it and yield
+                    // concatenated JSON like `{}{"plan":...}`. Codex then parses
+                    // only the leading `{}` and rejects with `missing field 'plan'`.
                     let input_json = value
                         .pointer("/content_block/input")
-                        .filter(|input| !input.is_null())
+                        .filter(|input| !input.is_null() && !is_empty_json_object(input))
                         .map(Value::to_string)
                         .unwrap_or_default();
                     self.tools.insert(
@@ -5165,6 +5178,93 @@ mod tests {
         assert!(emitted.contains("\"type\":\"response.completed\""));
         assert!(emitted.contains("\"input_tokens\":5"));
         assert!(emitted.contains("\"output_tokens\":7"));
+        // The placeholder `input:{}` on `content_block_start` must not seed the
+        // arguments, otherwise the deltas concatenate onto it and produce
+        // invalid `{}{"cmd":"date"}`.
+        assert!(emitted.contains("\"arguments\":\"{\\\"cmd\\\":\\\"date\\\"}\""));
+        assert!(!emitted.contains("{}{"));
+    }
+
+    #[test]
+    fn anthropic_stream_tool_use_placeholder_input_does_not_corrupt_plan_args() {
+        // Regression for the Responses↔Anthropic bridge dropping `plan`:
+        // Anthropic opens a `tool_use` block with a placeholder `input:{}` and
+        // streams the real arguments as `input_json_delta` fragments. Seeding
+        // `input_json` from the placeholder yielded `{}{"plan":[...]}`, which
+        // Codex parsed as the leading `{}` and rejected with
+        // `missing field 'plan'`.
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "rayline-codex".to_owned(),
+            3,
+            SyntheticOutputKind::Message,
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"update_plan","input":{}}}),
+        );
+        // Real arguments arrive split across two fragments, as Anthropic streams.
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"plan\":[{\"step\":"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"map dirs\",\"status\":\"pending\"}]}"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+
+        let emitted = format!(
+            "{}{}",
+            translator.start(),
+            translator.push_bytes(upstream.as_bytes())
+        );
+
+        // The emitted function_call arguments must be the exact, valid JSON
+        // Claude produced — with `plan` present and no placeholder prefix.
+        let args = extract_function_call_arguments(&emitted);
+        let parsed: Value = serde_json::from_str(&args).expect("arguments must be valid JSON");
+        assert!(
+            parsed.get("plan").is_some(),
+            "plan field must survive: {args}"
+        );
+        assert!(
+            !args.starts_with("{}"),
+            "placeholder must not be prefixed: {args}"
+        );
+    }
+
+    /// Pull the `arguments` string out of the first `function_call` item in a
+    /// Responses SSE stream.
+    fn extract_function_call_arguments(sse: &str) -> String {
+        let mut buffer = sse.to_owned();
+        while let Some(event) = drain_sse_event(&mut buffer) {
+            let Some((_event, data)) = parse_sse_event(&event) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") {
+                if let Some(args) = value.pointer("/item/arguments").and_then(Value::as_str) {
+                    return args.to_owned();
+                }
+            }
+        }
+        panic!("no function_call item found in stream");
     }
 
     #[test]
