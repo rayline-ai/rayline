@@ -37,8 +37,19 @@ impl CodexAuthMode {
 
     pub fn effective_for_run(self, config_path: Option<&PathBuf>) -> EffectiveCodexAuthMode {
         match self {
-            Self::Auto if config_path.is_some() => EffectiveCodexAuthMode::None,
-            Self::Auto | Self::Subscription => EffectiveCodexAuthMode::Subscription,
+            // `auto` with a `--config`: the config drives auth. If its `main`
+            // routes to the `subscription` sentinel, resolve to subscription so
+            // the ChatGPT backend is materialized — otherwise the sentinel has no
+            // concrete endpoint and 502-loops on a placeholder address. Any other
+            // main (local/provider/cloud) needs no client auth.
+            Self::Auto => match config_path {
+                Some(path) if crate::router_config::config_main_is_passthrough(path) => {
+                    EffectiveCodexAuthMode::Subscription
+                }
+                Some(_) => EffectiveCodexAuthMode::None,
+                None => EffectiveCodexAuthMode::Subscription,
+            },
+            Self::Subscription => EffectiveCodexAuthMode::Subscription,
             Self::None => EffectiveCodexAuthMode::None,
         }
     }
@@ -297,9 +308,23 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, parse_codex_version_text,
-        subscription_router_config_json,
+        CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
+        EffectiveCodexAuthMode, parse_codex_version_text, subscription_router_config_json,
     };
+    use std::path::PathBuf;
+
+    fn write_config(name: &str, body: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rayline-codex-auth-test-{}-{name}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
 
     #[test]
     fn parses_codex_cli_version_output() {
@@ -359,6 +384,79 @@ mod tests {
                 CODEX_SUBSCRIPTION_ENDPOINT_ID
             );
         }
+    }
+
+    #[test]
+    fn auto_without_config_resolves_to_subscription() {
+        assert_eq!(
+            CodexAuthMode::Auto.effective_for_run(None),
+            EffectiveCodexAuthMode::Subscription
+        );
+    }
+
+    #[test]
+    fn auto_with_subscription_main_config_resolves_to_subscription() {
+        // Regression: `--auth auto` + a `main: subscription` config must resolve to
+        // subscription (materializing the ChatGPT backend) instead of "no auth",
+        // which routed the sentinel to a dead placeholder and 502-looped.
+        let path = write_config(
+            "sub-main",
+            r#"{"routes":{"main":{"endpoint":"subscription"},"subagent":{"endpoint":"local"}}}"#,
+        );
+        assert_eq!(
+            CodexAuthMode::Auto.effective_for_run(Some(&path)),
+            EffectiveCodexAuthMode::Subscription
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_with_absent_main_resolves_to_subscription() {
+        // An absent `routes.main` is treated as the subscription passthrough.
+        let path = write_config("no-main", r#"{"routes":{"subagent":{"endpoint":"local"}}}"#);
+        assert_eq!(
+            CodexAuthMode::Auto.effective_for_run(Some(&path)),
+            EffectiveCodexAuthMode::Subscription
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_with_non_subscription_main_config_resolves_to_none() {
+        // A local/provider main needs no client auth — auto stays "none".
+        let path = write_config(
+            "local-main",
+            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
+        );
+        assert_eq!(
+            CodexAuthMode::Auto.effective_for_run(Some(&path)),
+            EffectiveCodexAuthMode::None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_modes_ignore_config() {
+        let path = write_config(
+            "local-main2",
+            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
+        );
+        // `--auth subscription` always subscription, even against a local-main config.
+        assert_eq!(
+            CodexAuthMode::Subscription.effective_for_run(Some(&path)),
+            EffectiveCodexAuthMode::Subscription
+        );
+        // `--auth none` always none, even against a subscription-main config.
+        let sub = write_config(
+            "sub-main2",
+            r#"{"routes":{"main":{"endpoint":"subscription"}}}"#,
+        );
+        assert_eq!(
+            CodexAuthMode::None.effective_for_run(Some(&sub)),
+            EffectiveCodexAuthMode::None
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(sub);
     }
 }
 
