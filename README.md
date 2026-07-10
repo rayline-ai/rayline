@@ -75,13 +75,18 @@ and forwards through the ChatGPT Codex backend:
 rayline codex -- exec "summarize this repo"
 ```
 
-For the Codex desktop app, write a reusable profile and start the Responses
-router in subscription passthrough mode:
+Launch the Codex **desktop app** through Rayline in one step — it accepts the
+same flags as `rayline codex`, starts the router, and points the app at Rayline:
 
 ```bash
-rayline codex configure
-rayline router start --mode codex --auth subscription
+rayline codex app                 # opens the desktop app routed through Rayline
+rayline codex app ~/projects/app  # optionally open a workspace
 ```
+
+Rayline sets the app up on an isolated Codex home so it doesn't disturb your
+normal Codex configuration. Because the desktop app is single-instance, if it is
+already running with a different configuration, `rayline codex app` prompts
+before restarting it.
 
 Check for CLI updates:
 
@@ -129,8 +134,9 @@ and TypeScript, grouped by routing path:
   [examples/local/typescript](examples/local/typescript)
 - **Codex / OpenAI Responses** — start the router with
   `rayline router start --mode codex` and point Codex at
-  `http://127.0.0.1:20811/v1`, or run `rayline codex ...` to have Rayline pass
-  the provider overrides automatically. The default no-config path reuses
+  `http://127.0.0.1:20811/v1`, run `rayline codex ...` to have Rayline pass the
+  provider overrides automatically, or `rayline codex app` to launch the Codex
+  desktop app routed through Rayline. The default no-config path reuses
   Codex's ChatGPT subscription auth; explicit configs can route selected
   requests to local/API-key endpoints. Rayline supports Codex's Responses create
   stream, model catalog, compaction, memory-summary, images, and search provider

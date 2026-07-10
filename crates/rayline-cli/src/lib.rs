@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
 pub mod codex;
+pub mod codex_app;
 pub mod discover;
 pub mod local_model;
 pub mod onboarding;
@@ -139,6 +140,7 @@ Options:
 
 const CODEX_HELP: &str = "\
 Usage: rayline codex [OPTIONS] [--] [CODEX_ARGS]...
+       rayline codex app [OPTIONS] [WORKSPACE]
        rayline codex configure [OPTIONS]
 
 Start Rayline's local OpenAI Responses router and run Codex CLI against it.
@@ -150,6 +152,25 @@ Options:
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto uses subscription when --config is absent and
                           no client auth when --config is present.
+  --subscription          Alias for --auth subscription
+  --help                  Show this message and exit
+";
+
+const CODEX_APP_HELP: &str = "\
+Usage: rayline codex app [OPTIONS] [WORKSPACE]
+
+Start Rayline's local router and launch the Codex desktop app against it.
+
+Unlike the CLI, the desktop app-server ignores -c overrides and is
+single-instance, so this writes the Rayline provider into an isolated
+CODEX_HOME (~/.rayline/codex-app-home) and launches the app there. If the app
+is already running on a different config, you'll be prompted to restart it.
+
+Options:
+  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+                          router config decide (main/subagent routing).
+  --config <path>         Rayline router config (endpoints + routes)
+  --auth <mode>           Codex auth source: auto|subscription|none.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
@@ -435,6 +456,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
         },
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
         RaylineDispatch::CodexRun(request) => codex::run(request).await,
+        RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
         RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
             Ok(message) => {
                 print!("{message}");
@@ -680,6 +702,7 @@ pub enum RaylineDispatch {
     AuthLogout(status::AuthLogoutRequest),
     ClaudeRun(claude::RunRequest),
     CodexRun(codex::RunRequest),
+    CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
     RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
@@ -1350,15 +1373,81 @@ fn parse_codex_dispatch<'a, I>(
 where
     I: Iterator<Item = &'a OsString>,
 {
-    if args
-        .peek()
-        .and_then(|arg| arg.to_str())
-        .is_some_and(|arg| arg == "configure")
-    {
-        let _ = args.next();
-        return parse_codex_configure_request(args).map(RaylineDispatch::CodexConfigure);
+    match args.peek().and_then(|arg| arg.to_str()) {
+        Some("configure") => {
+            let _ = args.next();
+            parse_codex_configure_request(args).map(RaylineDispatch::CodexConfigure)
+        }
+        Some("app") => {
+            let _ = args.next();
+            parse_codex_app_request(args, root_env_explicit).map(RaylineDispatch::CodexApp)
+        }
+        _ => parse_codex_request(args, root_env_explicit).map(RaylineDispatch::CodexRun),
     }
-    parse_codex_request(args, root_env_explicit).map(RaylineDispatch::CodexRun)
+}
+
+fn parse_codex_app_request<'a, I>(
+    mut args: std::iter::Peekable<I>,
+    root_env_explicit: bool,
+) -> Option<crate::codex_app::AppRunRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut model = None;
+    let mut config_path = None;
+    let mut auth_mode = crate::codex::CodexAuthMode::Auto;
+    let mut codex_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        let Some(arg_str) = arg.to_str() else {
+            codex_args.push(arg.clone());
+            codex_args.extend(args.cloned());
+            break;
+        };
+        if arg_str == "--help" {
+            return None;
+        }
+        if arg_str == "--" {
+            codex_args.extend(args.cloned());
+            break;
+        }
+        if let Some((option, value)) = arg_str.split_once('=') {
+            match option {
+                "--model" => {
+                    model = Some(value.to_owned());
+                    continue;
+                }
+                "--config" => {
+                    config_path = Some(PathBuf::from(value));
+                    continue;
+                }
+                "--auth" => {
+                    auth_mode = crate::codex::CodexAuthMode::parse(value)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match arg_str {
+            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
+            "--config" => config_path = Some(PathBuf::from(args.next()?)),
+            "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
+            "--subscription" => auth_mode = crate::codex::CodexAuthMode::Subscription,
+            _ => {
+                codex_args.push(arg.clone());
+                codex_args.extend(args.cloned());
+                break;
+            }
+        }
+    }
+
+    Some(crate::codex_app::AppRunRequest {
+        model,
+        config_path,
+        auth_mode,
+        codex_args,
+        root_env_explicit,
+    })
 }
 
 fn parse_codex_request<'a, I>(
@@ -1995,6 +2084,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["auth", "token"] => Some(AUTH_TOKEN_HELP),
         ["claude"] | ["claude", "run"] => Some(CLAUDE_HELP),
         ["codex"] => Some(CODEX_HELP),
+        ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
         ["local"] => Some(LOCAL_HELP),
         ["local", "models"] => Some(LOCAL_MODELS_HELP),
@@ -2810,6 +2900,42 @@ mod tests {
                 assert_eq!(request.codex_args, argv(&["exec", "hello"]));
             }
             other => panic!("expected CodexRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_app_dispatch_accepts_flags_and_workspace() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "codex",
+            "app",
+            "--config",
+            "/tmp/cfg.json",
+            "--subscription",
+            "/work/space",
+        ])) {
+            RaylineDispatch::CodexApp(request) => {
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
+                assert_eq!(
+                    request.config_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/cfg.json"))
+                );
+                // The workspace path is passed through to `codex app`.
+                assert_eq!(request.codex_args, argv(&["/work/space"]));
+            }
+            other => panic!("expected CodexApp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_app_dispatch_defaults_and_passes_workspace() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "codex", "app", "."])) {
+            RaylineDispatch::CodexApp(request) => {
+                assert_eq!(request.model, None);
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Auto);
+                assert_eq!(request.codex_args, argv(&["."]));
+            }
+            other => panic!("expected CodexApp, got {other:?}"),
         }
     }
 

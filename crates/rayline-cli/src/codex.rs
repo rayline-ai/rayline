@@ -153,21 +153,27 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
-pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    fs::create_dir_all(&codex_home)?;
-    let profile_path = codex_home.join("rayline.config.toml");
-    let base_url = request.base_url.clone().unwrap_or_else(|| {
-        format!(
-            "http://127.0.0.1:{}/v1",
-            crate::router::DEFAULT_LOCAL_ROUTER_PORT
-        )
-    });
-    let subscription_auth =
-        request.auth_mode.effective_for_run(None) == EffectiveCodexAuthMode::Subscription;
+/// The default Rayline OpenAI Responses base URL (the local router's `/v1`).
+pub fn default_rayline_base_url() -> String {
+    format!(
+        "http://127.0.0.1:{}/v1",
+        crate::router::DEFAULT_LOCAL_ROUTER_PORT
+    )
+}
+
+/// Render the `[model_providers.rayline]` TOML block that points Codex at the
+/// Rayline local router.
+///
+/// This is the single source of truth for the Codex-side provider config,
+/// shared by `rayline codex configure` (writes it as `$CODEX_HOME/
+/// rayline.config.toml`) and `rayline codex app` (writes it as the default
+/// `config.toml` inside an isolated `CODEX_HOME`, since the desktop app-server
+/// ignores `-c` overrides and only reads persistent config).
+pub fn rayline_provider_config_toml(
+    model: &str,
+    base_url: &str,
+    subscription_auth: bool,
+) -> String {
     let http_headers = if subscription_auth {
         codex_cli_version_header()
             .map(|version| format!("http_headers = {{ version = {} }}\n", toml_string(&version)))
@@ -175,11 +181,7 @@ pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
     } else {
         String::new()
     };
-    let model = request
-        .model
-        .as_deref()
-        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
-    let contents = format!(
+    format!(
         "model = {}\nmodel_provider = \"rayline\"\n{}\
 \n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
         toml_string(model),
@@ -188,14 +190,34 @@ pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
         } else {
             ""
         },
-        toml_string(&base_url),
+        toml_string(base_url),
         if subscription_auth {
             "requires_openai_auth = true\n"
         } else {
             ""
         },
         http_headers,
-    );
+    )
+}
+
+pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    fs::create_dir_all(&codex_home)?;
+    let profile_path = codex_home.join("rayline.config.toml");
+    let base_url = request
+        .base_url
+        .clone()
+        .unwrap_or_else(default_rayline_base_url);
+    let subscription_auth =
+        request.auth_mode.effective_for_run(None) == EffectiveCodexAuthMode::Subscription;
+    let model = request
+        .model
+        .as_deref()
+        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
+    let contents = rayline_provider_config_toml(model, &base_url, subscription_auth);
     fs::write(&profile_path, contents)?;
     Ok(format!(
         "Wrote Codex Rayline profile: {}\nStart Rayline with `rayline router start --mode codex --auth {}`, then use Codex profile `rayline`.\nBase URL: {base_url}\n",

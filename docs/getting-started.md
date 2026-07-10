@@ -67,8 +67,37 @@ Use `--model <name>` before `--` to request a different Rayline virtual or
 configured model. Use `--auth none --config <path>` when the config is fully
 API-key/local and should not require Codex ChatGPT auth.
 
-For the Codex desktop app or a reusable CLI profile, write a Codex profile and
-start the Responses router:
+### Desktop app
+
+`rayline codex app` launches the Codex **desktop app** through Rayline in one
+step. It accepts the same flags as `rayline codex` (`--config`, `--auth`,
+`--model`), starts the router, and points the app at Rayline:
+
+```bash
+rayline codex app                 # launch the desktop app routed through Rayline
+rayline codex app ~/projects/app  # optionally open a workspace path
+rayline codex app --auth none --config <path>   # local/API-key routing
+```
+
+Rayline runs the desktop app on an isolated Codex home
+(`~/.rayline/codex-app-home`) so it never disturbs your normal Codex
+configuration:
+
+- On first launch it seeds that home from your existing Codex config (preserving
+  your settings) and uses your Codex login when auth resolves to subscription.
+  On later launches it refreshes only the Rayline routing and preserves whatever
+  the app has since saved (open projects, plugins, and other app settings).
+- The app is single-instance. If it is already running with a **different**
+  configuration, `rayline codex app` prompts before quitting and relaunching it;
+  if it already matches, it just brings the window to the front.
+- With `--auth none` (or a local-only config), your Codex login is not used for
+  the isolated app.
+
+### Reusable CLI profile
+
+To write a standalone Codex profile (for the CLI, or manual configuration)
+instead of launching the app, use `rayline codex configure` and start the
+router yourself:
 
 ```bash
 rayline codex configure
