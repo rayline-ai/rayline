@@ -446,8 +446,10 @@ async fn openai_responses_client_bearer_forwards_codex_subscription_headers() {
 }
 
 /// In client-bearer subscription mode `/v1/models` should be authoritative from
-/// the Codex backend, while still appending Rayline's virtual models so users can
-/// select `rayline-codex` / `rayline-local` in Codex UI.
+/// the Codex backend, while appending only the single Codex-default sentinel
+/// `rayline-local` (what the CLI stamps as Codex's default `model`, so it must be
+/// reselectable). The other sentinels (`rayline-router`/`rayline-subagent`
+/// /`rayline-codex`) stay valid wire values but must not pollute the picker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -501,8 +503,10 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
         .filter_map(|model| model["slug"].as_str())
         .collect::<Vec<_>>();
     assert!(slugs.contains(&"gpt-5.4"));
-    assert!(slugs.contains(&"rayline-codex"));
     assert!(slugs.contains(&"rayline-local"));
+    assert!(!slugs.contains(&"rayline-router"));
+    assert!(!slugs.contains(&"rayline-codex"));
+    assert!(!slugs.contains(&"rayline-subagent"));
 
     let captured = rx.await.expect("captured upstream request");
     assert!(captured.starts_with("GET /models?client_version=9.9.9 "));

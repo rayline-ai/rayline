@@ -72,7 +72,7 @@ impl Default for LocalRouterOptions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouterConfig {
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
@@ -344,6 +344,15 @@ fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
 fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<()> {
     for endpoint in &config.endpoints {
         validate_endpoint(endpoint)?;
+        if endpoint_hidden_from_catalog(endpoint) {
+            // Only the catalog is affected; the route stays and fails at request
+            // time with its normal error if something actually targets it.
+            warn!(
+                "hiding endpoint {:?} from model catalog: {} unset",
+                endpoint.id,
+                endpoint.api_key_env.as_deref().unwrap_or_default()
+            );
+        }
     }
     if let Some(route) = config.routes.main.as_mut() {
         normalize_route_target(route, local_model_id)?;
@@ -670,27 +679,149 @@ fn static_models_response(state: &AppState) -> Response<BoxBody> {
     json_response(StatusCode::OK, static_models_value(state))
 }
 
-fn static_model_values(state: &AppState) -> Vec<Value> {
-    let mut models = vec![
-        model_json(DEFAULT_VIRTUAL_MODEL),
-        model_json(DEFAULT_SUBAGENT_MODEL),
-        model_json("rayline-codex"),
-        model_json("rayline-local"),
-    ];
-    for endpoint in &state.config.endpoints {
+/// A `/v1/models` catalog entry: the wire id/slug plus the friendly label Codex
+/// shows in its picker. The id is the routing value clients send back; only the
+/// `display_name` is cosmetic.
+struct CatalogModel {
+    id: String,
+    display_name: String,
+}
+
+/// The one Codex sentinel advertised in `/v1/models`. The `rayline codex` CLI
+/// stamps this as Codex's default `model` (its `CODEX_DEFAULT_SENTINEL_MODEL`),
+/// so it must appear in the picker — otherwise the configured default cannot be
+/// reselected and shows as a raw/blank entry. The other sentinels
+/// (`rayline-router`/`rayline-subagent`/`rayline-codex`) stay valid wire values
+/// but are internal markers, not picker entries.
+const CATALOG_SENTINEL_MODEL: &str = "rayline-local";
+
+/// The set of models advertised in `/v1/models`. Codex reads this to populate
+/// its picker, so we advertise only the single Codex-default sentinel
+/// ([`CATALOG_SENTINEL_MODEL`]) plus the models of endpoints that are actually
+/// reachable — an endpoint whose `api_key_env` is unset is dropped from the
+/// catalog (its route, if any, still exists and fails at request time with its
+/// normal error).
+fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
+    let mut models = vec![CatalogModel {
+        id: CATALOG_SENTINEL_MODEL.to_owned(),
+        display_name: sentinel_display_name(CATALOG_SENTINEL_MODEL),
+    }];
+    for endpoint in &config.endpoints {
+        if endpoint_hidden_from_catalog(endpoint) {
+            continue;
+        }
         for model in &endpoint.models {
-            models.push(model_json(model));
+            models.push(CatalogModel {
+                id: model.clone(),
+                display_name: catalog_display_name(endpoint, model),
+            });
         }
     }
     models
 }
 
+/// Endpoints that declare an `api_key_env` which is unset at startup are hidden
+/// from the catalog: advertising them just pollutes the picker with unreachable
+/// entries. Subscription (`client_bearer`) and `local` endpoints have no
+/// `api_key_env` and are never hidden.
+fn endpoint_hidden_from_catalog(endpoint: &EndpointConfig) -> bool {
+    endpoint
+        .api_key_env
+        .as_deref()
+        .is_some_and(|var| std::env::var_os(var).is_none())
+}
+
+/// Builds the picker label for an endpoint model. Requests routed to a real
+/// provider endpoint are prefixed `Rayline <provider> <model>` so they are
+/// visibly distinct; `client_bearer` subscription passthrough keeps its plain
+/// Codex name.
+fn catalog_display_name(endpoint: &EndpointConfig, model: &str) -> String {
+    if endpoint.auth == Some(AuthMode::ClientBearer) {
+        return pretty_model(model);
+    }
+    format!(
+        "Rayline {} {}",
+        pretty_provider(endpoint),
+        pretty_model(model)
+    )
+}
+
+/// A human label for the provider an endpoint routes to. Best-effort with an
+/// id fallback so an unknown endpoint never breaks the catalog.
+fn pretty_provider(endpoint: &EndpointConfig) -> String {
+    match endpoint.id.as_str() {
+        "anthropic" => "Anthropic".to_owned(),
+        "openai" => "OpenAI".to_owned(),
+        "openrouter" => "OpenRouter".to_owned(),
+        "local" => "Local".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// A human label for a model id. Best-effort: strips a known provider prefix and
+/// tidies common families, falling back to the raw id for anything unrecognized.
+fn pretty_model(model: &str) -> String {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    if let Some(rest) = bare.strip_prefix("claude-") {
+        if let Some(pretty) = pretty_claude(rest) {
+            return pretty;
+        }
+    } else if let Some(rest) = bare.strip_prefix("gpt-") {
+        return pretty_gpt(rest);
+    } else if bare.starts_with("qwen") {
+        return "Qwen".to_owned();
+    }
+    // Anything not matching a known friendly shape falls back to the raw id, so
+    // an unusual model id (e.g. a dated `claude-3-5-sonnet-20241022`) is left
+    // untouched rather than mangled.
+    bare.to_owned()
+}
+
+/// Prettifies the modern Claude id shapes `sonnet-4-6` and `sonnet-4.6`
+/// (both -> `Sonnet 4.6`): a family word followed by a version made of digits
+/// and dots (as one dotted segment, or two dash-joined numeric segments).
+/// Returns `None` for any other shape so the caller can fall back to the raw id.
+fn pretty_claude(rest: &str) -> Option<String> {
+    let is_version = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let mut parts = rest.split('-');
+    let family = parts.next().filter(|f| !f.is_empty())?;
+    let major = parts.next().filter(|s| is_version(s))?;
+    let minor = parts.next().filter(|s| is_version(s));
+    if parts.next().is_some() {
+        return None;
+    }
+    let version = match minor {
+        Some(minor) => format!("{major}.{minor}"),
+        None => major.to_owned(),
+    };
+    Some(format!("{} {}", capitalize(family), version))
+}
+
+fn pretty_gpt(rest: &str) -> String {
+    // `5.4-mini` -> `5.4 Mini`, `5.2-codex` -> `5.2 Codex`.
+    rest.split('-')
+        .map(capitalize)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 fn static_models_value(state: &AppState) -> Value {
-    let models = static_model_values(state);
-    let codex_models = models
+    let catalog = catalog_models(&state.config);
+    let models = catalog
         .iter()
-        .filter_map(|model| model.get("id").and_then(Value::as_str))
-        .map(codex_model_json)
+        .map(|model| model_json(&model.id, &model.display_name))
+        .collect::<Vec<_>>();
+    let codex_models = catalog
+        .iter()
+        .map(|model| codex_model_json(&model.id, &model.display_name))
         .collect::<Vec<_>>();
     json!({
         "object": "list",
@@ -779,20 +910,17 @@ fn merge_static_models(value: &mut Value, state: &AppState) {
         return;
     };
 
-    let static_models = static_model_values(state);
+    let catalog = catalog_models(&state.config);
     let data = object
         .entry("data")
         .or_insert_with(|| Value::Array(Vec::new()));
     if let Some(data) = data.as_array_mut() {
-        for model in &static_models {
-            let Some(id) = model.get("id").and_then(Value::as_str) else {
-                continue;
-            };
+        for model in &catalog {
             if !data
                 .iter()
-                .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+                .any(|existing| existing.get("id").and_then(Value::as_str) == Some(&model.id))
             {
-                data.push(model.clone());
+                data.push(model_json(&model.id, &model.display_name));
             }
         }
     }
@@ -801,19 +929,12 @@ fn merge_static_models(value: &mut Value, state: &AppState) {
         .entry("models")
         .or_insert_with(|| Value::Array(Vec::new()));
     if let Some(models) = models.as_array_mut() {
-        for model in static_models
-            .iter()
-            .filter_map(|model| model.get("id").and_then(Value::as_str))
-            .map(codex_model_json)
-        {
-            let Some(slug) = model.get("slug").and_then(Value::as_str) else {
-                continue;
-            };
+        for model in &catalog {
             if !models
                 .iter()
-                .any(|existing| existing.get("slug").and_then(Value::as_str) == Some(slug))
+                .any(|existing| existing.get("slug").and_then(Value::as_str) == Some(&model.id))
             {
-                models.push(model);
+                models.push(codex_model_json(&model.id, &model.display_name));
             }
         }
     }
@@ -838,13 +959,23 @@ fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
         || model == DEFAULT_SUBAGENT_MODEL
         || model == "rayline-codex"
         || model == "rayline-local"
-        || state
-            .config
-            .endpoints
-            .iter()
-            .any(|endpoint| endpoint.models.iter().any(|m| m == &model))
     {
-        return json_response(StatusCode::OK, model_json(&model));
+        return json_response(
+            StatusCode::OK,
+            model_json(&model, &sentinel_display_name(&model)),
+        );
+    }
+    // Only endpoints visible in the catalog resolve here, so a keyless
+    // (hidden) endpoint's model returns 404 just as it is absent from the list.
+    if let Some(endpoint) = state
+        .config
+        .endpoints
+        .iter()
+        .filter(|endpoint| !endpoint_hidden_from_catalog(endpoint))
+        .find(|endpoint| endpoint.models.iter().any(|m| m == &model))
+    {
+        let display_name = catalog_display_name(endpoint, &model);
+        return json_response(StatusCode::OK, model_json(&model, &display_name));
     }
     json_response(
         StatusCode::NOT_FOUND,
@@ -852,19 +983,36 @@ fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
     )
 }
 
-fn model_json(id: &str) -> Value {
+/// Friendly label for a sentinel wire id looked up directly via
+/// `GET /v1/models/{id}`. Only [`CATALOG_SENTINEL_MODEL`] is surfaced in the
+/// picker; the internal sentinels keep their raw id.
+fn sentinel_display_name(id: &str) -> String {
+    if id == CATALOG_SENTINEL_MODEL {
+        "Rayline Auto".to_owned()
+    } else {
+        id.to_owned()
+    }
+}
+
+fn model_json(id: &str, display_name: &str) -> Value {
     json!({
         "id": id,
         "object": "model",
         "type": "model",
-        "display_name": id,
+        "display_name": display_name,
     })
 }
 
-fn codex_model_json(id: &str) -> Value {
+/// Codex sorts its picker by ascending `priority`, so native models (priorities
+/// running into the tens) come first. Rayline-injected entries use a priority
+/// well above any native value to cluster together at the bottom of the list
+/// rather than interleaving with the Codex models.
+const RAYLINE_MODEL_PRIORITY: u32 = 1000;
+
+fn codex_model_json(id: &str, display_name: &str) -> Value {
     json!({
         "slug": id,
-        "display_name": id,
+        "display_name": display_name,
         "description": "Rayline-routed model",
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
@@ -875,7 +1023,7 @@ fn codex_model_json(id: &str) -> Value {
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
-        "priority": 1,
+        "priority": RAYLINE_MODEL_PRIORITY,
         "additional_speed_tiers": [],
         "availability_nux": Value::Null,
         "upgrade": Value::Null,
@@ -1760,12 +1908,21 @@ fn default_main_route() -> RouteTarget {
 }
 
 fn route_direct_model(config: &RouterConfig, requested_model: &str) -> Option<(String, String)> {
-    for endpoint in &config.endpoints {
-        if endpoint.models.iter().any(|model| model == requested_model) {
-            return Some((endpoint.id.clone(), requested_model.to_owned()));
-        }
-    }
-    None
+    // Prefer a catalog-visible (reachable) endpoint so direct routing selects the
+    // same endpoint the picker advertised: with two endpoints declaring the same
+    // model id, the earlier one keyless, the catalog advertises the later
+    // reachable endpoint, and routing must agree rather than fail on the earlier
+    // endpoint's missing key. Fall back to the first declaring endpoint even when
+    // hidden, so a model that lives only on a keyless endpoint still routes there
+    // and fails with that endpoint's clear missing-key error (not a silent
+    // substitution to routes.main).
+    let matches = |endpoint: &EndpointConfig| endpoint.models.iter().any(|m| m == requested_model);
+    let endpoint = config
+        .endpoints
+        .iter()
+        .find(|endpoint| matches(endpoint) && !endpoint_hidden_from_catalog(endpoint))
+        .or_else(|| config.endpoints.iter().find(|endpoint| matches(endpoint)))?;
+    Some((endpoint.id.clone(), requested_model.to_owned()))
 }
 
 fn local_available(headers: &HeaderMap) -> bool {
@@ -6458,5 +6615,234 @@ mod tests {
             .find(|e| e["type"] == "message_delta")
             .unwrap();
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
+    }
+
+    fn endpoint(id: &str, protocol: EndpointProtocol, models: &[&str]) -> EndpointConfig {
+        EndpointConfig {
+            id: id.to_owned(),
+            kind: "provider".to_owned(),
+            protocol,
+            base_url: "https://example.test".to_owned(),
+            api_key_env: None,
+            models: models.iter().map(|m| (*m).to_owned()).collect(),
+            headers: HashMap::new(),
+            auth: None,
+        }
+    }
+
+    fn catalog_ids(config: &RouterConfig) -> Vec<String> {
+        catalog_models(config).into_iter().map(|m| m.id).collect()
+    }
+
+    fn catalog_display(config: &RouterConfig, id: &str) -> Option<String> {
+        catalog_models(config)
+            .into_iter()
+            .find(|m| m.id == id)
+            .map(|m| m.display_name)
+    }
+
+    #[test]
+    fn catalog_advertises_only_the_codex_default_sentinel() {
+        // Of the four wire sentinels only the Codex-default `rayline-local` is
+        // surfaced (so the CLI-stamped default is reselectable); the other
+        // markers stay valid wire values but are not offered as picks.
+        let ids = catalog_ids(&RouterConfig::default());
+        assert_eq!(ids, vec![CATALOG_SENTINEL_MODEL.to_owned()]);
+        assert!(!ids.iter().any(|id| id == DEFAULT_VIRTUAL_MODEL
+            || id == DEFAULT_SUBAGENT_MODEL
+            || id == "rayline-codex"));
+        assert_eq!(
+            catalog_display(&RouterConfig::default(), CATALOG_SENTINEL_MODEL).as_deref(),
+            Some("Rayline Auto")
+        );
+    }
+
+    #[test]
+    fn catalog_prefixes_provider_endpoint_models() {
+        let config = RouterConfig {
+            endpoints: vec![
+                endpoint(
+                    "anthropic",
+                    EndpointProtocol::AnthropicMessages,
+                    &["claude-sonnet-4-6"],
+                ),
+                endpoint(
+                    "openrouter",
+                    EndpointProtocol::AnthropicMessages,
+                    &["anthropic/claude-sonnet-4.6"],
+                ),
+                endpoint("local", EndpointProtocol::OpenAIResponses, &["qwen3.6-35b"]),
+            ],
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            catalog_display(&config, "claude-sonnet-4-6").as_deref(),
+            Some("Rayline Anthropic Sonnet 4.6")
+        );
+        assert_eq!(
+            catalog_display(&config, "anthropic/claude-sonnet-4.6").as_deref(),
+            Some("Rayline OpenRouter Sonnet 4.6")
+        );
+        assert_eq!(
+            catalog_display(&config, "qwen3.6-35b").as_deref(),
+            Some("Rayline Local Qwen")
+        );
+    }
+
+    #[test]
+    fn catalog_keeps_subscription_passthrough_names_unprefixed() {
+        let mut subscription = endpoint(
+            "codex-subscription",
+            EndpointProtocol::OpenAIResponses,
+            &["gpt-5.4", "gpt-5.4-mini"],
+        );
+        subscription.auth = Some(AuthMode::ClientBearer);
+        subscription.base_url = "https://chatgpt.com/backend-api/codex".to_owned();
+        let config = RouterConfig {
+            endpoints: vec![subscription],
+            ..RouterConfig::default()
+        };
+        assert_eq!(catalog_display(&config, "gpt-5.4").as_deref(), Some("5.4"));
+        assert_eq!(
+            catalog_display(&config, "gpt-5.4-mini").as_deref(),
+            Some("5.4 Mini")
+        );
+    }
+
+    #[test]
+    fn catalog_hides_endpoints_whose_api_key_env_is_unset() {
+        let var = "RAYLINE_TEST_CATALOG_KEY_UNSET";
+        // SAFETY: the env var name is unique to this test so no other test reads
+        // or writes it, and the suite runs single-threaded (`--test-threads=1`),
+        // so no concurrent thread observes the mutation. Applies to every
+        // set_var/remove_var below.
+        unsafe { std::env::remove_var(var) };
+        let mut gated = endpoint("openrouter", EndpointProtocol::AnthropicMessages, &["m/x"]);
+        gated.api_key_env = Some(var.to_owned());
+        let config = RouterConfig {
+            endpoints: vec![gated],
+            ..RouterConfig::default()
+        };
+        assert!(endpoint_hidden_from_catalog(&config.endpoints[0]));
+        assert_eq!(
+            catalog_ids(&config),
+            vec![CATALOG_SENTINEL_MODEL.to_owned()]
+        );
+
+        // SAFETY: see the note above.
+        unsafe { std::env::set_var(var, "present") };
+        assert!(!endpoint_hidden_from_catalog(&config.endpoints[0]));
+        assert!(catalog_ids(&config).iter().any(|id| id == "m/x"));
+        // SAFETY: see the note above.
+        unsafe { std::env::remove_var(var) };
+    }
+
+    #[test]
+    fn direct_model_prefers_reachable_endpoint_over_keyless_duplicate() {
+        let unset = "RAYLINE_TEST_DIRECT_ROUTE_KEY_UNSET";
+        // SAFETY: env var name unique to this test; the suite runs
+        // single-threaded (`--test-threads=1`), so no other thread observes the
+        // mutation. Applies to the remove_var below too.
+        unsafe { std::env::remove_var(unset) };
+        // Two endpoints declare the same model id; the earlier one is keyless
+        // (hidden from the catalog), the later one is reachable.
+        let mut keyless = endpoint(
+            "openrouter",
+            EndpointProtocol::AnthropicMessages,
+            &["dup/m"],
+        );
+        keyless.api_key_env = Some(unset.to_owned());
+        let reachable = endpoint("local", EndpointProtocol::OpenAIResponses, &["dup/m"]);
+        let config = RouterConfig {
+            endpoints: vec![keyless, reachable],
+            ..RouterConfig::default()
+        };
+        // Routing selects the reachable endpoint the catalog advertised, not the
+        // earlier keyless one.
+        assert_eq!(
+            route_direct_model(&config, "dup/m"),
+            Some(("local".to_owned(), "dup/m".to_owned()))
+        );
+
+        // When the model lives only on a keyless endpoint, routing still selects
+        // it (so the request fails with that endpoint's clear missing-key error,
+        // not a silent fallback to routes.main).
+        let mut only_keyless = endpoint(
+            "openrouter",
+            EndpointProtocol::AnthropicMessages,
+            &["solo/m"],
+        );
+        only_keyless.api_key_env = Some(unset.to_owned());
+        let config = RouterConfig {
+            endpoints: vec![only_keyless],
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            route_direct_model(&config, "solo/m"),
+            Some(("openrouter".to_owned(), "solo/m".to_owned()))
+        );
+        // SAFETY: see the note above.
+        unsafe { std::env::remove_var(unset) };
+    }
+
+    #[test]
+    fn codex_model_entries_sort_after_native_models() {
+        // Native Codex models carry small ascending priorities; ours must be
+        // larger so the picker clusters them at the bottom, not interleaved.
+        let value = codex_model_json(CATALOG_SENTINEL_MODEL, "Rayline Auto");
+        assert_eq!(value["priority"], json!(RAYLINE_MODEL_PRIORITY));
+        // Larger than the observed native ceiling (codex-auto-review == 43).
+        const _: () = assert!(RAYLINE_MODEL_PRIORITY > 100);
+    }
+
+    #[test]
+    fn pretty_model_falls_back_to_raw_id() {
+        assert_eq!(pretty_model("claude-opus-4-7"), "Opus 4.7");
+        assert_eq!(pretty_model("gpt-5.2-codex"), "5.2 Codex");
+        assert_eq!(pretty_model("qwen3.6-35b-a3b"), "Qwen");
+        assert_eq!(pretty_model("some-unknown-id"), "some-unknown-id");
+        // Unrecognized Claude shapes (e.g. a dated id) are left untouched rather
+        // than mangled into "3 5.sonnet.20241022".
+        assert_eq!(
+            pretty_model("claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(
+            pretty_model("anthropic/claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet-20241022"
+        );
+    }
+
+    #[test]
+    fn single_model_lookup_hides_keyless_endpoint_models() {
+        let var = "RAYLINE_TEST_SINGLE_LOOKUP_KEY_UNSET";
+        // SAFETY: env var name unique to this test; the suite runs
+        // single-threaded (`--test-threads=1`), so no other thread observes the
+        // mutation. Applies to every set_var/remove_var below.
+        unsafe { std::env::remove_var(var) };
+        let mut gated = endpoint(
+            "openrouter",
+            EndpointProtocol::AnthropicMessages,
+            &["gated/m"],
+        );
+        gated.api_key_env = Some(var.to_owned());
+        let state = state(RouterConfig {
+            endpoints: vec![gated],
+            ..RouterConfig::default()
+        });
+
+        // Hidden endpoint's model is 404, matching its absence from the list.
+        let resp = model_response(&state, "/v1/models/gated/m");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // The advertised sentinel still resolves.
+        let resp = model_response(&state, &format!("/v1/models/{CATALOG_SENTINEL_MODEL}"));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // SAFETY: see the note above.
+        unsafe { std::env::set_var(var, "present") };
+        let resp = model_response(&state, "/v1/models/gated/m");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // SAFETY: see the note above.
+        unsafe { std::env::remove_var(var) };
     }
 }
