@@ -412,9 +412,10 @@ struct RunningApp {
 
 /// Find the Codex desktop app-server process and read its `CODEX_HOME`.
 ///
-/// The app-server argv is `.../Codex.app/Contents/Resources/codex app-server`
-/// on macOS and `codex app-server` elsewhere — distinct from the GUI parent and
-/// the renderer/GPU helpers.
+/// The app-server argv is `.../ChatGPT.app/Contents/Resources/codex app-server`
+/// on macOS (`Codex.app` on installs predating the rename) and `codex
+/// app-server` elsewhere — distinct from the GUI parent and the renderer/GPU
+/// helpers. We key off the `app-server` token, so the bundle name is incidental.
 fn find_running_app_server() -> Option<RunningApp> {
     let pid = pgrep_app_server()?;
     Some(RunningApp {
@@ -541,9 +542,14 @@ fn quit_running_app(app: &RunningApp) -> io::Result<()> {
     {
         // Ask the app to quit gracefully. If AppleScript can't reach it, fall
         // back to signalling the app-server process directly.
+        //
+        // Target the bundle id, not the app name: the desktop app ships as
+        // `Codex.app` on older installs and `ChatGPT.app` since the rename,
+        // but `com.openai.codex` is stable across both. Matching by name would
+        // silently miss the renamed bundle and degrade every quit to SIGTERM.
         let quit = Command::new("osascript")
             .arg("-e")
-            .arg("tell application \"Codex\" to quit")
+            .arg("tell application id \"com.openai.codex\" to quit")
             .status();
         if !matches!(quit, Ok(status) if status.success()) {
             signal_term(app.pid)?;
@@ -609,8 +615,12 @@ mod tests {
         // Regression: Codex injects `-c` flags between the binary and the
         // subcommand, so a fixed "codex app-server" substring misses it.
         assert!(is_app_server_argv(
-            "/Applications/Codex.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
+            "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled"
         ));
+        assert!(is_app_server_argv(
+            "/Applications/ChatGPT.app/Contents/Resources/codex app-server --analytics-default-enabled"
+        ));
+        // Installs predating the ChatGPT.app rename must keep matching.
         assert!(is_app_server_argv(
             "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));
@@ -900,7 +910,10 @@ mod tests {
         assert!(!is_app_server_argv("codex resume 019f3c3e-fcc9"));
         assert!(!is_app_server_argv("codex"));
         assert!(!is_app_server_argv(
-            "/Applications/Codex.app/Contents/Frameworks/Codex Helper --type=renderer"
+            "/Applications/ChatGPT.app/Contents/Frameworks/Codex Helper --type=renderer"
+        ));
+        assert!(!is_app_server_argv(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
         ));
     }
 
