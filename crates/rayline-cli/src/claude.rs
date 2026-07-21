@@ -1031,7 +1031,13 @@ fn router_url_for_run(
 /// when the user is not yet authenticated (the `auth login` step). Interactive
 /// sign-in only fires on a real terminal; non-interactive callers keep the
 /// previous hard error instead of blocking on a browser.
-async fn ensure_router_key(
+/// Provision (mint or read) the hosted-RCR router key (`rlk-`) for `env_name`.
+///
+/// Shared by the Claude run path and the Codex run/app paths (see
+/// [`crate::codex::resolve_cloud_router_key`]) so a config whose route targets a
+/// `rayline-cloud` endpoint authenticates from a plain `rayline auth login` with
+/// no manual `RAYLINE_ROUTER_API_KEY`.
+pub(crate) async fn ensure_router_key(
     env_name: &str,
     home: &Path,
     auth_token: Option<&str>,

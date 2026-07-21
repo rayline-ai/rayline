@@ -128,6 +128,42 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
         .any(|endpoint| cloud_ids.contains(&endpoint))
 }
 
+/// Whether any route targets a hosted Rayline Cloud Router endpoint — prod
+/// (`api.rayline.ai`) **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key
+/// should be provisioned from `rayline auth login`.
+///
+/// Broader than [`config_uses_cloud_router`] (prod host only): this matches the
+/// same hosts the Codex-native rewrite guards on
+/// ([`endpoint_base_url_is_hosted_rcr`]), so the Codex provisioning gate fires for
+/// a dev-targeted config too (`rayline --env dev codex --config …`).
+pub fn config_routes_to_hosted_rcr(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let hosted_ids = hosted_rcr_endpoint_ids(&cfg);
+    route_target_endpoints(&cfg)
+        .into_iter()
+        .any(|endpoint| hosted_ids.contains(&endpoint))
+}
+
+/// Endpoint ids whose `base_url` host is a hosted RCR (prod or dev).
+fn hosted_rcr_endpoint_ids(cfg: &Value) -> Vec<String> {
+    let Some(endpoints) = cfg.get("endpoints").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let id = endpoint.get("id").and_then(Value::as_str)?;
+            let base_url = endpoint.get("base_url").and_then(Value::as_str);
+            endpoint_base_url_is_hosted_rcr(base_url).then(|| id.to_owned())
+        })
+        .collect()
+}
+
 /// Whether any route targets the bundled `"local"` endpoint (needs a configured
 /// local model).
 pub fn config_uses_local_endpoint(path: &Path) -> bool {
@@ -1270,6 +1306,60 @@ mod tests {
         assert_eq!(ep["auth"], "bearer");
         assert_eq!(ep["headers"]["x-rayline-client"], "codex");
         assert_eq!(ep["base_url"], "https://api.rayline.ai/v1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosted_rcr_route_detection_covers_prod_dev_not_local() {
+        let dir = std::env::temp_dir().join(format!("rayline-hosted-rcr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, base_url: &str| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json!({
+                    "endpoints": [
+                        { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                          "base_url": base_url, "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                          "auth": "api_key", "models": ["rayline-router"] }
+                    ],
+                    "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            path
+        };
+
+        // Prod and dev hosts both count — matching the Codex-native host guard.
+        assert!(config_routes_to_hosted_rcr(&write(
+            "prod.json",
+            "https://api.rayline.ai"
+        )));
+        assert!(config_routes_to_hosted_rcr(&write(
+            "dev.json",
+            "https://api-dev.rayline.ai"
+        )));
+        // A user's own custom host must not trigger provisioning.
+        assert!(!config_routes_to_hosted_rcr(&write(
+            "custom.json",
+            "https://not-the-rcr.example.com"
+        )));
+
+        // A purely local config (no hosted endpoint) never provisions.
+        let local = dir.join("local.json");
+        std::fs::write(
+            &local,
+            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
+        )
+        .unwrap();
+        assert!(!config_routes_to_hosted_rcr(&local));
+        // Prod-only helper stays prod-only (dev is not "cloud router").
+        assert!(!config_uses_cloud_router(&write(
+            "dev2.json",
+            "https://api-dev.rayline.ai"
+        )));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

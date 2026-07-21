@@ -146,6 +146,12 @@ pub struct RouterStartCliRequest {
     /// passthrough when no config is supplied, no client auth for explicit configs.
     pub codex_auth_mode: crate::codex::CodexAuthMode,
     pub root_env_explicit: bool,
+    /// Pre-resolved hosted-RCR router key (`rlk-`) to inject as
+    /// `RAYLINE_ROUTER_API_KEY` for the spawned daemon, so a config whose route
+    /// targets a `rayline-cloud` endpoint authenticates without a manual env var.
+    /// The Codex run/app paths populate this via
+    /// [`crate::codex::resolve_cloud_router_key`]; `None` falls back to the env.
+    pub router_api_key_override: Option<String>,
 }
 
 impl RouterStatusRequest {
@@ -1603,6 +1609,11 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     let bin_path = resolve_rld_bin(&home)?;
     let mut start_request = RouterStartRequest::local_router_defaults(request.root_env_explicit);
+    // A pre-resolved hosted-RCR key (Codex run/app path) is injected as
+    // `RAYLINE_ROUTER_API_KEY` for the daemon; `resolve_router_api_key` honors it
+    // before the `enable_proxy` gate, so it reaches the cloud leg even in Codex
+    // mode (`enable_proxy = false`).
+    start_request.router_api_key_override = request.router_api_key_override.clone();
     let codex_mode = request.api_mode == ROUTER_API_MODE_CODEX;
     let codex_subscription_auth = codex_mode
         && request

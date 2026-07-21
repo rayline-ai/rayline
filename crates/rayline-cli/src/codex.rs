@@ -73,6 +73,13 @@ pub struct RunRequest {
     pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
     pub root_env_explicit: bool,
+    /// Hosted environment override (`--env`), forwarded to router-key
+    /// provisioning when the config routes a leg to the cloud router.
+    pub env_name: Option<String>,
+    /// Account bearer (`--auth-token`) used to mint/read the `rlk-` router key,
+    /// mirroring the Claude path. `None` falls back to stored credentials or the
+    /// interactive `rayline auth login` prompt.
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,13 +90,49 @@ pub struct ConfigureRequest {
     pub auth_mode: CodexAuthMode,
 }
 
+/// Provision the hosted-RCR router key (`rlk-`) when a `--config` routes a leg to
+/// the cloud router, so `rayline codex --config <cloud>` (RRC/RAC/RAL/…)
+/// authenticates from a plain `rayline auth login` — no manual
+/// `RAYLINE_ROUTER_API_KEY`. Mirrors the Claude path
+/// ([`crate::claude::ensure_router_key`]).
+///
+/// Best-effort: returns `None` when there is no config, the config routes to no
+/// cloud endpoint (subscription `A*` / local `L*` modes), or provisioning fails
+/// (e.g. not logged in and non-interactive) — the daemon then surfaces a clear
+/// error only if a cloud route is actually hit. When interactive and logged out,
+/// `ensure_router_key` drives the same `rayline auth login` prompt Claude uses.
+pub(crate) async fn resolve_cloud_router_key(
+    config_path: Option<&Path>,
+    env_name: Option<&str>,
+    auth_token: Option<&str>,
+    root_env_explicit: bool,
+) -> Option<String> {
+    let path = config_path?;
+    if !crate::router_config::config_routes_to_hosted_rcr(path) {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    let env = crate::status::resolve_env(env_name, Some(home.as_path()));
+    crate::claude::ensure_router_key(&env, &home, auth_token, root_env_explicit)
+        .await
+        .ok()
+}
+
 pub async fn run(request: RunRequest) -> ExitCode {
+    let router_api_key_override = resolve_cloud_router_key(
+        request.config_path.as_deref(),
+        request.env_name.as_deref(),
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await;
     let start_request = crate::router::RouterStartCliRequest {
         api_mode: crate::router::ROUTER_API_MODE_CODEX.to_owned(),
         proxy_routing_mode: crate::router::PROXY_ROUTING_MODE_ALL.to_owned(),
         config_path: request.config_path.clone(),
         codex_auth_mode: request.auth_mode,
         root_env_explicit: request.root_env_explicit,
+        router_api_key_override,
     };
     match crate::router::start_from_cli(&start_request).await {
         Ok(_) => {
@@ -331,7 +374,8 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 mod tests {
     use super::{
         CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
-        EffectiveCodexAuthMode, parse_codex_version_text, subscription_router_config_json,
+        EffectiveCodexAuthMode, parse_codex_version_text, resolve_cloud_router_key,
+        subscription_router_config_json,
     };
     use std::path::PathBuf;
 
@@ -346,6 +390,35 @@ mod tests {
         ));
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    // Router-key provisioning is gated on the config routing a leg to the hosted
+    // RCR. The negative cases must resolve to `None` *without* touching
+    // credentials or the network, so subscription (`A*`) and local (`L*`) Codex
+    // runs never trigger a `rayline auth login` prompt.
+    #[tokio::test]
+    async fn cloud_router_key_none_without_config() {
+        assert!(
+            resolve_cloud_router_key(None, None, None, false)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_router_key_none_for_local_only_config() {
+        // A purely local (ollama) config — no hosted-RCR endpoint — must not
+        // provision a key (would otherwise prompt/fail on a machine with no login).
+        let path = write_config(
+            "local-only",
+            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
+        );
+        assert!(
+            resolve_cloud_router_key(Some(path.as_path()), None, None, false)
+                .await
+                .is_none()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

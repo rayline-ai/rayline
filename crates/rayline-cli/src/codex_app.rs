@@ -33,16 +33,28 @@ pub struct AppRunRequest {
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
     pub root_env_explicit: bool,
+    /// Hosted environment override (`--env`) for router-key provisioning.
+    pub env_name: Option<String>,
+    /// Account bearer (`--auth-token`) for minting/reading the `rlk-` key.
+    pub auth_token: Option<String>,
 }
 
 pub async fn run(request: AppRunRequest) -> ExitCode {
     // 1. Start/ensure the Rayline router — identical path to `rayline codex`.
+    let router_api_key_override = crate::codex::resolve_cloud_router_key(
+        request.config_path.as_deref(),
+        request.env_name.as_deref(),
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await;
     let start_request = crate::router::RouterStartCliRequest {
         api_mode: crate::router::ROUTER_API_MODE_CODEX.to_owned(),
         proxy_routing_mode: crate::router::PROXY_ROUTING_MODE_ALL.to_owned(),
         config_path: request.config_path.clone(),
         codex_auth_mode: request.auth_mode,
         root_env_explicit: request.root_env_explicit,
+        router_api_key_override,
     };
     if let Err(error) = crate::router::start_from_cli(&start_request).await {
         eprintln!("Error: failed to start Rayline Codex router: {error}");

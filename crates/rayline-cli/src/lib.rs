@@ -825,7 +825,7 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             "claude" => parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::ClaudeRun)
                 .unwrap_or(RaylineDispatch::Unavailable),
-            "codex" => parse_codex_dispatch(args, root_env_explicit)
+            "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
                 .unwrap_or(RaylineDispatch::Unavailable),
@@ -1368,6 +1368,8 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
 
 fn parse_codex_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<RaylineDispatch>
 where
@@ -1380,14 +1382,18 @@ where
         }
         Some("app") => {
             let _ = args.next();
-            parse_codex_app_request(args, root_env_explicit).map(RaylineDispatch::CodexApp)
+            parse_codex_app_request(args, root_env, root_auth_token, root_env_explicit)
+                .map(RaylineDispatch::CodexApp)
         }
-        _ => parse_codex_request(args, root_env_explicit).map(RaylineDispatch::CodexRun),
+        _ => parse_codex_request(args, root_env, root_auth_token, root_env_explicit)
+            .map(RaylineDispatch::CodexRun),
     }
 }
 
 fn parse_codex_app_request<'a, I>(
     mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<crate::codex_app::AppRunRequest>
 where
@@ -1447,11 +1453,15 @@ where
         auth_mode,
         codex_args,
         root_env_explicit,
+        env_name: root_env,
+        auth_token: root_auth_token,
     })
 }
 
 fn parse_codex_request<'a, I>(
     mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<crate::codex::RunRequest>
 where
@@ -1519,6 +1529,8 @@ where
         auth_mode,
         codex_args,
         root_env_explicit,
+        env_name: root_env,
+        auth_token: root_auth_token,
     })
 }
 
@@ -1684,6 +1696,7 @@ where
         config_path,
         codex_auth_mode,
         root_env_explicit,
+        router_api_key_override: None,
     })
 }
 
