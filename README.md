@@ -138,7 +138,9 @@ and TypeScript, grouped by routing path:
   provider overrides automatically, or `rayline codex app` to launch the Codex
   desktop app routed through Rayline. The default no-config path reuses
   Codex's ChatGPT subscription auth; explicit configs can route selected
-  requests to local/API-key endpoints. Rayline supports Codex's Responses create
+  requests to local/API-key endpoints or to the hosted **cloud router (RCR)** at
+  `api.rayline.ai` (the `R*` modes), which serves Codex natively over
+  `/v1/responses` and picks a GPT model. Rayline supports Codex's Responses create
   stream, model catalog, compaction, memory-summary, images, and search provider
   calls, with native passthrough when the selected route is an `openai_responses`
   endpoint.

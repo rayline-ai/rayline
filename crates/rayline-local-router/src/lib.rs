@@ -2410,6 +2410,17 @@ async fn response_from_reqwest(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("<none>")
         .to_owned();
+    // Native passthrough (e.g. the RCR OpenAI/Codex path): the real model the
+    // upstream chose comes back in its `x-rayline-selected-model` response header,
+    // whereas `decision.selected_model` is only the sentinel (`rayline-router`).
+    // Prefer the upstream value for both the re-stamped outbound header and the
+    // usage metric, so `rayline top` shows the real model — never overwrite an
+    // upstream-provided value with the sentinel.
+    let upstream_selected_model = resp
+        .headers()
+        .get("x-rayline-selected-model")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut headers_out = HeaderMap::new();
     for (k, v) in resp.headers().iter() {
         if is_hop_by_hop_str(k.as_str()) {
@@ -2427,6 +2438,14 @@ async fn response_from_reqwest(
     }
     if let Some(decision) = decision {
         add_decision_headers(&mut headers_out, decision);
+        // Restore the upstream-chosen model when present (add_decision_headers
+        // just overwrote it with the sentinel).
+        if let Some(model) = upstream_selected_model
+            .as_deref()
+            .and_then(|model| HeaderValue::from_str(model).ok())
+        {
+            headers_out.insert("x-rayline-selected-model", model);
+        }
         if let Ok(value) = HeaderValue::from_str(&decision.requested_model) {
             headers_out.insert("openai-model", value);
         }
@@ -2436,7 +2455,9 @@ async fn response_from_reqwest(
     let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
     let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
     let body_out: BoxBody = stream_body.boxed();
-    let selected_model = decision.map(|decision| decision.selected_model.clone());
+    // Prefer the upstream-reported model (native passthrough) over the sentinel.
+    let selected_model =
+        prefer_upstream_selected_model(upstream_selected_model.as_deref(), decision);
     // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
     // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
     let has_metrics = metrics.is_some() && request_id.is_some();
@@ -2844,6 +2865,21 @@ fn record_remote_token_usage(
         output_tokens,
         selected_model,
     });
+}
+
+/// Choose the model to report (outbound header + usage metric) for a forwarded
+/// response: prefer the model the upstream actually chose (its
+/// `x-rayline-selected-model` response header — set by the RCR on the native
+/// OpenAI/Codex path) over the edge's own `decision.selected_model`, which is
+/// only the routing sentinel (`rayline-router`). Falls back to the decision
+/// model when the upstream reports none.
+fn prefer_upstream_selected_model(
+    upstream: Option<&str>,
+    decision: Option<&RouteDecision>,
+) -> Option<String> {
+    upstream
+        .map(str::to_owned)
+        .or_else(|| decision.map(|decision| decision.selected_model.clone()))
 }
 
 fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
@@ -4918,6 +4954,31 @@ mod tests {
             response.headers().get(REQUEST_ID_HEADER).unwrap(),
             "req_abc123"
         );
+    }
+
+    #[test]
+    fn prefers_upstream_selected_model_over_sentinel() {
+        let decision = RouteDecision {
+            target: RouteSelection::Endpoint("rayline-cloud".to_owned()),
+            requested_model: DEFAULT_VIRTUAL_MODEL.to_owned(),
+            selected_model: DEFAULT_VIRTUAL_MODEL.to_owned(), // the sentinel
+            policy: "main".to_owned(),
+            task_class: "main".to_owned(),
+            route_id: "rt-1".to_owned(),
+        };
+
+        // Upstream (RCR) reports the real model → prefer it over the sentinel.
+        assert_eq!(
+            prefer_upstream_selected_model(Some("gpt-5.5"), Some(&decision)).as_deref(),
+            Some("gpt-5.5")
+        );
+        // No upstream header → fall back to the decision's model.
+        assert_eq!(
+            prefer_upstream_selected_model(None, Some(&decision)).as_deref(),
+            Some(DEFAULT_VIRTUAL_MODEL)
+        );
+        // No decision either → None.
+        assert_eq!(prefer_upstream_selected_model(None, None), None);
     }
 
     #[test]

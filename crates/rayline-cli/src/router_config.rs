@@ -303,6 +303,9 @@ pub fn materialize_codex_subscription_for_local_router(
     let mut changed = ensure_codex_subscription_endpoint(&mut cfg);
     changed |= ensure_codex_subscription_main_route(&mut cfg);
     changed |= rewrite_subscription_routes_for_codex(&mut cfg);
+    // A*-subagent-cloud case: a `rayline-cloud` subagent endpoint pointed at the
+    // hosted RCR must also forward native Responses + carry `x-rayline-client`.
+    changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
     // After the rewrite `routes.main` is the concrete codex-subscription endpoint,
     // so pinning the sentinel `--model` to it points Codex's MAIN turns there. The
     // local router skips this model_route on subagent turns (so `routes.subagent`
@@ -333,6 +336,9 @@ pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
     let mut changed = ensure_codex_config_model_routes(&mut cfg);
+    // Codex `R*` main → hosted RCR: forward native Responses (not the lossy
+    // Anthropic bridge) and stamp `x-rayline-client: codex`. Host-guarded.
+    changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
     // Same passthrough handling as materialize_for_local_router: the local router
     // has no `subscription` endpoint, so strip a passthrough `main` (that combo is
     // for `--auth subscription`, which uses a different materialization).
@@ -395,6 +401,109 @@ fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
         changed = true;
     }
     changed
+}
+
+/// `x-rayline-client` value the edge stamps on Codex requests forwarded to the
+/// hosted RCR, so the cloud router selects a GPT (vs Claude) model. Path-based
+/// class detection is the RCR-side fallback; this header is the intended
+/// contract.
+const RAYLINE_CLIENT_HEADER: &str = "x-rayline-client";
+const RAYLINE_CLIENT_CODEX: &str = "codex";
+
+/// Rewrite any endpoint pointing at the hosted RCR so a Codex `/v1/responses`
+/// request forwards **natively** (`openai_responses`) instead of being
+/// down-translated to Anthropic. Concretely, on the matched endpoint(s):
+/// - flip `protocol` `anthropic_messages` → `openai_responses` (so
+///   `handle_responses` dispatches to `forward_openai_responses_endpoint`);
+/// - set `auth: bearer` so the `rlk-` router key rides on `Authorization:
+///   Bearer` — the header the RCR's `getUser`/`extractAuthHeader` accepts and
+///   the style `forward_openai_passthrough_endpoint` applies;
+/// - inject `x-rayline-client: codex` into the endpoint `headers` map so
+///   `apply_endpoint_headers` forwards it verbatim.
+///
+/// **Host-guarded:** only endpoints whose `base_url` host is the hosted RCR
+/// (`api.rayline.ai` / `api-dev.rayline.ai`) are flipped. A user's own custom
+/// `anthropic_messages` endpoint is left untouched.
+fn rewrite_rayline_cloud_for_codex_native(cfg: &mut Value) -> bool {
+    let Some(endpoints) = cfg.get_mut("endpoints").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for endpoint in endpoints.iter_mut() {
+        let Some(object) = endpoint.as_object_mut() else {
+            continue;
+        };
+        if !endpoint_base_url_is_hosted_rcr(object.get("base_url").and_then(Value::as_str)) {
+            continue;
+        }
+        changed |= normalize_rcr_endpoint_for_codex_native(object);
+    }
+    changed
+}
+
+/// Normalize a hosted-RCR endpoint for native Codex forwarding. Applied
+/// uniformly regardless of the endpoint's declared protocol (a fresh
+/// `anthropic_messages` RRC endpoint, or a partially-migrated `openai_responses`
+/// one), so the result is always: `openai_responses` + `auth: bearer` +
+/// `/v1` base_url + `x-rayline-client: codex`. Each step is idempotent; returns
+/// whether anything changed.
+fn normalize_rcr_endpoint_for_codex_native(endpoint: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    if endpoint.get("protocol").and_then(Value::as_str) != Some("openai_responses") {
+        endpoint.insert("protocol".to_owned(), json!("openai_responses"));
+        changed = true;
+    }
+    // Bearer so the rlk- key rides on Authorization (the style the native
+    // passthrough applies); never leave a stale `auth: api_key` (→ x-api-key).
+    if endpoint.get("auth").and_then(Value::as_str) != Some("bearer") {
+        endpoint.insert("auth".to_owned(), json!("bearer"));
+        changed = true;
+    }
+    changed |= ensure_rcr_base_url_has_v1(endpoint);
+    changed |= inject_rayline_client_codex_header(endpoint);
+    changed
+}
+
+/// Ensure the RCR endpoint's `base_url` ends in `/v1`, so the native passthrough
+/// (which strips the inbound `/v1/` prefix before appending `responses`) reaches
+/// `…/v1/responses` on the hosted router rather than `…/responses`. The RRC-shape
+/// base_url is the bare host root (`https://api.rayline.ai`); add the `/v1`.
+/// Idempotent. Returns whether the config changed.
+fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(base_url) = endpoint.get("base_url").and_then(Value::as_str) else {
+        return false;
+    };
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        return false;
+    }
+    endpoint.insert("base_url".to_owned(), json!(format!("{trimmed}/v1")));
+    true
+}
+
+/// Whether a `base_url` host is the hosted Rayline Cloud Router (prod or dev).
+fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
+    matches!(
+        base_url.and_then(host_of).as_deref(),
+        Some("api.rayline.ai") | Some("api-dev.rayline.ai")
+    )
+}
+
+/// Add `x-rayline-client: codex` to an endpoint's `headers` map (creating it if
+/// absent). Idempotent. Returns whether the config changed.
+fn inject_rayline_client_codex_header(endpoint: &mut serde_json::Map<String, Value>) -> bool {
+    let headers = endpoint.entry("headers").or_insert_with(|| json!({}));
+    let Some(headers) = headers.as_object_mut() else {
+        return false;
+    };
+    if headers.get(RAYLINE_CLIENT_HEADER).and_then(Value::as_str) == Some(RAYLINE_CLIENT_CODEX) {
+        return false;
+    }
+    headers.insert(
+        RAYLINE_CLIENT_HEADER.to_owned(),
+        json!(RAYLINE_CLIENT_CODEX),
+    );
+    true
 }
 
 fn ensure_codex_subscription_endpoint(cfg: &mut Value) -> bool {
@@ -1046,5 +1155,179 @@ mod tests {
             }
         });
         assert!(!config_value_needs_local_router(&cfg));
+    }
+
+    // ── Codex native-Responses forwarding to the hosted RCR (edge half of #36) ──
+
+    #[test]
+    fn codex_native_flips_only_hosted_rayline_cloud() {
+        // A hosted `rayline-cloud` (anthropic_messages) endpoint alongside a
+        // user's own custom `anthropic_messages` endpoint. Only the hosted one
+        // must flip to native Responses; the custom endpoint stays untouched.
+        let mut cfg = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                  "auth": "api_key", "models": ["rayline-router"] },
+                { "id": "my-anthropic", "protocol": "anthropic_messages",
+                  "base_url": "https://my-gateway.example.com", "auth": "api_key" }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+
+        let changed = rewrite_rayline_cloud_for_codex_native(&mut cfg);
+        assert!(changed);
+
+        let endpoints = cfg["endpoints"].as_array().unwrap();
+        let hosted = &endpoints[0];
+        assert_eq!(hosted["protocol"], "openai_responses");
+        assert_eq!(hosted["base_url"], "https://api.rayline.ai/v1");
+
+        let custom = &endpoints[1];
+        assert_eq!(
+            custom["protocol"], "anthropic_messages",
+            "custom endpoint untouched"
+        );
+        assert_eq!(custom["auth"], "api_key");
+        assert!(
+            custom.get("headers").is_none(),
+            "no client header on custom endpoint"
+        );
+
+        // Idempotent: a second pass changes nothing.
+        assert!(!rewrite_rayline_cloud_for_codex_native(&mut cfg));
+    }
+
+    #[test]
+    fn codex_native_stamps_client_header_and_bearer_auth() {
+        // Pins the exact contract with the RCR: native Responses protocol, bearer
+        // auth (so the rlk- key rides on `Authorization: Bearer`, the header the
+        // RCR accepts), and the x-rayline-client: codex header.
+        let mut cfg = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": "https://api-dev.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                  "auth": "api_key", "models": ["rayline-router"] }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+
+        assert!(rewrite_rayline_cloud_for_codex_native(&mut cfg));
+
+        let ep = &cfg["endpoints"][0];
+        assert_eq!(ep["protocol"], "openai_responses");
+        assert_eq!(ep["auth"], "bearer");
+        assert_eq!(ep["headers"]["x-rayline-client"], "codex");
+        // base_url gains `/v1` so the native passthrough reaches `/v1/responses`
+        // (it strips the inbound `/v1/` prefix before appending `responses`).
+        assert_eq!(ep["base_url"], "https://api-dev.rayline.ai/v1");
+        // api_key_env is preserved so the rlk- key still loads.
+        assert_eq!(ep["api_key_env"], "RAYLINE_ROUTER_API_KEY");
+    }
+
+    #[test]
+    fn codex_native_base_url_gets_v1_suffix_idempotently() {
+        // Bare host root → `/v1`; a base_url already ending in `/v1` is untouched.
+        let mut ep = serde_json::Map::new();
+        ep.insert("base_url".to_owned(), json!("https://api.rayline.ai"));
+        assert!(ensure_rcr_base_url_has_v1(&mut ep));
+        assert_eq!(ep["base_url"], "https://api.rayline.ai/v1");
+        assert!(!ensure_rcr_base_url_has_v1(&mut ep), "idempotent");
+
+        let mut trailing = serde_json::Map::new();
+        trailing.insert("base_url".to_owned(), json!("https://api.rayline.ai/"));
+        assert!(ensure_rcr_base_url_has_v1(&mut trailing));
+        assert_eq!(trailing["base_url"], "https://api.rayline.ai/v1");
+    }
+
+    #[test]
+    fn codex_native_via_materialize_config() {
+        // End-to-end through the codex `--config` materializer (RRC shape).
+        let dir = std::env::temp_dir().join(format!("rayline-codex-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("RRC.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_vec(&json!({
+                "endpoints": [
+                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                      "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                      "auth": "api_key", "models": ["rayline-router"] }
+                ],
+                "routes": {
+                    "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_config_for_local_router(&cfg_path, &dir).unwrap();
+        let materialized: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        let ep = &materialized["endpoints"][0];
+        assert_eq!(ep["protocol"], "openai_responses");
+        assert_eq!(ep["auth"], "bearer");
+        assert_eq!(ep["headers"]["x-rayline-client"], "codex");
+        assert_eq!(ep["base_url"], "https://api.rayline.ai/v1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_native_normalizes_already_native_endpoint_auth() {
+        // A partially-migrated hosted endpoint: already `openai_responses` but
+        // still `auth: api_key`. Must be normalized to bearer (+ /v1 + header),
+        // not left sending the rlk- key as x-api-key.
+        let mut cfg = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "openai_responses",
+                  "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                  "auth": "api_key", "models": ["rayline-router"] }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+        assert!(rewrite_rayline_cloud_for_codex_native(&mut cfg));
+        let ep = &cfg["endpoints"][0];
+        assert_eq!(ep["protocol"], "openai_responses");
+        assert_eq!(
+            ep["auth"], "bearer",
+            "stale api_key auth must be normalized"
+        );
+        assert_eq!(ep["base_url"], "https://api.rayline.ai/v1");
+        assert_eq!(ep["headers"]["x-rayline-client"], "codex");
+        // Fully normalized → idempotent.
+        assert!(!rewrite_rayline_cloud_for_codex_native(&mut cfg));
+    }
+
+    #[test]
+    fn codex_native_ignores_custom_host() {
+        // A user's own anthropic endpoint at a non-RCR host must never flip.
+        let mut cfg = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": "https://not-the-rcr.example.com", "auth": "api_key" }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+        assert!(!rewrite_rayline_cloud_for_codex_native(&mut cfg));
+        assert_eq!(cfg["endpoints"][0]["protocol"], "anthropic_messages");
+    }
+
+    #[test]
+    fn hosted_rcr_host_detection() {
+        assert!(endpoint_base_url_is_hosted_rcr(Some(
+            "https://api.rayline.ai"
+        )));
+        assert!(endpoint_base_url_is_hosted_rcr(Some(
+            "https://api-dev.rayline.ai"
+        )));
+        assert!(!endpoint_base_url_is_hosted_rcr(Some(
+            "https://api.rayline.ai.evil.com"
+        )));
+        assert!(!endpoint_base_url_is_hosted_rcr(Some(
+            "https://openrouter.ai/api"
+        )));
+        assert!(!endpoint_base_url_is_hosted_rcr(None));
     }
 }
