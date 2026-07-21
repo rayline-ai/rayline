@@ -12,7 +12,10 @@ any of these entry points (each is a column in the [Modes](#modes) table):
   main leg. Current Codex spawns subagents (observed: `collab_spawn`) and Rayline
   routes them via `routes.subagent`/`routes.subagents`, so a main≠subagent split
   is exercised — **subscription-main (`A*`) modes work fully (⁵), cloud-RCR-main
-  (`R*`) modes now route Codex natively to the hosted RCR (✅, ⁴), and local-main
+  (`R*`) modes route Codex natively to the hosted RCR — the `--config` codex
+  materialization flips the hosted endpoint to `openai_responses` (bearer auth,
+  `x-rayline-client: codex`), so a Codex `/v1/responses` main forwards natively and
+  the RCR picks the model, no down-translation to Anthropic (✅) — and local-main
   (`L*`) modes route to the on-device model (🟡, ⁴)**.
 
 `--config` drives **both** the main agent (`routes.main`) and subagents
@@ -90,15 +93,15 @@ by the local model (see ¹/⁴) · ❌ = not supported. See
 
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Claude | Codex | Router | Config |
 |---|---|---|---|---|---|---|---|:--:|:--:|:--:|---|
-| **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ | ✅ ⁴ | ✅ | [`RRC.json`](./RRC.json) |
-| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud model (RCR may send a subagent → local) | rayline | ✅ | ✅ ⁴ | ✅ | [`RRCL.json`](./RRCL.json) |
-| **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ | ✅ ⁴ | ✅ | [`RRL.json`](./RRL.json) |
-| **RAC** † | `rayline` | `anthropic/openai` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ ⁴ | ✅ | [`RAC.json`](./RAC.json) |
+| **RRC** | `rayline` | `rayline` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ | ✅ | ✅ | [`RRC.json`](./RRC.json) |
+| **RRCL** § | `rayline` | `rayline` | rayline-cloud | on | cloud (RCR) § | cloud model (RCR may send a subagent → local) | rayline | ✅ | ✅ | ✅ | [`RRCL.json`](./RRCL.json) |
+| **RRL** | `rayline` | `rayline` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ | ✅ | ✅ | [`RRL.json`](./RRL.json) |
+| **RAC** † | `rayline` | `anthropic/openai` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`RAC.json`](./RAC.json) |
 | **RACL** ² | `rayline` | `anthropic/openai` | rayline-cloud | on | cloud model (RCR may send a agent → local) | Anthropic (API key) | rayline + Anthropic key | ❌ | ❌ | ❌ | — (may-local) |
-| **RAL** † | `rayline` | `anthropic/openai` | rayline-local | N/A | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ ⁴ | ✅ | [`RAL.json`](./RAL.json) |
-| **RLC** | `rayline` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ | ✅ ⁴ | ✅ | [`RLC.json`](./RLC.json) |
+| **RAL** † | `rayline` | `anthropic/openai` | rayline-local | N/A | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`RAL.json`](./RAL.json) |
+| **RLC** | `rayline` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ | ✅ | ✅ | [`RLC.json`](./RLC.json) |
 | **RLCL** ² | `rayline` | `local` | rayline-cloud | on | cloud model (RCR may send a agent → local) | local model | rayline | ❌ | ❌ | ❌ | — (may-local) |
-| **RLL** | `rayline` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ | ✅ ⁴ | ✅ | [`RLL.json`](./RLL.json) |
+| **RLL** | `rayline` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ | ✅ | ✅ | [`RLL.json`](./RLL.json) |
 | **ARC** | `anthropic/openai` | `rayline` | rayline-cloud | off | subscription (Claude / ChatGPT) | cloud (RCR) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`ARC.json`](./ARC.json) |
 | **ARCL** § | `anthropic/openai` | `rayline` | rayline-cloud | on | subscription (Claude / ChatGPT) | cloud model (RCR may send a subagent → local) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`ARCL.json`](./ARCL.json) |
 | **ARL** | `anthropic/openai` | `rayline` | rayline-local | N/A | subscription (Claude / ChatGPT) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`ARL.json`](./ARL.json) |
@@ -114,7 +117,7 @@ instead of one blanket default:
 
 - [`RLC-per-type.json`](./RLC-per-type.json) — `RLC-per-type`: main cloud;
   `Explore`/`Plan` → distinct local models, everything else → cloud. Claude ✅ ·
-  Router ✅ · Codex ✅ (cloud-RCR main — ⁴).
+  Router ✅ · Codex ✅ (cloud-RCR main, native Responses).
 - [`AL-per-type.json`](./AL-per-type.json) — `AL-per-type`: main on your Claude
   **subscription**; only `Explore` → local, and **every other subagent passes
   through to the subscription** (no `routes.subagent` default). Claude ✅ · Router ✅
@@ -198,33 +201,29 @@ subagent advertises may-local) and is likewise verified on-device. The
 advertisement + redirect *plumbing* is hermetically tested; the end-to-end redirect
 is exercised only by the ignored live test.
 
-**⁴ Codex, non-subscription main — depends on the main's provider.** Current Codex
-spawns subagents (`collab_spawn`) that Rayline routes via `routes.subagent` /
-`routes.subagents`, so the subagent axis is live. Codex sends a **sentinel
-`--model`** (`rayline-local` by default) on every turn; the `--config` codex
-materialization pins that sentinel to `routes.main` for **main** turns (the same
-helper the subscription path uses), while the router skips that model_route on
-**subagent** turns so subagent routing applies. The main leg then splits by the
-main's provider:
+**⁴ 🟡 Codex, local main (`L*`: `LRC`/`LRL`/`LA`/`LL`) — capability-limited.** Codex
+sends a **sentinel `--model`** (`rayline-local` by default) on every turn; the
+`--config` codex materialization pins that sentinel to `routes.main` for **main**
+turns (the same helper the subscription path uses), while the router skips that
+model_route on **subagent** turns so subagent routing applies (Codex spawns
+subagents via `collab_spawn`, routed through `routes.subagent`/`routes.subagents`).
+For the local-main modes the sentinel routes to the config's on-device endpoint and
+the local model answers — marked 🟡, not ✅, for the **same reason as the Claude
+column (¹)**: whether a small local model can reliably drive Codex's agentic tool
+loop is a model-capability question. Verified on-device: `rayline codex --config
+LL.json` → `codex route endpoint:ollama requested=rayline-local selected=qwen3.5:9b`
+→ reply returned.
 
-- **🟡 local main (`L*`: `LRC`/`LRL`/`LA`/`LL`).** The sentinel now routes to the
-  config's local endpoint and the on-device model answers. Marked 🟡, not ✅, for
-  the **same reason as the Claude column (¹)**: whether a small local model can
-  reliably drive Codex's agentic tool loop is a model-capability question. Verified
-  on-device: `rayline codex --config LL.json` → `codex route endpoint:ollama
-  requested=rayline-local selected=qwen3.5:9b` → reply returned.
-- **✅ cloud main (`R*`: `RRC`/`RRCL`/`RRL`/`RAC`/`RAL`/`RLC`/`RLL`).** The sentinel
-  routes to `rayline-cloud` — the hosted **RCR**, which now serves Codex natively:
-  the codex `--config` materialization flips the hosted endpoint to
-  `openai_responses` (bearer auth, `x-rayline-client: codex`), so a Codex
-  `/v1/responses` main forwards natively to the RCR (`POST /v1/responses`) and the
-  RCR picks a GPT model — no down-translation to Anthropic. The RCR reports the
-  chosen model back via `x-rayline-selected-model`, so `rayline top` shows the real
-  GPT (v1 default `gpt-5.5`). Verified end-to-end against prod
-  (`api.rayline.ai`): `rayline codex --config RRC.json` drove a real Codex coding
-  session (shell + edit tools, subagent spawn) through the RCR. Only a user's own
-  **custom** `anthropic_messages` endpoint is left untouched (host-guarded to
-  `api.rayline.ai` / `api-dev.rayline.ai`).
+The **cloud-main (`R*`) modes are plain ✅** — the codex `--config` materialization
+flips the hosted RCR endpoint to `openai_responses` (bearer auth, `x-rayline-client:
+codex`), so a Codex `/v1/responses` main forwards natively (`POST /v1/responses`)
+and the RCR picks the model — no down-translation to Anthropic. The RCR reports the
+chosen model back via `x-rayline-selected-model`, so `rayline top` shows the real
+model. Only a user's own **custom** `anthropic_messages` endpoint is left untouched
+(host-guarded to `api.rayline.ai` / `api-dev.rayline.ai`). Verified end-to-end
+against prod (`api.rayline.ai`) and dev (`api-dev.rayline.ai`): `rayline codex
+--config RRC.json` drives a real Codex session through the RCR (trivial prompt →
+cheap tier, hard prompt → frontier — the RCR tiers per request).
 
 **⁵ ✅ Codex — subscription main via `--auth subscription`.** The `A*` modes route
 `routes.main` to the `subscription` sentinel, which `rayline codex --auth
@@ -258,7 +257,8 @@ local-main capability limit). Per-cell status:
 
 - **✅** — works end-to-end. Every shipped config's routing is exercised by the
   hermetic tests below, and where a *capable* main drives the run the agent loop
-  completes too. **Codex** is ✅ for the subscription mains (⁵). Modes with a
+  completes too. **Codex** is ✅ for the cloud-RCR mains (`R*`, native Responses)
+  and the subscription mains (`A*`, ⁵). Modes with a
   cloud/capable main and `router: rayline-local` (`RRL`/`RAL`/`RLL`/`ARL`) are ✅ for
   Claude/Router: `router: rayline-local` is **static LSR routing** — the JSON is the
   decider, no ML policy needed. (`RRCL` is ✅ for the client/advertisement contract;
@@ -272,7 +272,7 @@ local-main capability limit). Per-cell status:
   on-device model (⁴), but whether it can drive Codex's agentic tool loop is likewise
   a model-capability question.
 - **❌** — not supported. For **Codex**, a mode that ships no config (the
-  cloud-RCR-main and subscription-main paths now route Codex — ⁴/⁵). For
+  cloud-RCR-main (`R*`) and subscription-main (`A*`, ⁵) paths both route Codex). For
   **Claude/Router**, a `rayline`-only sub-axis isn't wired yet, for two reasons:
   - **may-local is inert** — the `CL` lands on the main agent (the only `rayline-cloud`
     class), where may-local never applies (`RACL` ≡ `RAC`, `RLCL` ≡ `RLC`) — see ².
