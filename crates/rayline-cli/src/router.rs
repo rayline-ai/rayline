@@ -49,6 +49,16 @@ fn daemon_bin_env_var() -> &'static str {
     "RLD_BIN"
 }
 
+/// Whether a Codex run's `--config` declares may-local (Rcl-Rcl/Rcl-K) — a route
+/// carrying `local_models`. The may-local adapter branch in `start_from_cli` is
+/// gated `!codex_mode`, so a Codex config declaring may-local silently ignores it
+/// and routes on the cloud RCR. This gates a startup warning so the drop is not
+/// silent. It states a fact about the config, not a per-request routing
+/// prediction; it never changes routing.
+fn codex_may_local_unsupported(codex_mode: bool, config_path: &Path) -> bool {
+    codex_mode && crate::router_config::config_may_local(config_path).is_some()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterStatusRequest {
     pub root_env_explicit: bool,
@@ -1652,6 +1662,21 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             start_request.upstream_model = Some(may_local.model.clone());
             start_request.local_model_id = may_local.model;
             return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
+        }
+        // may-local (Rcl-Rcl/Rcl-K) is not supported for Codex: the branch above is
+        // gated `!codex_mode`, so a Codex run with a may-local config falls
+        // through to plain cloud-RCR routing and `local_models` is ignored. Warn
+        // loudly instead of silently degrading, and point to Rc-L — an explicit
+        // `routes.subagent → local` config that *does* route Codex subagents
+        // on-device today. (Full Codex may-local is tracked separately.)
+        if codex_may_local_unsupported(codex_mode, path) {
+            eprintln!(
+                "rayline codex: your config's `local_models` setting (letting the cloud router \
+                 send some work to your local model) currently works only with Claude, not \
+                 Codex, so it will be ignored on this run. Any routes you point directly at a \
+                 local `endpoint` still run on-device as configured; to run part of a Codex \
+                 session locally, use one of those instead of `local_models`."
+            );
         }
         start_request.router_config_path = Some(if codex_subscription_auth {
             crate::router_config::materialize_codex_subscription_for_local_router(path, &home)?
@@ -4016,6 +4041,73 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn codex_may_local_unsupported_predicate() {
+        use serde_json::json;
+        let dir = unique_test_dir("codex-may-local-warn");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Rcl-Rcl-shape: a `rayline-cloud` route carrying `local_models` → may-local on.
+        let rcl_rcl = dir.join("Rcl-Rcl.json");
+        std::fs::write(
+            &rcl_rcl,
+            serde_json::to_vec(&json!({
+                "endpoints": [
+                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                      "base_url": "https://api.rayline.ai", "models": ["rayline-router"] },
+                    { "id": "ollama", "protocol": "openai_chat",
+                      "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
+                ],
+                "routes": {
+                    "main":     { "endpoint": "rayline-cloud", "model": "rayline-router",
+                                  "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router",
+                                  "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Rc-Rc-shape: no `local_models` → may-local off.
+        let rc_rc = dir.join("Rc-Rc.json");
+        std::fs::write(
+            &rc_rc,
+            serde_json::to_vec(&json!({
+                "endpoints": [
+                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                      "base_url": "https://api.rayline.ai", "models": ["rayline-router"] }
+                ],
+                "routes": {
+                    "main":     { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Warns only for Codex + a may-local config.
+        assert!(
+            codex_may_local_unsupported(true, &rcl_rcl),
+            "codex + Rcl-Rcl → warn"
+        );
+        assert!(
+            !codex_may_local_unsupported(false, &rcl_rcl),
+            "claude + Rcl-Rcl → no warn (supported)"
+        );
+        assert!(
+            !codex_may_local_unsupported(true, &rc_rc),
+            "codex + Rc-Rc → no warn (no local_models)"
+        );
+        assert!(
+            !codex_may_local_unsupported(false, &rc_rc),
+            "claude + Rc-Rc → no warn"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
