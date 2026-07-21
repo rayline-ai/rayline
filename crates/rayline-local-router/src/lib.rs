@@ -711,6 +711,14 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
             continue;
         }
         for model in &endpoint.models {
+            // Internal sentinels (`rayline-router`/`rayline-subagent`/`rayline-codex`)
+            // are valid wire values but not picker entries — the one picker sentinel
+            // (`rayline-local` → "Rayline Auto") is added above. An endpoint that
+            // declares a sentinel as its `models` (e.g. `rayline-cloud`) would
+            // otherwise pollute the catalog with a duplicate/garbled entry.
+            if is_internal_sentinel_model(model) {
+                continue;
+            }
             models.push(CatalogModel {
                 id: model.clone(),
                 display_name: catalog_display_name(endpoint, model),
@@ -718,6 +726,14 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
         }
     }
     models
+}
+
+/// Sentinel model names that are internal routing markers, never picker entries.
+/// Excludes `rayline-local` (the one advertised picker sentinel, added explicitly).
+fn is_internal_sentinel_model(model: &str) -> bool {
+    model == DEFAULT_VIRTUAL_MODEL      // rayline-router
+        || model == DEFAULT_SUBAGENT_MODEL  // rayline-subagent
+        || model == "rayline-codex"
 }
 
 /// Endpoints that declare an `api_key_env` which is unset at startup are hidden
@@ -6715,6 +6731,26 @@ mod tests {
         assert_eq!(
             catalog_display(&RouterConfig::default(), CATALOG_SENTINEL_MODEL).as_deref(),
             Some("Rayline Auto")
+        );
+    }
+
+    #[test]
+    fn catalog_hides_internal_sentinels_declared_as_endpoint_models() {
+        // A `rayline-cloud` endpoint declares the `rayline-router` sentinel as its
+        // model (RRC configs do). It is an internal wire marker, not a picker entry,
+        // so the catalog must offer only `rayline-local` ("Rayline Auto") — never a
+        // garbled "Rayline rayline-cloud rayline-router" row.
+        let config = RouterConfig {
+            endpoints: vec![endpoint(
+                "rayline-cloud",
+                EndpointProtocol::OpenAIResponses,
+                &["rayline-router"],
+            )],
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            catalog_ids(&config),
+            vec![CATALOG_SENTINEL_MODEL.to_owned()]
         );
     }
 

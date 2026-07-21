@@ -91,7 +91,20 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         .auth_mode
         .effective_for_run(request.config_path.as_ref())
         == EffectiveCodexAuthMode::Subscription;
-    let config = generate_config(&request, subscription_auth);
+    // Present the Rayline provider to the desktop app as OpenAI-authed whenever we
+    // can. That is what makes Codex use the provider's /models and show the clean
+    // "Rayline Auto" entry in the picker instead of "Custom" + its built-in GPT
+    // presets. This is presentation only — it does NOT change where the prompt
+    // goes: the router config decides that. Under the RRC default the request
+    // routes to the hosted RCR with your `rlk-` key (the endpoint is not
+    // `client_bearer`, so the ChatGPT token Codex attaches is stripped and
+    // replaced with the router key upstream). We enable it for subscription, and
+    // for the RRC default only when a ChatGPT login already exists to attach —
+    // `--auth none` (local) stays plain, and a user with no ChatGPT login keeps
+    // the working-but-plain picker rather than being forced into a login.
+    let openai_presentation =
+        subscription_auth || (request.auth_mode == CodexAuthMode::Auto && chatgpt_auth_available());
+    let config = generate_config(&request, openai_presentation);
 
     // 3. Reconcile the single-instance app-server. The comparison basis is the
     //    running app-server's OWN loaded config (its CODEX_HOME/config.toml),
@@ -108,7 +121,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         }
         ReconcileOutcome::Proceed => {
             // No conflicting app, or the user agreed to restart: write config now.
-            if let Err(error) = write_isolated_home(&home, &config, subscription_auth) {
+            if let Err(error) = write_isolated_home(&home, &config, openai_presentation) {
                 eprintln!("Error: failed to prepare Codex app home: {error}");
                 return ExitCode::from(1);
             }
@@ -128,6 +141,15 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
             ExitCode::from(127)
         }
     }
+}
+
+/// Whether a ChatGPT `auth.json` exists in the user's real Codex home. Gates the
+/// OpenAI-authed presentation for the RRC default: with a login we can attach a
+/// token (so Codex shows the clean picker), without one we must not force a login.
+fn chatgpt_auth_available() -> bool {
+    user_codex_home()
+        .map(|home| home.join("auth.json").exists())
+        .unwrap_or(false)
 }
 
 /// Resolve the user's real Codex home (`$CODEX_HOME` or `~/.codex`), used as the
