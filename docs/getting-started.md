@@ -56,16 +56,19 @@ Codex provider overrides:
 rayline codex -- exec "summarize this repo"
 ```
 
-With no `--config`, `rayline codex` runs in subscription passthrough mode:
-Codex reuses its existing ChatGPT/Codex login, sends those auth headers to
-Rayline, and Rayline forwards them to the ChatGPT Codex backend. This mirrors the
-default `rayline claude` proxy shape: the default stays on the user's
-subscription, and a config can override selected routes to local/API-key
-endpoints.
+With no `--config`, `rayline codex` defaults to **RRC** — it routes everything
+(main + subagents) to the hosted cloud router (RCR) over native OpenAI Responses,
+authenticated with your `rayline auth login` session key. This mirrors the
+default `rayline claude`, which likewise routes everything to the cloud router; a
+`--config` overrides selected routes to local/API-key/subscription endpoints.
+
+To use your ChatGPT/Codex subscription for the main agent instead, pass
+`--auth subscription` (Codex reuses its existing ChatGPT login; subagents route
+to the on-device model when one is available). Use `--auth none` for local/no
+hosted auth.
 
 Use `--model <name>` before `--` to request a different Rayline virtual or
-configured model. Use `--auth none --config <path>` when the config is fully
-API-key/local and should not require Codex ChatGPT auth.
+configured model.
 
 ### Desktop app
 

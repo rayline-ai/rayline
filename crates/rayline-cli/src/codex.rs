@@ -118,7 +118,50 @@ pub(crate) async fn resolve_cloud_router_key(
         .ok()
 }
 
-pub async fn run(request: RunRequest) -> ExitCode {
+/// Resolve the config that drives a `rayline codex` / `rayline codex app` run.
+///
+/// A user-supplied `--config` is used verbatim. Otherwise the **default** is RRC
+/// — route main + subagents to the hosted cloud RCR (native OpenAI Responses),
+/// mirroring `rayline claude`'s route-all cloud default. We reuse the shared
+/// default config (`router_config::default_config_json`, materialized via
+/// `ensure_default_config`) and drive it through the ordinary `--config` codex
+/// path, so cloud-key provisioning ([`resolve_cloud_router_key`]) and the native
+/// materialization ([`crate::router_config::materialize_codex_config_for_local_router`])
+/// are shared, not re-implemented.
+///
+/// Only the default `--auth auto` opts in. Explicit `--auth subscription` keeps
+/// the ChatGPT-subscription default, and `--auth none` keeps the local default —
+/// both resolve their own zero-config shapes downstream in `start_from_cli`.
+pub(crate) fn resolve_codex_config_path(
+    home: &Path,
+    config_path: Option<PathBuf>,
+    auth_mode: CodexAuthMode,
+) -> io::Result<Option<PathBuf>> {
+    if config_path.is_some() || auth_mode != CodexAuthMode::Auto {
+        return Ok(config_path);
+    }
+    Ok(Some(crate::router_config::ensure_default_config(home)?))
+}
+
+/// Resolve the real home used for the Rayline router config + key (not the Codex
+/// app's isolated `CODEX_HOME`), then apply [`resolve_codex_config_path`].
+pub(crate) fn resolve_codex_config_path_from_home(
+    config_path: Option<PathBuf>,
+    auth_mode: CodexAuthMode,
+) -> io::Result<Option<PathBuf>> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    resolve_codex_config_path(&home, config_path, auth_mode)
+}
+
+pub async fn run(mut request: RunRequest) -> ExitCode {
+    match resolve_codex_config_path_from_home(request.config_path.take(), request.auth_mode) {
+        Ok(path) => request.config_path = path,
+        Err(error) => {
+            eprintln!("Error: failed to prepare the default Rayline codex config: {error}");
+            return ExitCode::from(1);
+        }
+    }
     let router_api_key_override = resolve_cloud_router_key(
         request.config_path.as_deref(),
         request.env_name.as_deref(),
@@ -375,9 +418,22 @@ mod tests {
     use super::{
         CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
         EffectiveCodexAuthMode, parse_codex_version_text, resolve_cloud_router_key,
-        subscription_router_config_json,
+        resolve_codex_config_path, subscription_router_config_json,
     };
     use std::path::PathBuf;
+
+    fn temp_home() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "rayline-codex-home-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
 
     fn write_config(name: &str, body: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -419,6 +475,47 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Default `rayline codex` / `codex app` (no `--config`, auto auth) → RRC:
+    // synthesize the shared default config (route everything to the hosted RCR).
+    #[test]
+    fn default_auto_no_config_resolves_to_rrc() {
+        let home = temp_home();
+        let resolved = resolve_codex_config_path(&home, None, CodexAuthMode::Auto).unwrap();
+        let path = resolved.expect("auto + no --config should synthesize a default config");
+        // It's the shared default config, and it routes to the hosted cloud RCR
+        // (RRC), not a subscription passthrough.
+        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
+        assert!(!crate::router_config::config_main_is_passthrough(&path));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_config_is_used_verbatim() {
+        let home = temp_home();
+        let user = write_config("user-cfg", r#"{"endpoints":[],"routes":{}}"#);
+        let resolved =
+            resolve_codex_config_path(&home, Some(user.clone()), CodexAuthMode::Auto).unwrap();
+        assert_eq!(resolved, Some(user.clone()));
+        let _ = std::fs::remove_file(&user);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_subscription_and_none_keep_their_own_default() {
+        // Only `auto` opts into the RRC default; `subscription` (ChatGPT) and
+        // `none` (local) keep `None` here and resolve their shapes downstream.
+        let home = temp_home();
+        assert_eq!(
+            resolve_codex_config_path(&home, None, CodexAuthMode::Subscription).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_codex_config_path(&home, None, CodexAuthMode::None).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

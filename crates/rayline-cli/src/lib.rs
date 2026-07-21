@@ -150,8 +150,11 @@ Options:
                           router config decide (main/subagent routing).
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
-                          auto uses subscription when --config is absent and
-                          no client auth when --config is present.
+                          auto with no --config defaults to RRC (route
+                          everything to the hosted cloud router, like
+                          `rayline claude`); with --config it follows the
+                          config. subscription uses your ChatGPT subscription;
+                          none runs local.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
@@ -171,6 +174,9 @@ Options:
                           router config decide (main/subagent routing).
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
+                          auto with no --config defaults to RRC (route
+                          everything to the hosted cloud router). subscription
+                          uses your ChatGPT subscription; none runs local.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";

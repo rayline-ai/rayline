@@ -39,7 +39,20 @@ pub struct AppRunRequest {
     pub auth_token: Option<String>,
 }
 
-pub async fn run(request: AppRunRequest) -> ExitCode {
+pub async fn run(mut request: AppRunRequest) -> ExitCode {
+    // Default (no `--config`, auto auth) to RRC — route everything to the hosted
+    // cloud RCR, mirroring `rayline claude` and `rayline codex`. Shared resolver
+    // so the default is defined once.
+    match crate::codex::resolve_codex_config_path_from_home(
+        request.config_path.take(),
+        request.auth_mode,
+    ) {
+        Ok(path) => request.config_path = path,
+        Err(error) => {
+            eprintln!("Error: failed to prepare the default Rayline codex config: {error}");
+            return ExitCode::from(1);
+        }
+    }
     // 1. Start/ensure the Rayline router — identical path to `rayline codex`.
     let router_api_key_override = crate::codex::resolve_cloud_router_key(
         request.config_path.as_deref(),
