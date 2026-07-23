@@ -599,5 +599,17 @@ rayline router stop
 rayline claude --local --isolated --router-config-path ~/.config/rayline/local-router.json
 ```
 
+If a turn fails with a provider-side error (Codex shows "Provider returned
+error"), the router log now records the upstream status:
+
+```
+WARN rayline_local_router: upstream returned HTTP 400 (task=main selected=…)
+```
+
+The response body is passed through to the client untouched — read it there for
+the provider's own message. Tool names are not a cause: names Codex namespaces
+with characters providers reject (`server.tool`, `server/tool`) are rewritten to
+the provider-safe charset on the way upstream and restored on the way back.
+
 To validate the full end-to-end Claude Code path through Rayline Local, see
 [Acceptance testing](acceptance-testing.md).

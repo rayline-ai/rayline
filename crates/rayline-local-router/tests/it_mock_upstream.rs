@@ -819,3 +819,98 @@ async fn main_only_config_routes_subagents_to_main_over_http() {
     let _ = std::fs::remove_file(path);
     println!("PASS main-only config drives main AND subagents to the single endpoint");
 }
+
+/// Codex namespaces MCP tools with characters (`.`, `/`) that Anthropic's
+/// Messages API and the providers behind it reject: forwarding them verbatim
+/// fails the whole turn with a 400 the client shows as "Provider returned
+/// error". The router must rewrite such names to the provider-safe charset on
+/// the way upstream and restore the client's original name on the way back, so
+/// Codex can still match the call to the MCP tool it declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_style_tool_names_are_provider_safe_upstream_and_restored_downstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    // The upstream answers with the name it was given (the rewritten one), the
+    // way a real provider echoes the tool it picked.
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"codex_list_resource_templates\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cursor\\\":null}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(upstream, http_sse(sse), tx));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "mock-anthropic",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["model-solo"]
+        }],
+        "routes": {
+            "main": {"endpoint": "mock-anthropic", "model": "model-solo"},
+            "model_routes": {
+                "rayline-local": {"endpoint": "mock-anthropic", "model": "model-solo"}
+            }
+        }
+    });
+    let path = write_config("mcp-tool-names", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({
+            "model": "rayline-local",
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "list the templates"}
+            ]}],
+            "tools": [{
+                "type": "function",
+                "name": "codex.list_resource_templates",
+                "description": "List MCP resource templates",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+
+    let events = collect_sse(resp).await;
+    let call = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call")
+        .expect("a function_call item");
+    assert_eq!(call["item"]["name"], "codex.list_resource_templates");
+    assert_eq!(call["item"]["call_id"], "toolu_1");
+    assert_eq!(call["item"]["arguments"], "{\"cursor\":null}");
+
+    let captured = rx.await.expect("captured upstream request");
+    let body = captured
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+    let sent = serde_json::from_str::<Value>(body).expect("upstream request body");
+    let sent_name = sent["tools"][0]["name"]
+        .as_str()
+        .expect("upstream tool name");
+    assert_eq!(sent_name, "codex_list_resource_templates");
+    assert!(
+        !captured.contains("codex.list_resource_templates"),
+        "the provider-rejected name must not reach upstream"
+    );
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS MCP tool name rewritten upstream as {sent_name:?} and restored downstream");
+}

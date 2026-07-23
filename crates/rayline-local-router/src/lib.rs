@@ -1567,7 +1567,9 @@ async fn run_synthetic_unary_response(
     body: &Value,
     request_id: &str,
 ) -> Result<(Value, u64)> {
-    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    // Text-only synthetic turns (title/memory summarization): no tool calls come
+    // back, so no name rewrites need restoring.
+    let (anthropic, _tool_names) = responses_to_anthropic_request(body, &decision.selected_model);
     let estimated_input_tokens = approximate_input_tokens(&anthropic);
     match &decision.target {
         RouteSelection::Local => {
@@ -2170,7 +2172,7 @@ async fn forward_responses_to_anthropic_endpoint(
     request_id: &str,
     output_kind: SyntheticOutputKind,
 ) -> Result<Response<BoxBody>> {
-    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let (anthropic, tool_names) = responses_to_anthropic_request(body, &decision.selected_model);
     let estimated_input_tokens = approximate_input_tokens(&anthropic);
     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
     let mut outbound = state
@@ -2194,10 +2196,13 @@ async fn forward_responses_to_anthropic_endpoint(
         resp,
         decision,
         state.opts.metrics.clone(),
-        request_id.to_owned(),
-        estimated_input_tokens,
-        output_kind,
-        responses_wants_stream(body),
+        ResponsesTranslation {
+            request_id: request_id.to_owned(),
+            estimated_input_tokens,
+            output_kind,
+            want_stream: responses_wants_stream(body),
+            tool_names,
+        },
     )
     .await
 }
@@ -2209,7 +2214,7 @@ async fn forward_responses_to_local_adapter(
     request_id: &str,
     output_kind: SyntheticOutputKind,
 ) -> Result<Response<BoxBody>> {
-    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let (anthropic, tool_names) = responses_to_anthropic_request(body, &decision.selected_model);
     let estimated_input_tokens = approximate_input_tokens(&anthropic);
     let url = format!(
         "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}&rayline_request_id={}",
@@ -2228,10 +2233,13 @@ async fn forward_responses_to_local_adapter(
         resp,
         decision,
         state.opts.metrics.clone(),
-        request_id.to_owned(),
-        estimated_input_tokens,
-        output_kind,
-        responses_wants_stream(body),
+        ResponsesTranslation {
+            request_id: request_id.to_owned(),
+            estimated_input_tokens,
+            output_kind,
+            want_stream: responses_wants_stream(body),
+            tool_names,
+        },
     )
     .await
 }
@@ -2244,7 +2252,7 @@ async fn forward_responses_to_openai_chat_endpoint(
     request_id: &str,
     output_kind: SyntheticOutputKind,
 ) -> Result<Response<BoxBody>> {
-    let anthropic = responses_to_anthropic_request(body, &decision.selected_model);
+    let (anthropic, tool_names) = responses_to_anthropic_request(body, &decision.selected_model);
     let estimated_input_tokens = approximate_input_tokens(&anthropic);
     let request_body = build_openai_chat_request(&anthropic, &decision.selected_model, false);
     let url = format!(
@@ -2287,6 +2295,7 @@ async fn forward_responses_to_openai_chat_endpoint(
             request_id,
             estimated_input_tokens,
             output_kind,
+            &tool_names,
         ))
     } else {
         Ok(synthetic_responses_json(
@@ -2295,6 +2304,7 @@ async fn forward_responses_to_openai_chat_endpoint(
             request_id,
             estimated_input_tokens,
             output_kind,
+            &tool_names,
         ))
     }
 }
@@ -2456,6 +2466,23 @@ async fn response_from_reqwest(
     request_id: Option<String>,
     estimated_input_tokens: Option<u64>,
 ) -> Result<Response<BoxBody>> {
+    // Upstream failures are passed through verbatim, which leaves the client
+    // showing whatever opaque wrapper the provider sent ("Provider returned
+    // error"). Record the status so the router log says which endpoint/model
+    // failed; the body is not logged because provider errors echo request
+    // content.
+    if !status.is_success() {
+        let (task, selected) = decision.map_or(("<none>", "<none>"), |decision| {
+            (
+                decision.task_class.as_str(),
+                decision.selected_model.as_str(),
+            )
+        });
+        warn!(
+            "upstream returned HTTP {} (task={task} selected={selected})",
+            status.as_u16()
+        );
+    }
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -2952,7 +2979,8 @@ fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
     headers.insert("x-rayline-route-id", route_id);
 }
 
-fn responses_to_anthropic_request(body: &Value, model: &str) -> Value {
+fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolNameRewrites) {
+    let rewrites = ToolNameRewrites::from_responses_body(body);
     let mut messages = Vec::new();
     let mut system_parts = Vec::new();
     let mut converted_tools = Vec::new();
@@ -2963,6 +2991,7 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> Value {
                 &mut system_parts,
                 &mut converted_tools,
                 item,
+                &rewrites,
             );
         }
     } else if let Some(input) = body.get("input") {
@@ -2994,7 +3023,10 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> Value {
         system_parts.push(instructions.to_owned());
     }
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        for tool in tools.iter().filter_map(responses_tool_to_anthropic) {
+        for tool in tools
+            .iter()
+            .filter_map(|tool| responses_tool_to_anthropic(tool, &rewrites))
+        {
             converted_tools.push(tool);
         }
     }
@@ -3013,7 +3045,7 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> Value {
     if !converted_tools.is_empty() {
         out.insert("tools".to_owned(), Value::Array(converted_tools));
     }
-    Value::Object(out)
+    (Value::Object(out), rewrites)
 }
 
 fn responses_wants_stream(body: &Value) -> bool {
@@ -3041,11 +3073,15 @@ fn append_responses_input_as_anthropic(
     system_parts: &mut Vec<String>,
     converted_tools: &mut Vec<Value>,
     item: &Value,
+    rewrites: &ToolNameRewrites,
 ) {
     match item.get("type").and_then(Value::as_str) {
         Some("additional_tools") => {
             if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-                for tool in tools.iter().filter_map(responses_tool_to_anthropic) {
+                for tool in tools
+                    .iter()
+                    .filter_map(|tool| responses_tool_to_anthropic(tool, rewrites))
+                {
                     converted_tools.push(tool);
                 }
             }
@@ -3108,7 +3144,12 @@ fn append_responses_input_as_anthropic(
                 .unwrap_or_else(|| json!({}));
             messages.push(json!({
                 "role": "assistant",
-                "content": [{"type": "tool_use", "id": id, "name": name, "input": arguments}]
+                "content": [{
+                    "type": "tool_use",
+                    "id": id,
+                    "name": rewrites.upstream(name),
+                    "input": arguments,
+                }]
             }));
         }
         Some("local_shell_call") => {
@@ -3235,7 +3276,116 @@ fn openai_image_url_to_anthropic(url: &str) -> Value {
     json!({"type": "image", "source": {"type": "url", "url": url}})
 }
 
-fn responses_tool_to_anthropic(tool: &Value) -> Option<Value> {
+/// Per-request rewrites for tool names upstream providers refuse.
+///
+/// Anthropic's Messages API and the OpenAI-compatible providers behind it
+/// validate tool/function names against roughly `[A-Za-z][A-Za-z0-9_-]*`. Codex
+/// namespaces MCP tools with characters outside that set (`codex.list_x`,
+/// `server/tool`), and forwarding those verbatim makes the provider reject the
+/// entire turn with a 400 the client surfaces as an opaque
+/// "Provider returned error". Rewrite offending names on the way upstream and
+/// restore the client's original name on the way back, so the client can still
+/// match the tool call to the tool it declared.
+#[derive(Clone, Debug, Default)]
+struct ToolNameRewrites {
+    to_upstream: HashMap<String, String>,
+    to_client: HashMap<String, String>,
+}
+
+impl ToolNameRewrites {
+    fn from_responses_body(body: &Value) -> Self {
+        let mut rewrites = Self::default();
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            rewrites.record_tools(tools);
+        }
+        for item in body
+            .get("input")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match item.get("type").and_then(Value::as_str) {
+                Some("additional_tools") => {
+                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                        rewrites.record_tools(tools);
+                    }
+                }
+                // Replayed calls from earlier turns must use the same upstream
+                // name as the tool declaration, even when that tool is no longer
+                // in `tools`.
+                Some("function_call") | Some("custom_tool_call") => {
+                    if let Some(name) = item.get("name").and_then(Value::as_str) {
+                        rewrites.record(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        rewrites
+    }
+
+    fn record_tools(&mut self, tools: &[Value]) {
+        for tool in tools {
+            if let Some(name) = tool
+                .get("name")
+                .or_else(|| tool.pointer("/function/name"))
+                .and_then(Value::as_str)
+            {
+                self.record(name);
+            }
+        }
+    }
+
+    fn record(&mut self, name: &str) {
+        if is_provider_safe_tool_name(name) || self.to_upstream.contains_key(name) {
+            return;
+        }
+        let base = sanitize_tool_name(name);
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        while self.to_client.contains_key(&candidate) {
+            candidate = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        self.to_client.insert(candidate.clone(), name.to_owned());
+        self.to_upstream.insert(name.to_owned(), candidate);
+    }
+
+    fn upstream<'a>(&'a self, name: &'a str) -> &'a str {
+        self.to_upstream.get(name).map_or(name, String::as_str)
+    }
+
+    fn client<'a>(&'a self, name: &'a str) -> &'a str {
+        self.to_client.get(name).map_or(name, String::as_str)
+    }
+}
+
+fn is_provider_safe_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some(first) if first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn sanitize_tool_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !out.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        out.insert_str(0, "tool_");
+    }
+    out
+}
+
+fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return None;
     }
@@ -3254,7 +3404,7 @@ fn responses_tool_to_anthropic(tool: &Value) -> Option<Value> {
         .cloned()
         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
     Some(json!({
-        "name": name,
+        "name": rewrites.upstream(name),
         "description": description,
         "input_schema": input_schema
     }))
@@ -3283,15 +3433,31 @@ fn function_output_to_text(value: &Value) -> String {
     content_to_text(value)
 }
 
-async fn anthropic_response_to_responses(
-    resp: reqwest::Response,
-    decision: &RouteDecision,
-    metrics: Option<SharedMetricsSink>,
+/// Everything the upstream-Anthropic → Codex-Responses translation needs beyond
+/// the reply itself.
+struct ResponsesTranslation {
     request_id: String,
     estimated_input_tokens: u64,
     output_kind: SyntheticOutputKind,
     want_stream: bool,
+    tool_names: ToolNameRewrites,
+}
+
+async fn anthropic_response_to_responses(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    translation: ResponsesTranslation,
 ) -> Result<Response<BoxBody>> {
+    let ResponsesTranslation {
+        request_id,
+        estimated_input_tokens,
+        output_kind,
+        want_stream,
+        tool_names,
+    } = &translation;
+    let (estimated_input_tokens, output_kind, want_stream) =
+        (*estimated_input_tokens, *output_kind, *want_stream);
     let status = resp.status();
     if !status.is_success() {
         return response_from_reqwest(
@@ -3299,7 +3465,7 @@ async fn anthropic_response_to_responses(
             status,
             Some(decision),
             metrics,
-            Some(request_id),
+            Some(request_id.clone()),
             Some(estimated_input_tokens),
         )
         .await;
@@ -3316,9 +3482,10 @@ async fn anthropic_response_to_responses(
                 resp,
                 decision,
                 metrics,
-                request_id,
+                request_id.clone(),
                 estimated_input_tokens,
                 output_kind,
+                tool_names.clone(),
             ));
         }
         let text = resp.text().await?;
@@ -3326,9 +3493,10 @@ async fn anthropic_response_to_responses(
         Ok(synthetic_responses_json(
             decision,
             &value,
-            &request_id,
+            request_id,
             estimated_input_tokens,
             output_kind,
+            tool_names,
         ))
     } else {
         let value = resp.json::<Value>().await?;
@@ -3336,17 +3504,19 @@ async fn anthropic_response_to_responses(
             Ok(synthetic_responses_json(
                 decision,
                 &value,
-                &request_id,
+                request_id,
                 estimated_input_tokens,
                 output_kind,
+                tool_names,
             ))
         } else {
             Ok(synthetic_responses_sse(
                 decision,
                 &value,
-                &request_id,
+                request_id,
                 estimated_input_tokens,
                 output_kind,
+                tool_names,
             ))
         }
     }
@@ -3359,6 +3529,7 @@ fn anthropic_stream_to_responses(
     request_id: String,
     estimated_input_tokens: u64,
     output_kind: SyntheticOutputKind,
+    tool_names: ToolNameRewrites,
 ) -> Response<BoxBody> {
     let selected_model = decision.selected_model.clone();
     let response_id = format!("resp_{}", decision.route_id.replace('-', "_"));
@@ -3373,6 +3544,7 @@ fn anthropic_stream_to_responses(
             selected_model.clone(),
             estimated_input_tokens,
             output_kind,
+            tool_names,
         );
         let mut stream = resp.bytes_stream();
         let mut downstream_open = true;
@@ -3492,6 +3664,7 @@ struct AnthropicToResponsesTranslator {
     buffer: String,
     text: String,
     tools: HashMap<usize, AnthropicToolBlock>,
+    tool_names: ToolNameRewrites,
     input_tokens: u64,
     output_tokens: Option<u64>,
     running_output_chars: usize,
@@ -3506,6 +3679,7 @@ impl AnthropicToResponsesTranslator {
         selected_model: String,
         estimated_input_tokens: u64,
         output_kind: SyntheticOutputKind,
+        tool_names: ToolNameRewrites,
     ) -> Self {
         Self {
             response_id,
@@ -3514,6 +3688,7 @@ impl AnthropicToResponsesTranslator {
             buffer: String::new(),
             text: String::new(),
             tools: HashMap::new(),
+            tool_names,
             input_tokens: estimated_input_tokens,
             output_tokens: None,
             running_output_chars: 0,
@@ -3576,10 +3751,14 @@ impl AnthropicToResponsesTranslator {
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned();
-                    let name = value
-                        .pointer("/content_block/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
+                    let name = self
+                        .tool_names
+                        .client(
+                            value
+                                .pointer("/content_block/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool"),
+                        )
                         .to_owned();
                     // Anthropic streams a `tool_use` block's arguments via
                     // `input_json_delta` fragments; the `input` on
@@ -3769,6 +3948,7 @@ fn synthetic_responses_sse(
     request_id: &str,
     estimated_input_tokens: u64,
     output_kind: SyntheticOutputKind,
+    tool_names: &ToolNameRewrites,
 ) -> Response<BoxBody> {
     let response_id = format!("resp_{}", request_id.replace('-', "_"));
     let mut translator = AnthropicToResponsesTranslator::new(
@@ -3776,6 +3956,7 @@ fn synthetic_responses_sse(
         decision.selected_model.clone(),
         estimated_input_tokens,
         output_kind,
+        tool_names.clone(),
     );
     let mut events = translator.start();
     if let Some(usage) = anthropic_message.get("usage") {
@@ -3799,10 +3980,8 @@ fn synthetic_responses_sse(
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned(),
-                    name: block
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
+                    name: tool_names
+                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool"))
                         .to_owned(),
                     input_json: block
                         .get("input")
@@ -3847,9 +4026,10 @@ fn synthetic_responses_json(
     request_id: &str,
     estimated_input_tokens: u64,
     output_kind: SyntheticOutputKind,
+    tool_names: &ToolNameRewrites,
 ) -> Response<BoxBody> {
     let response_id = format!("resp_{}", request_id.replace('-', "_"));
-    let output = synthetic_response_items(anthropic_message, output_kind);
+    let output = synthetic_response_items(anthropic_message, output_kind, tool_names);
     let output_text = output
         .iter()
         .filter_map(|item| {
@@ -3899,6 +4079,7 @@ fn synthetic_responses_json(
 fn synthetic_response_items(
     anthropic_message: &Value,
     output_kind: SyntheticOutputKind,
+    tool_names: &ToolNameRewrites,
 ) -> Vec<Value> {
     let mut text = String::new();
     let mut output = Vec::new();
@@ -3912,7 +4093,8 @@ fn synthetic_response_items(
             Some("tool_use") if output_kind == SyntheticOutputKind::Message => {
                 output.push(json!({
                     "type": "function_call",
-                    "name": block.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                    "name": tool_names
+                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool")),
                     "arguments": block
                         .get("input")
                         .cloned()
@@ -5336,7 +5518,7 @@ mod tests {
             }]
         });
 
-        let converted = responses_to_anthropic_request(&request, "claude-test");
+        let (converted, _rewrites) = responses_to_anthropic_request(&request, "claude-test");
 
         assert_eq!(converted["model"], "claude-test");
         assert_eq!(converted["system"], "You are concise.");
@@ -5381,12 +5563,154 @@ mod tests {
             "stream": false
         });
 
-        let converted = responses_to_anthropic_request(&request, "claude-test");
+        let (converted, _rewrites) = responses_to_anthropic_request(&request, "claude-test");
 
         assert_eq!(converted["stream"], false);
         assert_eq!(converted["system"], "Follow repo rules.");
         assert_eq!(converted["messages"][0]["content"][0]["text"], "hello");
         assert_eq!(converted["tools"][0]["name"], "exec_command");
+    }
+
+    #[test]
+    fn provider_unsafe_tool_names_are_rewritten_and_restored() {
+        // Codex namespaces MCP tools with `.` / `/`; providers behind the
+        // Anthropic surface reject those names outright ("Provider returned
+        // error"), so they must not reach upstream verbatim.
+        let request = json!({
+            "model": "rayline-codex",
+            "input": [
+                {"type": "function_call", "call_id": "call_1",
+                 "name": "codex.list_resource_templates", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+            ],
+            "tools": [
+                {"type": "function", "name": "codex.list_resource_templates",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "function", "name": "codex/list_resource_templates",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "function", "name": "shell",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]
+        });
+
+        let (converted, rewrites) = responses_to_anthropic_request(&request, "claude-test");
+
+        let names = converted["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        for name in &names {
+            assert!(
+                is_provider_safe_tool_name(name),
+                "tool name {name:?} still violates the provider charset"
+            );
+        }
+        // Distinct client names stay distinct upstream.
+        assert_eq!(names.len(), 3);
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+        // Safe names are passed through untouched.
+        assert!(names.contains(&"shell".to_owned()));
+        // A replayed call keeps the same name as its declaration.
+        assert_eq!(
+            converted["messages"][0]["content"][0]["name"],
+            names[0].as_str()
+        );
+        // ...and the round trip restores exactly what the client declared.
+        assert_eq!(rewrites.client(&names[0]), "codex.list_resource_templates");
+        assert_eq!(rewrites.client(&names[1]), "codex/list_resource_templates");
+        assert_eq!(rewrites.client("shell"), "shell");
+    }
+
+    #[test]
+    fn sanitize_tool_name_forces_a_leading_letter() {
+        assert_eq!(sanitize_tool_name("codex.list"), "codex_list");
+        assert_eq!(sanitize_tool_name("9lives"), "tool_9lives");
+        assert_eq!(sanitize_tool_name("_hidden"), "tool__hidden");
+        assert_eq!(sanitize_tool_name(""), "tool_");
+        assert!(is_provider_safe_tool_name("a-b_c9"));
+        assert!(!is_provider_safe_tool_name("a.b"));
+        assert!(!is_provider_safe_tool_name("1ab"));
+    }
+
+    #[test]
+    fn synthetic_response_items_restore_the_client_tool_name() {
+        let (_converted, rewrites) = responses_to_anthropic_request(
+            &json!({
+                "tools": [{"type": "function", "name": "codex.list_resource_templates",
+                           "parameters": {"type": "object", "properties": {}}}]
+            }),
+            "claude-test",
+        );
+        let upstream_name = rewrites
+            .upstream("codex.list_resource_templates")
+            .to_owned();
+        assert_ne!(upstream_name, "codex.list_resource_templates");
+
+        let items = synthetic_response_items(
+            &json!({
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": upstream_name,
+                    "input": {"a": 1}
+                }]
+            }),
+            SyntheticOutputKind::Message,
+            &rewrites,
+        );
+
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["name"], "codex.list_resource_templates");
+        assert_eq!(items[0]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn anthropic_stream_translator_restores_the_client_tool_name() {
+        let (_converted, rewrites) = responses_to_anthropic_request(
+            &json!({
+                "tools": [{"type": "function", "name": "codex.list_resource_templates",
+                           "parameters": {"type": "object", "properties": {}}}]
+            }),
+            "claude-test",
+        );
+        let upstream_name = rewrites
+            .upstream("codex.list_resource_templates")
+            .to_owned();
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "rayline-codex".to_owned(),
+            1,
+            SyntheticOutputKind::Message,
+            rewrites,
+        );
+
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"tool_use","id":"call_1","name":upstream_name}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        let out = translator.push_bytes(upstream.as_bytes());
+
+        assert!(out.contains("\"name\":\"codex.list_resource_templates\""));
+        assert!(!out.contains(&format!("\"name\":\"{upstream_name}\"")));
     }
 
     #[test]
@@ -5396,6 +5720,7 @@ mod tests {
             "rayline-codex".to_owned(),
             3,
             SyntheticOutputKind::Message,
+            ToolNameRewrites::default(),
         );
         let mut upstream = String::new();
         push_sse(
@@ -5472,6 +5797,7 @@ mod tests {
             "rayline-codex".to_owned(),
             3,
             SyntheticOutputKind::Message,
+            ToolNameRewrites::default(),
         );
         let mut upstream = String::new();
         push_sse(
@@ -5548,6 +5874,7 @@ mod tests {
             "rayline-codex".to_owned(),
             3,
             SyntheticOutputKind::Compaction,
+            ToolNameRewrites::default(),
         );
         let mut upstream = String::new();
         push_sse(
@@ -5591,6 +5918,7 @@ mod tests {
             "req-test",
             2,
             SyntheticOutputKind::Message,
+            &ToolNameRewrites::default(),
         );
 
         assert_eq!(response.status(), StatusCode::OK);
