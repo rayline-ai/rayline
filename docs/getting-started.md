@@ -300,11 +300,11 @@ single-model setup needs one route entry:
       "base_url": "https://openrouter.ai/api",
       "api_key_env": "OPENROUTER_API_KEY",
       "auth": "bearer",
-      "models": ["moonshotai/kimi-k3"]
+      "models": ["moonshotai/kimi-k2.6"]
     }
   ],
   "routes": {
-    "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" }
+    "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" }
   }
 }
 ```
@@ -321,7 +321,7 @@ on a frontier model, subagents on-device):
 
 ```json
 "routes": {
-  "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+  "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" },
   "subagent": { "endpoint": "local" }
 }
 ```
