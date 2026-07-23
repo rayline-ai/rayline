@@ -96,11 +96,20 @@ pub struct ConfigureRequest {
 /// `RAYLINE_ROUTER_API_KEY`. Mirrors the Claude path
 /// ([`crate::claude::ensure_router_key`]).
 ///
-/// Best-effort: returns `None` when there is no config, the config routes to no
-/// cloud endpoint (subscription `A*` / local `L*` modes), or provisioning fails
-/// (e.g. not logged in and non-interactive) — the daemon then surfaces a clear
-/// error only if a cloud route is actually hit. When interactive and logged out,
-/// `ensure_router_key` drives the same `rayline auth login` prompt Claude uses.
+/// An explicit `RAYLINE_ROUTER_API_KEY` is respected and passed through verbatim
+/// as the override (no provisioning): otherwise a stored `rlk-` key would be
+/// returned instead and shadow the user's explicit value. Passing it as the
+/// override also bakes it into the daemon reuse metadata, so a key change
+/// re-fingerprints and restarts a stale daemon rather than silently reusing one
+/// (the daemon otherwise inherits the env var, so a first run still works, but
+/// the resolved value must match what it actually uses).
+///
+/// Best-effort otherwise: returns `None` when there is no config, the config
+/// routes to no cloud endpoint (subscription `A*` / local `L*` modes), or
+/// provisioning fails (e.g. not logged in and non-interactive) — the daemon then
+/// surfaces a clear error only if a cloud route is actually hit. When interactive
+/// and logged out, `ensure_router_key` drives the same `rayline auth login`
+/// prompt Claude uses.
 pub(crate) async fn resolve_cloud_router_key(
     config_path: Option<&Path>,
     env_name: Option<&str>,
@@ -110,6 +119,12 @@ pub(crate) async fn resolve_cloud_router_key(
     let path = config_path?;
     if !crate::router_config::config_routes_to_hosted_rcr(path) {
         return None;
+    }
+    if let Some(explicit) = std::env::var_os("RAYLINE_ROUTER_API_KEY")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(explicit);
     }
     let home = dirs::home_dir()?;
     let env = crate::status::resolve_env(env_name, Some(home.as_path()));
@@ -474,6 +489,38 @@ mod tests {
                 .await
                 .is_none()
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn cloud_router_key_passes_through_explicit_env_var() {
+        // An explicit `RAYLINE_ROUTER_API_KEY` is returned verbatim as the
+        // override (not shadowed by a stored key, and not dropped on the
+        // proxy-less Codex daemon start). Network-free: returns before
+        // `ensure_router_key`.
+        let path = write_config(
+            "rrc-cloud",
+            r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses","base_url":"https://api.rayline.ai","models":["rayline-router"],"api_key_env":"RAYLINE_ROUTER_API_KEY","auth":"bearer"}],"routes":{"main":{"endpoint":"rayline-cloud","model":"rayline-router"}}}"#,
+        );
+        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
+
+        let var = "RAYLINE_ROUTER_API_KEY";
+        let previous = std::env::var_os(var);
+        // SAFETY: this test owns the var for its duration and the suite runs
+        // single-threaded (`--test-threads=1`); the original value is restored.
+        unsafe { std::env::set_var(var, "rlk-user-explicit") };
+        assert_eq!(
+            resolve_cloud_router_key(Some(path.as_path()), None, None, false).await,
+            Some("rlk-user-explicit".to_owned()),
+            "an explicit RAYLINE_ROUTER_API_KEY must pass through as the override"
+        );
+        // SAFETY: see the note above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
         let _ = std::fs::remove_file(&path);
     }
 

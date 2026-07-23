@@ -2954,16 +2954,19 @@ fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Resu
     if let Some(override_key) = request.router_api_key_override.as_deref() {
         return Ok(Some(override_key.to_owned()));
     }
-    if !request.enable_proxy {
-        return Ok(None);
-    }
     if request.decision_plane == DECISION_PLANE_LOCAL {
         // The local router on :20811 needs no auth, but a config endpoint may read
         // RAYLINE_ROUTER_API_KEY (e.g. a hosted cloud-router route). Preserve a
-        // user-set value rather than clobbering it with empty.
+        // user-set value rather than clobbering it with empty. Checked before the
+        // `!enable_proxy` short-circuit below so a proxy-less Codex start
+        // (`enable_proxy = false`, including `router start --mode codex`) still
+        // forwards an explicit env var to the daemon and its reuse metadata.
         return Ok(Some(
             std::env::var("RAYLINE_ROUTER_API_KEY").unwrap_or_default(),
         ));
+    }
+    if !request.enable_proxy {
+        return Ok(None);
     }
     let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
     crate::status::resolve_hosted_environment(&env_name, Some(home))
@@ -4132,20 +4135,44 @@ mod tests {
     }
 
     #[test]
-    fn no_override_and_disabled_proxy_resolves_to_none() {
-        // Without an explicit override, a disabled proxy short-circuits to None
-        // (the local router on :20811 needs no auth of its own). The override fix
-        // only affects the has-override case.
-        let home = unique_test_dir("router-key-noneoverride");
+    fn local_plane_disabled_proxy_forwards_env_key() {
+        // A proxy-less local-plane start (the Codex daemon shape, including
+        // `router start --mode codex`) reads RAYLINE_ROUTER_API_KEY even without
+        // an explicit override, so a config's cloud-router leg authenticates and
+        // a changed key reaches the daemon reuse metadata. This is checked before
+        // the `!enable_proxy` short-circuit.
+        let home = unique_test_dir("router-key-localplane-env");
         std::fs::create_dir_all(&home).unwrap();
 
         let mut request = RouterStartRequest::local_router_defaults(false);
         request.enable_proxy = false;
         request.router_api_key_override = None;
 
-        let resolved = resolve_router_api_key(&home, &request).unwrap();
-        assert_eq!(resolved, None);
+        let var = "RAYLINE_ROUTER_API_KEY";
+        let previous = std::env::var_os(var);
+        // SAFETY: single-threaded suite (`--test-threads=1`); we own the var for
+        // this test and restore it below.
+        unsafe { std::env::set_var(var, "rlk-env-forwarded") };
+        assert_eq!(
+            resolve_router_api_key(&home, &request).unwrap().as_deref(),
+            Some("rlk-env-forwarded"),
+            "an explicit env var must be forwarded on the proxy-less local plane"
+        );
+        // Unset → empty string (preserve the user value, else empty), not an error.
+        // SAFETY: see the note above.
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(
+            resolve_router_api_key(&home, &request).unwrap().as_deref(),
+            Some("")
+        );
 
+        // SAFETY: see the note above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 }
