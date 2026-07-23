@@ -1788,7 +1788,7 @@ fn select_route(
     // On a subagent turn the Codex sentinel must NOT resolve via `model_routes`
     // when an explicit subagent route exists — otherwise that route is dead config
     // and a main≠subagent Codex split is impossible. But when NO subagent
-    // route exists (e.g. the per-type `AL-per-type`/`ARC-per-type` configs route
+    // route exists (e.g. the per-type `S-L-per-type`/`S-Rc-per-type` configs route
     // only `Explore` and set no `routes.subagent` default), the sentinel
     // model_route (pinned to `routes.main`) is the intended passthrough for
     // unmatched subagents — keep it, don't strand them on the local adapter. Main
@@ -5305,8 +5305,8 @@ mod tests {
                 include_str!("../../../examples/openrouter.json"),
             ),
             (
-                "single-model",
-                include_str!("../../../examples/single-model.json"),
+                "K-K (single-model)",
+                include_str!("../../../examples/routing-modes/K-K.json"),
             ),
         ] {
             serde_json::from_str::<RouterConfig>(raw)
@@ -5375,16 +5375,16 @@ mod tests {
         let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
 
         // main routed + subagent routed (the routes the local router executes):
-        let st = load_state(include_str!("../../../examples/routing-modes/RRC.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rc-Rc.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        // RRL: `router: rayline-local` makes the LSR the router; it forwards to the
+        // Rl-Rl: `router: rayline-local` makes the LSR the router; it forwards to the
         // `rayline-cloud` endpoint but pins each class's `model` on-device instead of
         // sending the `rayline-router` virtual model for the RCR to pick. Covers all
         // three routing slots — main, default subagent, and a per-type override —
         // each a distinct model, proving the LSR (not the RCR) is choosing.
-        let st = load_state(include_str!("../../../examples/routing-modes/RRL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rl-Rl.json"));
         assert_eq!(
             main_route(&st),
             (ep("rayline-cloud"), "z-ai/glm-5.2".to_owned())
@@ -5398,42 +5398,49 @@ mod tests {
             (ep("rayline-cloud"), "deepseek/deepseek-v4-flash".to_owned())
         );
 
-        // RRCL: `router`/`local_models` are may-local advertisement metadata; they do
+        // Rcl-Rcl: `router`/`local_models` are may-local advertisement metadata; they do
         // not change the LSR's routing — main + subagents still resolve to cloud.
-        let st = load_state(include_str!("../../../examples/routing-modes/RRCL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rcl-Rcl.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/RLC.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rc-L.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/LRC.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/L-Rc.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/LL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/L-L.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/RAC.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rc-K.json"));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/LA.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/L-K.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
+
+        // K-K: a single keyed endpoint with only `routes.main` — subagents inherit the
+        // main route, so both legs resolve to the same endpoint + model.
+        let st = load_state(include_str!("../../../examples/routing-modes/K-K.json"));
+        let kimi = || (ep("openrouter"), "moonshotai/kimi-k2.6".to_owned());
+        assert_eq!(main_route(&st), kimi());
+        assert_eq!(sub_route(&st, "reviewer"), kimi());
 
         // subscription main (stripped) → assert subagents only:
-        let st = load_state(include_str!("../../../examples/routing-modes/ARC.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/S-Rc.json"));
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/AL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/S-L.json"));
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         // per-type: Explore/Plan → distinct local models, anything else → cloud catch-all:
         let st = load_state(include_str!(
-            "../../../examples/routing-modes/RLC-per-type.json"
+            "../../../examples/routing-modes/Rc-L-per-type.json"
         ));
         assert_eq!(main_route(&st), cloud());
         assert_eq!(
@@ -5443,47 +5450,47 @@ mod tests {
         assert_eq!(sub_route(&st, "Plan"), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), cloud());
 
-        // router: rayline-local on the rayline class (RAL/RLL/ARL/LRL) — the LSR
+        // router: rayline-local on the rayline class (Rl-K/Rl-L/S-Rl/L-Rl) — the LSR
         // routes that class to rayline-cloud and pins its model; the other class is
         // anthropic (API key) / ollama / subscription, per the JSON.
         let glm = || (ep("rayline-cloud"), "z-ai/glm-5.2".to_owned());
         let ds_pro = || (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned());
-        let st = load_state(include_str!("../../../examples/routing-modes/RAL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rl-K.json"));
         assert_eq!(main_route(&st), glm());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
-        let st = load_state(include_str!("../../../examples/routing-modes/RLL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/Rl-L.json"));
         assert_eq!(main_route(&st), glm());
         assert_eq!(
             sub_route(&st, "reviewer"),
             (ep("ollama"), "qwen2.5-coder:7b".to_owned())
         );
 
-        let st = load_state(include_str!("../../../examples/routing-modes/LRL.json"));
+        let st = load_state(include_str!("../../../examples/routing-modes/L-Rl.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), ds_pro());
 
-        // ARL: subscription main (stripped) → assert the rayline-local subagent only.
-        let st = load_state(include_str!("../../../examples/routing-modes/ARL.json"));
+        // S-Rl: subscription main (stripped) → assert the rayline-local subagent only.
+        let st = load_state(include_str!("../../../examples/routing-modes/S-Rl.json"));
         assert_eq!(sub_route(&st, "reviewer"), ds_pro());
 
-        // AL-per-type: subscription main (stripped) + no default subagent; only the
+        // S-L-per-type: subscription main (stripped) + no default subagent; only the
         // Explore type is routed to a local model. Other subagents and the main pass
         // through at the proxy layer (not modeled by the LSR), so assert just the one
         // routed leg the LSR actually executes.
         let st = load_state(include_str!(
-            "../../../examples/routing-modes/AL-per-type.json"
+            "../../../examples/routing-modes/S-L-per-type.json"
         ));
         assert_eq!(
             sub_route(&st, "Explore"),
             (ep("ollama"), "qwen2.5-coder:7b".to_owned())
         );
 
-        // ARC-per-type: subscription main (stripped) + no default subagent; only the
+        // S-Rc-per-type: subscription main (stripped) + no default subagent; only the
         // Explore type is routed to the cloud router. Cloud-only, so production routes
         // it via the proxy allowlist (not the LSR); this asserts the one routed leg.
         let st = load_state(include_str!(
-            "../../../examples/routing-modes/ARC-per-type.json"
+            "../../../examples/routing-modes/S-Rc-per-type.json"
         ));
         assert_eq!(sub_route(&st, "Explore"), cloud());
     }
@@ -6198,7 +6205,7 @@ mod tests {
         assert_eq!(decision.policy, "subagent");
     }
 
-    /// Builds an `AL-per-type`-shaped config: `routes.main` → subscription-ish
+    /// Builds an `S-L-per-type`-shaped config: `routes.main` → subscription-ish
     /// endpoint (pinned onto the sentinel model_route by materialization), one
     /// per-type `routes.subagents.Explore` → local, and NO `routes.subagent`
     /// default. Clears the built-in `default_config` subagent default so the
@@ -7206,7 +7213,7 @@ mod tests {
     #[test]
     fn catalog_hides_internal_sentinels_declared_as_endpoint_models() {
         // A `rayline-cloud` endpoint declares the `rayline-router` sentinel as its
-        // model (RRC configs do). It is an internal wire marker, not a picker entry,
+        // model (Rc-Rc configs do). It is an internal wire marker, not a picker entry,
         // so the catalog must offer only `rayline-local` ("Rayline Auto") — never a
         // garbled "Rayline rayline-cloud rayline-router" row.
         let config = RouterConfig {

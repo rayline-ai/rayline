@@ -91,7 +91,7 @@ pub struct ConfigureRequest {
 }
 
 /// Provision the hosted-RCR router key (`rlk-`) when a `--config` routes a leg to
-/// the cloud router, so `rayline codex --config <cloud>` (RRC/RAC/RAL/…)
+/// the cloud router, so `rayline codex --config <cloud>` (Rc-Rc/Rc-K/Rl-K/…)
 /// authenticates from a plain `rayline auth login` — no manual
 /// `RAYLINE_ROUTER_API_KEY`. Mirrors the Claude path
 /// ([`crate::claude::ensure_router_key`]).
@@ -120,7 +120,7 @@ pub(crate) async fn resolve_cloud_router_key(
 
 /// Resolve the config that drives a `rayline codex` / `rayline codex app` run.
 ///
-/// A user-supplied `--config` is used verbatim. Otherwise the **default** is RRC
+/// A user-supplied `--config` is used verbatim. Otherwise the **default** is Rc-Rc
 /// — route main + subagents to the hosted cloud RCR (native OpenAI Responses),
 /// mirroring `rayline claude`'s route-all cloud default. We reuse the shared
 /// default config (`router_config::default_config_json`, materialized via
@@ -477,7 +477,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // Default `rayline codex` / `codex app` (no `--config`, auto auth) → RRC:
+    // Default `rayline codex` / `codex app` (no `--config`, auto auth) → Rc-Rc:
     // synthesize the shared default config (route everything to the hosted RCR).
     #[test]
     fn default_auto_no_config_resolves_to_rrc() {
@@ -485,7 +485,7 @@ mod tests {
         let resolved = resolve_codex_config_path(&home, None, CodexAuthMode::Auto).unwrap();
         let path = resolved.expect("auto + no --config should synthesize a default config");
         // It's the shared default config, and it routes to the hosted cloud RCR
-        // (RRC), not a subscription passthrough.
+        // (Rc-Rc), not a subscription passthrough.
         assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
         assert!(!crate::router_config::config_main_is_passthrough(&path));
         let _ = std::fs::remove_dir_all(&home);
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn explicit_subscription_and_none_keep_their_own_default() {
-        // Only `auto` opts into the RRC default; `subscription` (ChatGPT) and
+        // Only `auto` opts into the Rc-Rc default; `subscription` (ChatGPT) and
         // `none` (local) keep `None` here and resolve their shapes downstream.
         let home = temp_home();
         assert_eq!(

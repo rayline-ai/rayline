@@ -40,7 +40,7 @@ pub struct AppRunRequest {
 }
 
 pub async fn run(mut request: AppRunRequest) -> ExitCode {
-    // Default (no `--config`, auto auth) to RRC — route everything to the hosted
+    // Default (no `--config`, auto auth) to Rc-Rc — route everything to the hosted
     // cloud RCR, mirroring `rayline claude` and `rayline codex`. Shared resolver
     // so the default is defined once.
     match crate::codex::resolve_codex_config_path_from_home(
@@ -95,11 +95,11 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     // can. That is what makes Codex use the provider's /models and show the clean
     // "Rayline Auto" entry in the picker instead of "Custom" + its built-in GPT
     // presets. This is presentation only — it does NOT change where the prompt
-    // goes: the router config decides that. Under the RRC default the request
+    // goes: the router config decides that. Under the Rc-Rc default the request
     // routes to the hosted RCR with your `rlk-` key (the endpoint is not
     // `client_bearer`, so the ChatGPT token Codex attaches is stripped and
     // replaced with the router key upstream). We enable it for subscription, and
-    // for the RRC default only when a ChatGPT login already exists to attach —
+    // for the Rc-Rc default only when a ChatGPT login already exists to attach —
     // `--auth none` (local) stays plain, and a user with no ChatGPT login keeps
     // the working-but-plain picker rather than being forced into a login.
     let openai_presentation =
@@ -144,7 +144,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
 }
 
 /// Whether a ChatGPT `auth.json` exists in the user's real Codex home. Gates the
-/// OpenAI-authed presentation for the RRC default: with a login we can attach a
+/// OpenAI-authed presentation for the Rc-Rc default: with a login we can attach a
 /// token (so Codex shows the clean picker), without one we must not force a login.
 fn chatgpt_auth_available() -> bool {
     user_codex_home()

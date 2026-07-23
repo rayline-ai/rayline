@@ -1629,7 +1629,7 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     // (ollama, direct-anthropic, rayline-cloud) are served by the local router
     // directly. Cloud-router endpoints read `RAYLINE_ROUTER_API_KEY` from the env.
     if let Some(path) = request.config_path.as_deref() {
-        // RRCL (may-local): a cloud-only config whose `rayline-cloud` route declares
+        // Rcl-Rcl (may-local): a cloud-only config whose `rayline-cloud` route declares
         // `local_models`. Route on the hosted cloud router (RCR) but front the
         // config's local endpoint with a custom adapter and advertise it, so the RCR
         // may 307-redirect to it. Cloud decision plane + custom upstream; the daemon
@@ -2322,7 +2322,7 @@ fn spawn_router(
         // Proxy disabled (e.g. the isolated local-plane path uses a separate proxy
         // sidecar), but the local router daemon itself still needs
         // RAYLINE_ROUTER_API_KEY when a config route targets the hosted
-        // `rayline-cloud` endpoint (e.g. RAC/RAL). Export it directly rather than
+        // `rayline-cloud` endpoint (e.g. Rc-K/Rl-K). Export it directly rather than
         // via `set_proxy_child_env`, which also scrubs proxy env not relevant here.
         command.env("RAYLINE_ROUTER_API_KEY", key);
     }
@@ -2665,7 +2665,7 @@ fn router_meta(
         meta.insert("bin_path".to_owned(), bin_path.display().to_string());
     }
     // Track the router key in BOTH proxy and non-proxy modes. The non-proxy
-    // local-plane path (isolated mixed configs like RAC/RAL) exports
+    // local-plane path (isolated mixed configs like Rc-K/Rl-K) exports
     // RAYLINE_ROUTER_API_KEY to the daemon for a `rayline-cloud` endpoint, so a
     // key acquired (first login) or rotated after the daemon is already running
     // counts as a config change and restarts the daemon — otherwise the reuse
@@ -2925,7 +2925,7 @@ fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Resu
     // is honored regardless of `enable_proxy`. The isolated local-plane path
     // starts the router with `enable_proxy = false`, so gating on it here would
     // drop the key and 502 the cloud leg with `requires $RAYLINE_ROUTER_API_KEY`
-    // for mixed configs (e.g. RAC: rayline-cloud main + anthropic subagent).
+    // for mixed configs (e.g. Rc-K: rayline-cloud main + anthropic subagent).
     if let Some(override_key) = request.router_api_key_override.as_deref() {
         return Ok(Some(override_key.to_owned()));
     }
@@ -3406,7 +3406,7 @@ mod tests {
     #[test]
     fn metadata_detects_router_key_acquisition_in_non_proxy_mode() {
         // Regression: a non-proxy local-plane router (isolated mixed configs like
-        // RAC) exports RAYLINE_ROUTER_API_KEY for a rayline-cloud endpoint. A key
+        // Rc-K) exports RAYLINE_ROUTER_API_KEY for a rayline-cloud endpoint. A key
         // acquired after the daemon is already running (first launch pre-login →
         // relaunch post-login) must be tracked in router_meta so the reuse check
         // restarts the daemon instead of keeping a keyless env.
@@ -4023,7 +4023,7 @@ mod tests {
         // Regression: the isolated local-plane path starts the router with
         // enable_proxy = false. An explicit `router_api_key_override` (the
         // `rayline auth login` session key injected for a config whose
-        // `rayline-cloud` endpoint reads RAYLINE_ROUTER_API_KEY, e.g. RAC/RAL)
+        // `rayline-cloud` endpoint reads RAYLINE_ROUTER_API_KEY, e.g. Rc-K/Rl-K)
         // must still be resolved — not dropped by the proxy gate — so the cloud
         // main leg authenticates instead of 502-ing.
         let home = unique_test_dir("router-key-override");

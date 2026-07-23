@@ -11,19 +11,19 @@
 #
 # Usage:
 #   ./visual-test.sh [MODE] [PROMPT]
-#     MODE    one of the configs in this dir (default: RRC), e.g. RRC RLC ARCL RRL LL AL ...
+#     MODE    one of the configs in this dir (default: Rc-Rc), e.g. Rc-Rc Rc-L S-Rcl Rl-Rl L-L S-L ...
 #     PROMPT  the prompt sent to the client; overrides the default. The Claude
 #             default spawns subagents so subagent routing — may-local
-#             (RRCL/ARCL) and per-class LSR routing (RRL) — is actually visible.
+#             (Rcl-Rcl/S-Rcl) and per-class LSR routing (Rl-Rl) — is actually visible.
 #             (A plain "say pong" never spawns a subagent.) Codex has no `Task`
 #             subagents, so its default is a plain prompt (only `routes.main` runs).
 #
 # Env:
 #   CLIENT         which client to drive: claude (default) or codex. Codex only
-#                  exercises `routes.main`; supported for subscription-main (A*)
-#                  and local-main (L*) modes — see the README's Codex column.
+#                  exercises `routes.main`; supported for subscription-main (S-*)
+#                  and local-main (L-*) modes — see the README's Codex column.
 #   CODEX_AUTH     codex auth source: auto (default) | subscription | none. `auto`
-#                  uses `--auth subscription` for A* (subscription-main) modes and
+#                  uses `--auth subscription` for S-* (subscription-main) modes and
 #                  no client auth otherwise. Ignored when CLIENT=claude.
 #   RAYLINE_BIN    rayline binary to use (default: rayline from PATH)
 #   DEMO_HEADLESS  set to 1 to force the text path even on a TTY
@@ -34,7 +34,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODE="${1:-RRC}"
+MODE="${1:-Rc-Rc}"
 RAYLINE_BIN="${RAYLINE_BIN:-rayline}"
 WINDOW_SIZE="${WINDOW_SIZE:-220x50}"
 CLIENT="${CLIENT:-claude}"
@@ -66,7 +66,7 @@ if [ "$CLIENT" = codex ]; then
   case "${CODEX_AUTH:-auto}" in
     subscription) CODEX_SUBSCRIPTION=1 ;;
     none) CODEX_SUBSCRIPTION="" ;;
-    auto) case "$MODE" in A*) CODEX_SUBSCRIPTION=1 ;; esac ;;
+    auto) case "$MODE" in S-*) CODEX_SUBSCRIPTION=1 ;; esac ;;
     *) echo "error: CODEX_AUTH must be auto|subscription|none" >&2; exit 1 ;;
   esac
 fi

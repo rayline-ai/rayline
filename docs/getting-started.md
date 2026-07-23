@@ -56,7 +56,7 @@ Codex provider overrides:
 rayline codex -- exec "summarize this repo"
 ```
 
-With no `--config`, `rayline codex` defaults to **RRC** — it routes everything
+With no `--config`, `rayline codex` defaults to **Rc-Rc** — it routes everything
 (main + subagents) to the hosted cloud router (RCR) over native OpenAI Responses,
 authenticated with your `rayline auth login` session key. This mirrors the
 default `rayline claude`, which likewise routes everything to the cloud router; a
@@ -289,7 +289,8 @@ Notes:
 
 `routes.subagent` is optional. A config that declares `routes.main` and no
 `routes.subagent` routes **subagents to the same target as main**, so a
-single-model setup needs one route entry:
+single-model setup needs one route entry. This ships as the **`K-K`** mode
+([`examples/routing-modes/K-K.json`](../examples/routing-modes/K-K.json)):
 
 ```json
 {

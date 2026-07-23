@@ -180,7 +180,7 @@ pub fn config_uses_local_endpoint(path: &Path) -> bool {
 
 /// `router` value selecting the hosted cloud decider (the default when absent).
 pub const ROUTER_RAYLINE_CLOUD: &str = "rayline-cloud";
-/// `router` value selecting the on-device LSR decider (RRL): the LSR routes the
+/// `router` value selecting the on-device LSR decider (Rl-Rl): the LSR routes the
 /// class per the static JSON and pins its `model`, rather than the hosted RCR.
 pub const ROUTER_RAYLINE_LOCAL: &str = "rayline-local";
 
@@ -479,7 +479,7 @@ fn rewrite_rayline_cloud_for_codex_native(cfg: &mut Value) -> bool {
 
 /// Normalize a hosted-RCR endpoint for native Codex forwarding. Applied
 /// uniformly regardless of the endpoint's declared protocol (a fresh
-/// `anthropic_messages` RRC endpoint, or a partially-migrated `openai_responses`
+/// `anthropic_messages` Rc-Rc endpoint, or a partially-migrated `openai_responses`
 /// one), so the result is always: `openai_responses` + `auth: bearer` +
 /// `/v1` base_url + `x-rayline-client: codex`. Each step is idempotent; returns
 /// whether anything changed.
@@ -502,7 +502,7 @@ fn normalize_rcr_endpoint_for_codex_native(endpoint: &mut serde_json::Map<String
 
 /// Ensure the RCR endpoint's `base_url` ends in `/v1`, so the native passthrough
 /// (which strips the inbound `/v1/` prefix before appending `responses`) reaches
-/// `…/v1/responses` on the hosted router rather than `…/responses`. The RRC-shape
+/// `…/v1/responses` on the hosted router rather than `…/responses`. The Rc-Rc-shape
 /// base_url is the bare host root (`https://api.rayline.ai`); add the `/v1`.
 /// Idempotent. Returns whether the config changed.
 fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> bool {
@@ -796,35 +796,39 @@ mod tests {
     fn example_mode_configs_derive_expected_routing() {
         // (file, main_is_passthrough, needs_local_router, uses_cloud_router)
         let cases = [
-            ("RRC.json", false, false, true),
-            // RRCL: may-local routes stay on the cloud router (the `ollama` endpoint
+            ("Rc-Rc.json", false, false, true),
+            // Rcl-Rcl: may-local routes stay on the cloud router (the `ollama` endpoint
             // is a redirect target, not a route) → no on-device router engaged.
-            ("RRCL.json", false, false, true),
-            // RRL: router rayline-local engages the on-device router even though
+            ("Rcl-Rcl.json", false, false, true),
+            // Rl-Rl: router rayline-local engages the on-device router even though
             // both routes target rayline-cloud (it pins the model on-device).
-            ("RRL.json", false, true, true),
-            ("RLC.json", false, true, true),
-            ("RLC-per-type.json", false, true, true),
-            ("RAC.json", false, true, true),
-            // RAL/RLL/ARL/LRL: router rayline-local on the rayline class → on-device
+            ("Rl-Rl.json", false, true, true),
+            ("Rc-L.json", false, true, true),
+            ("Rc-L-per-type.json", false, true, true),
+            ("Rc-K.json", false, true, true),
+            // Rl-K/Rl-L/S-Rl/L-Rl: router rayline-local on the rayline class → on-device
             // routing; the other class is anthropic (API key) / ollama / subscription.
-            ("RAL.json", false, true, true),
-            ("RLL.json", false, true, true),
-            ("ARL.json", true, true, true),
-            ("LRL.json", false, true, true),
-            ("ARC.json", true, false, true),
-            // ARC-per-type: subscription main (passthrough) + only Explore routed to
+            ("Rl-K.json", false, true, true),
+            ("Rl-L.json", false, true, true),
+            ("S-Rl.json", true, true, true),
+            ("L-Rl.json", false, true, true),
+            ("S-Rc.json", true, false, true),
+            // S-Rc-per-type: subscription main (passthrough) + only Explore routed to
             // the cloud router; no local endpoint. Unlisted subagents pass through at
             // the proxy (allowlist), so no default subagent and no LSR engagement.
-            ("ARC-per-type.json", true, false, true),
-            ("AL.json", true, true, false),
-            // AL-per-type: subscription main (passthrough) + only Explore routed to a
+            ("S-Rc-per-type.json", true, false, true),
+            ("S-L.json", true, true, false),
+            // S-L-per-type: subscription main (passthrough) + only Explore routed to a
             // local endpoint → engages the LSR; no cloud endpoint. Unlisted subagents
             // pass through at the proxy (not a route), so no default subagent needed.
-            ("AL-per-type.json", true, true, false),
-            ("LRC.json", false, true, true),
-            ("LL.json", false, true, false),
-            ("LA.json", false, true, false),
+            ("S-L-per-type.json", true, true, false),
+            ("L-Rc.json", false, true, true),
+            ("L-L.json", false, true, false),
+            ("L-K.json", false, true, false),
+            // K-K: a single keyed endpoint (openrouter) with only `routes.main` →
+            // main is routed (not passthrough); the on-device router forwards to the
+            // non-cloud endpoint; no hosted cloud-router key.
+            ("K-K.json", false, true, false),
         ];
         for (file, passthrough, needs_local, uses_cloud) in cases {
             let path = examples_dir().join(file);
@@ -865,11 +869,11 @@ mod tests {
         //                 gated on the cloud-only path (!needs_local) in claude.rs.
         // (file, expect_resolves, expect_needs_local, expect_fires)
         let cases = [
-            ("RRCL.json", true, false, true),
-            ("ARCL.json", true, false, true),
-            ("RACL.json", true, true, false),
-            ("RLCL.json", true, true, false),
-            ("LRCL.json", true, true, false),
+            ("Rcl-Rcl.json", true, false, true),
+            ("S-Rcl.json", true, false, true),
+            ("Rcl-K.json", true, true, false),
+            ("Rcl-L.json", true, true, false),
+            ("L-Rcl.json", true, true, false),
         ];
         for (file, resolves, needs_local, fires) in cases {
             let path = examples_dir().join(file);
@@ -892,27 +896,27 @@ mod tests {
 
     #[test]
     fn rrl_example_engages_local_router() {
-        // RRL: `router: rayline-local` makes the on-device LSR the router even though
+        // Rl-Rl: `router: rayline-local` makes the on-device LSR the router even though
         // the routes target the hosted `rayline-cloud` endpoint — so the LSR must be
         // engaged (it pins the route's `model` on-device instead of letting the RCR
         // pick). It is not may-local, not a passthrough main, and uses the cloud key.
-        let path = examples_dir().join("RRL.json");
-        assert!(path.exists(), "missing example config RRL.json");
+        let path = examples_dir().join("Rl-Rl.json");
+        assert!(path.exists(), "missing example config Rl-Rl.json");
         serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap();
         assert!(
             config_needs_local_router(&path),
-            "RRL: router rayline-local must engage the on-device router"
+            "Rl-Rl: router rayline-local must engage the on-device router"
         );
-        assert!(!config_main_is_passthrough(&path), "RRL: main is routed");
+        assert!(!config_main_is_passthrough(&path), "Rl-Rl: main is routed");
         assert!(
             config_uses_cloud_router(&path),
-            "RRL: forwards to the cloud key"
+            "Rl-Rl: forwards to the cloud key"
         );
         assert!(
             !config_uses_local_endpoint(&path),
-            "RRL: no bundled local model"
+            "Rl-Rl: no bundled local model"
         );
-        assert_eq!(config_may_local(&path), None, "RRL: not may-local");
+        assert_eq!(config_may_local(&path), None, "Rl-Rl: not may-local");
     }
 
     #[test]
@@ -933,10 +937,10 @@ mod tests {
 
     #[test]
     fn rrcl_example_resolves_may_local() {
-        // The shipped RRCL config advertises a local model fronted by the `ollama`
+        // The shipped Rcl-Rcl config advertises a local model fronted by the `ollama`
         // endpoint, and stays cloud-only for routing (no on-device router engaged).
-        let path = examples_dir().join("RRCL.json");
-        assert!(path.exists(), "missing example config RRCL.json");
+        let path = examples_dir().join("Rcl-Rcl.json");
+        assert!(path.exists(), "missing example config Rcl-Rcl.json");
         assert_eq!(
             config_may_local(&path),
             Some(MayLocal {
@@ -944,23 +948,23 @@ mod tests {
                 upstream_url: "http://127.0.0.1:11434".to_owned(),
             })
         );
-        // RRC (no may-local) must not resolve one.
-        assert_eq!(config_may_local(&examples_dir().join("RRC.json")), None);
+        // Rc-Rc (no may-local) must not resolve one.
+        assert_eq!(config_may_local(&examples_dir().join("Rc-Rc.json")), None);
     }
 
     #[test]
     fn materialize_strips_subscription_main_for_local_router() {
         let home = tmp_home();
-        // ARC: main = subscription (passthrough) → stripped; subagent stays.
-        let out = materialize_for_local_router(&examples_dir().join("ARC.json"), &home).unwrap();
+        // S-Rc: main = subscription (passthrough) → stripped; subagent stays.
+        let out = materialize_for_local_router(&examples_dir().join("S-Rc.json"), &home).unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         assert!(
             cfg["routes"].get("main").is_none(),
             "subscription main must be stripped"
         );
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "rayline-cloud");
-        // RLC: main is a real endpoint → file used verbatim (path unchanged).
-        let rl = examples_dir().join("RLC.json");
+        // Rc-L: main is a real endpoint → file used verbatim (path unchanged).
+        let rl = examples_dir().join("Rc-L.json");
         assert_eq!(materialize_for_local_router(&rl, &home).unwrap(), rl);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1142,7 +1146,7 @@ mod tests {
 
     #[test]
     fn may_local_resolves_model_and_upstream_for_rrcl() {
-        // RRCL: rayline-cloud routes carrying `local_models`, plus a local endpoint
+        // Rcl-Rcl: rayline-cloud routes carrying `local_models`, plus a local endpoint
         // that serves the advertised model.
         let cfg = json!({
             "endpoints": [
@@ -1169,7 +1173,7 @@ mod tests {
 
     #[test]
     fn may_local_off_when_no_local_models() {
-        // RRC: rayline-cloud, no `local_models` → may-local off.
+        // Rc-Rc: rayline-cloud, no `local_models` → may-local off.
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline", "protocol": "anthropic_messages",
@@ -1186,7 +1190,7 @@ mod tests {
 
     #[test]
     fn may_local_ignored_for_rayline_local_router() {
-        // RRL-shaped: `rayline-local` routes never advertise may-local (N/A), even
+        // Rl-Rl-shaped: `rayline-local` routes never advertise may-local (N/A), even
         // if a stray `local_models` is present.
         let cfg = json!({
             "endpoints": [
@@ -1326,10 +1330,10 @@ mod tests {
 
     #[test]
     fn codex_native_via_materialize_config() {
-        // End-to-end through the codex `--config` materializer (RRC shape).
+        // End-to-end through the codex `--config` materializer (Rc-Rc shape).
         let dir = std::env::temp_dir().join(format!("rayline-codex-native-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg_path = dir.join("RRC.json");
+        let cfg_path = dir.join("Rc-Rc.json");
         std::fs::write(
             &cfg_path,
             serde_json::to_vec(&json!({

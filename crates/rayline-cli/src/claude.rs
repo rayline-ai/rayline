@@ -142,8 +142,8 @@ fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
 /// account toggle + a configured local model.
 ///
 /// - `config_present`: a `--config` file is in play. When true, the config is the
-///   sole driver of may-local (a `local_models` route → the RRCL/ARCL arm), so the
-///   implicit path is suppressed — e.g. a cloud-only `RRC` (`--local-model=off`)
+///   sole driver of may-local (a `local_models` route → the Rcl-Rcl/S-Rcl arm), so the
+///   implicit path is suppressed — e.g. a cloud-only `Rc-Rc` (`--local-model=off`)
 ///   stays pure cloud even with `rayline local on` + a local model configured.
 /// - Env (`Override`) mode is cloud-only by contract (sets `ANTHROPIC_BASE_URL`
 ///   directly, can't reach local), so it never engages.
@@ -536,12 +536,12 @@ async fn run_command_from_home(
     let config_cloud_only = effective_config.is_some()
         && request.routing_mode != RoutingMode::Override
         && !config_engages_local;
-    // RRCL (may-local): a cloud-only config whose `rayline-cloud` route declares
+    // Rcl-Rcl (may-local): a cloud-only config whose `rayline-cloud` route declares
     // `local_models`. Routing stays on the hosted cloud router (RCR), but a custom
     // adapter fronts the config's local endpoint so the RCR may 307-redirect a turn
     // to it — the same shape as the account-toggle may-local, driven by config. The
     // RCR makes the redirect decision (account-gated), so without it this behaves
-    // like RRC. `N/A` under `--via env` (cloud-only override) and for local-plane
+    // like Rc-Rc. `N/A` under `--via env` (cloud-only override) and for local-plane
     // configs.
     let config_may_local = if config_cloud_only {
         effective_config
@@ -670,7 +670,7 @@ async fn run_command_from_home(
         }
         Some(start_request)
     } else if let Some(may_local) = config_may_local.clone() {
-        // RRCL: keep routing on the hosted cloud router, but stand up a custom-mode
+        // Rcl-Rcl: keep routing on the hosted cloud router, but stand up a custom-mode
         // adapter fronting the config's local endpoint and advertise it, so the RCR
         // can 307-redirect to it (may-local). Mirrors the proven account-toggle
         // may-local path (`defaults()` keeps the hosted decision plane + cloud
@@ -2806,7 +2806,7 @@ mod implicit_local_routing_tests {
     fn config_suppresses_implicit_local() {
         // With a `--config` in play, the config is the sole may-local driver — the
         // account-toggle implicit path is suppressed even with the toggle on and no
-        // isolation. (This is why `RRC --config` stays pure cloud when local is ON.)
+        // isolation. (This is why `Rc-Rc --config` stays pure cloud when local is ON.)
         assert!(!implicit_local_engages(
             RoutingMode::Proxy,
             false,

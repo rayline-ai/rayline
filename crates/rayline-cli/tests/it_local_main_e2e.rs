@@ -1,4 +1,4 @@
-//! Interactive end-to-end for the `agent = local` routing modes (`LR`/`LA`/`LL`,
+//! Interactive end-to-end for the `agent = local` routing modes (`L-Rc`/`L-Rl`/`L-K`/`L-L`,
 //! marked ‡ in examples/routing-modes/README.md).
 //!
 //! This is the harness for "drive a local **main** agent through `--config` and
@@ -32,7 +32,7 @@ fn local_main_spawns_subagent_end_to_end() {
     let rayline = env!("CARGO_BIN_EXE_rayline");
     let config = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/routing-modes/LL.json"
+        "/../../examples/routing-modes/L-L.json"
     );
     // A blunt prompt that forces an immediate `Task` call. A capable main spawns
     // an Explore subagent; today's small local mains emit fake tool-call text.
