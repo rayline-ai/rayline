@@ -285,6 +285,51 @@ Notes:
   router. Main-thread Claude Code traffic still passes through normally under
   `--route subagents`.
 
+## One Model For Everything (`routes.main` Only)
+
+`routes.subagent` is optional. A config that declares `routes.main` and no
+`routes.subagent` routes **subagents to the same target as main**, so a
+single-model setup needs one route entry:
+
+```json
+{
+  "endpoints": [
+    {
+      "id": "openrouter",
+      "protocol": "anthropic_messages",
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "auth": "bearer",
+      "models": ["moonshotai/kimi-k3"]
+    }
+  ],
+  "routes": {
+    "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" }
+  }
+}
+```
+
+```bash
+export OPENROUTER_API_KEY=<your-api-key>
+rayline codex app --config ./kimi.json     # or: rayline claude --config ./kimi.json
+```
+
+Resolution order for a subagent turn is: a matching `routes.subagents.<type>`
+entry → `routes.subagent` → `routes.main` → `routes.default`. Add
+`routes.subagent` only when subagents should differ from main (for example main
+on a frontier model, subagents on-device):
+
+```json
+"routes": {
+  "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+  "subagent": { "endpoint": "local" }
+}
+```
+
+The same applies to the hosted cloud router: the default
+`~/.config/rayline/router.json` needs only its `main` entry, and subagents follow
+whatever model the Rayline dashboard selects for that route.
+
 ## Connecting Provider Endpoints
 
 Provider endpoints go in the same static router config. Keep API keys in env vars

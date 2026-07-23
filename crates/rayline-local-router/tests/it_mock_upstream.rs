@@ -743,3 +743,79 @@ async fn config_routes_main_and_subagent_to_distinct_endpoints() {
     let _ = std::fs::remove_file(path);
     println!("PASS config drives main→main-ep, subagent→sub-ep over HTTP");
 }
+
+/// Single-model config (`routes.main` only, no `routes.subagent`): BOTH the main
+/// turn and a subagent turn must reach the one configured endpoint/model over
+/// real HTTP. Without the main-inheritance fallback, subagent turns would be
+/// redirected to the on-device adapter the config never mentions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn main_only_config_routes_subagents_to_main_over_http() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // Two sequential requests (main, then subagent) on the same upstream.
+        for _ in 0..2 {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut buf = [0u8; 16384];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(anthropic_sse("ONE-MODEL-OK").as_bytes())
+                    .await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        }
+    });
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [
+            {"id": "solo", "protocol": "anthropic_messages",
+             "base_url": format!("http://127.0.0.1:{upstream_port}"), "models": ["model-solo"]}
+        ],
+        "routes": {"main": {"endpoint": "solo", "model": "model-solo"}}
+    });
+    let path = write_config("config-main-only", &config);
+    start_router(port, path.clone()).await;
+    let client = reqwest::Client::new();
+
+    let body = json!({
+        "model": "rayline-router", "stream": true, "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let main_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .expect("main request");
+    assert_eq!(main_resp.status(), 200);
+    assert_eq!(header(&main_resp, "x-rayline-task-class"), Some("main"));
+    assert_eq!(
+        header(&main_resp, "x-rayline-selected-model"),
+        Some("model-solo")
+    );
+    assert_eq!(sse_text(&collect_sse(main_resp).await), "ONE-MODEL-OK");
+
+    let sub_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-agent-id", "abc123")
+        .header("x-rayline-claude-code-agent-type", "reviewer")
+        .json(&body)
+        .send()
+        .await
+        .expect("subagent request");
+    assert_eq!(sub_resp.status(), 200);
+    assert_eq!(header(&sub_resp, "x-rayline-task-class"), Some("subagent"));
+    assert_eq!(
+        header(&sub_resp, "x-rayline-selected-model"),
+        Some("model-solo")
+    );
+    assert_eq!(sse_text(&collect_sse(sub_resp).await), "ONE-MODEL-OK");
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS main-only config drives main AND subagents to the single endpoint");
+}

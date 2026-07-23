@@ -159,6 +159,10 @@ impl RouteTarget {
 pub struct RoutesConfig {
     #[serde(default)]
     pub main: Option<RouteTarget>,
+    /// Default route for subagent turns that no `subagents.<type>` entry
+    /// matches. Optional: a config that declares `main` and omits `subagent`
+    /// routes subagents to `main` (see `merge_config` and `select_route`), so a
+    /// single-model config needs only the `main` entry.
     #[serde(default)]
     pub subagent: Option<RouteTarget>,
     #[serde(default)]
@@ -253,7 +257,7 @@ pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
         endpoint_ids.join(","),
         subagent_keys.join(","),
         route_summary(config.routes.main.as_ref()),
-        route_summary(config.routes.subagent.as_ref())
+        subagent_summary(&config)
     );
     let state = AppState {
         opts: Arc::new(opts),
@@ -286,6 +290,17 @@ fn route_summary(route: Option<&RouteTarget>) -> String {
     route
         .map(|route| format!("{}:{}", route.endpoint, route.model))
         .unwrap_or_else(|| "<default>".to_owned())
+}
+
+/// Startup summary for the subagent default: `<inherits main>` when no
+/// `routes.subagent` is configured, since unmatched subagent turns then follow
+/// `routes.main`.
+fn subagent_summary(config: &RouterConfig) -> String {
+    match config.routes.subagent.as_ref() {
+        Some(route) => route_summary(Some(route)),
+        None if config.routes.main.is_some() => "<inherits main>".to_owned(),
+        None => "<default>".to_owned(),
+    }
 }
 
 fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
@@ -325,10 +340,20 @@ fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
         }
     }
 
+    let subagent_override = overrides.routes.subagent.is_some();
     if overrides.routes.main.is_some() {
         config.routes.main = overrides.routes.main;
+        if !subagent_override {
+            // A config that declares its own `main` but no `subagent` means
+            // "subagents follow main". Drop the built-in default's
+            // `subagent` → local-adapter route so it cannot silently hijack
+            // subagent turns onto an on-device model the config never mentions
+            // (and which may not even be running). `select_route` then falls
+            // back to `routes.main` for unmatched subagents.
+            config.routes.subagent = None;
+        }
     }
-    if overrides.routes.subagent.is_some() {
+    if subagent_override {
         config.routes.subagent = overrides.routes.subagent;
     }
     if overrides.routes.default.is_some() {
@@ -1786,12 +1811,23 @@ fn select_route(
                 route
             }
             Some((None, route)) => route,
-            None => state
-                .config
-                .routes
-                .default
-                .clone()
-                .unwrap_or_else(|| RouteTarget::local(&state.opts.local_model_id)),
+            // No subagent route at all: inherit `routes.main` so a config that
+            // only declares a main model routes subagents to that same model.
+            // `routes.default` (and finally the local adapter) stay as the
+            // last-resort fallbacks for configs whose main is absent, e.g. a
+            // subscription main stripped before the router sees it.
+            None => match state.config.routes.main.clone() {
+                Some(main) => {
+                    policy = "subagent:main".to_owned();
+                    main
+                }
+                None => state
+                    .config
+                    .routes
+                    .default
+                    .clone()
+                    .unwrap_or_else(|| RouteTarget::local(&state.opts.local_model_id)),
+            },
         }
     } else if is_virtual_marker {
         // Main turn with a virtual marker → `routes.main` (never direct-model:
@@ -5050,6 +5086,10 @@ mod tests {
                 "openrouter",
                 include_str!("../../../examples/openrouter.json"),
             ),
+            (
+                "single-model",
+                include_str!("../../../examples/single-model.json"),
+            ),
         ] {
             serde_json::from_str::<RouterConfig>(raw)
                 .unwrap_or_else(|error| panic!("{name} example did not parse: {error}"));
@@ -6941,5 +6981,226 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // SAFETY: see the note above.
         unsafe { std::env::remove_var(var) };
+    }
+
+    /// Helper: load a config file's JSON through the real `load_config` layering
+    /// (built-in defaults + file overrides), as a launched router would.
+    fn load_state_from_json(tag: &str, raw: &str) -> AppState {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-{tag}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, raw).unwrap();
+        let opts = LocalRouterOptions {
+            local_model_id: "local-model".to_owned(),
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+        let config = load_config(&opts).unwrap();
+        let _ = fs::remove_file(&path);
+        state(config)
+    }
+
+    fn subagent_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("abc123"),
+        );
+        headers.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("Explore"),
+        );
+        headers
+    }
+
+    /// A single-model config only needs `routes.main`: an omitted
+    /// `routes.subagent` inherits main rather than falling back to the built-in
+    /// default's local-adapter route (which would strand subagents on an
+    /// on-device model the config never mentions).
+    #[test]
+    fn main_only_config_routes_subagents_to_main() {
+        let st = load_state_from_json(
+            "main-only",
+            r#"{
+              "endpoints": [{
+                "id": "openrouter",
+                "protocol": "anthropic_messages",
+                "base_url": "https://openrouter.ai/api",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "auth": "bearer",
+                "models": ["moonshotai/kimi-k3"]
+              }],
+              "routes": {
+                "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" }
+              }
+            }"#,
+        );
+        assert!(
+            st.config.routes.subagent.is_none(),
+            "an explicit main with no subagent must not inherit the default local subagent route"
+        );
+
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+        let main = select_route(&st, &HeaderMap::new(), &body, ApiSurface::Anthropic);
+        let sub = select_route(&st, &subagent_headers(), &body, ApiSurface::Anthropic);
+
+        let expected = RouteSelection::Endpoint("openrouter".to_owned());
+        assert_eq!(main.target, expected);
+        assert_eq!(main.selected_model, "moonshotai/kimi-k3");
+        assert_eq!(sub.target, expected);
+        assert_eq!(sub.selected_model, "moonshotai/kimi-k3");
+        assert_eq!(sub.task_class, "subagent");
+        assert_eq!(sub.policy, "subagent:main");
+    }
+
+    /// Same contract on the Codex surface: `rayline codex --config` pins the
+    /// sentinel `--model` to `routes.main` via `model_routes` (the CLI's
+    /// `ensure_codex_config_model_routes`), and with no subagent route the
+    /// sentinel is kept on subagent turns too, so both classes reach main.
+    #[test]
+    fn main_only_config_routes_codex_subagents_to_main() {
+        let st = load_state_from_json(
+            "main-only-codex",
+            r#"{
+              "endpoints": [{
+                "id": "openrouter",
+                "protocol": "anthropic_messages",
+                "base_url": "https://openrouter.ai/api",
+                "api_key_env": "OPENROUTER_API_KEY",
+                "auth": "bearer",
+                "models": ["moonshotai/kimi-k3"]
+              }],
+              "routes": {
+                "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+                "model_routes": {
+                  "rayline-local": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+                  "rayline-codex": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" }
+                }
+              }
+            }"#,
+        );
+
+        let body = json!({"model": "rayline-codex", "messages": []});
+        let main = select_route(&st, &HeaderMap::new(), &body, ApiSurface::Codex);
+        let sub = select_route(&st, &subagent_headers(), &body, ApiSurface::Codex);
+
+        let expected = RouteSelection::Endpoint("openrouter".to_owned());
+        assert_eq!(main.target, expected);
+        assert_eq!(main.selected_model, "moonshotai/kimi-k3");
+        assert_eq!(sub.target, expected);
+        assert_eq!(sub.selected_model, "moonshotai/kimi-k3");
+        assert_eq!(sub.task_class, "subagent");
+    }
+
+    /// The default `~/.config/rayline/router.json` shape (hosted cloud router,
+    /// no `subagent` entry): subagent turns must reach the cloud router — the
+    /// model picked in the Rayline dashboard — not the local adapter.
+    #[test]
+    fn cloud_router_config_without_subagent_stays_on_cloud() {
+        let st = load_state_from_json(
+            "rrc-no-subagent",
+            r#"{
+              "endpoints": [{
+                "id": "rayline-cloud",
+                "protocol": "anthropic_messages",
+                "base_url": "https://api.rayline.ai",
+                "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                "models": ["rayline-router"]
+              }],
+              "routes": {
+                "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                "default": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                "subagents": {}
+              }
+            }"#,
+        );
+
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+        let sub = select_route(&st, &subagent_headers(), &body, ApiSurface::Anthropic);
+
+        assert_eq!(
+            sub.target,
+            RouteSelection::Endpoint("rayline-cloud".to_owned())
+        );
+        assert_eq!(sub.selected_model, "rayline-router");
+        assert_eq!(sub.task_class, "subagent");
+    }
+
+    /// An explicit `routes.subagent` still wins over main — a main≠subagent
+    /// split stays expressible.
+    #[test]
+    fn explicit_subagent_route_still_overrides_main() {
+        let st = load_state_from_json(
+            "split",
+            r#"{
+              "endpoints": [
+                {"id": "openrouter", "protocol": "anthropic_messages",
+                 "base_url": "https://openrouter.ai/api", "api_key_env": "OPENROUTER_API_KEY",
+                 "auth": "bearer", "models": ["moonshotai/kimi-k3", "z-ai/glm-5.2"]}
+              ],
+              "routes": {
+                "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+                "subagent": { "endpoint": "openrouter", "model": "z-ai/glm-5.2" }
+              }
+            }"#,
+        );
+
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+        let main = select_route(&st, &HeaderMap::new(), &body, ApiSurface::Anthropic);
+        let sub = select_route(&st, &subagent_headers(), &body, ApiSurface::Anthropic);
+
+        assert_eq!(main.selected_model, "moonshotai/kimi-k3");
+        assert_eq!(sub.selected_model, "z-ai/glm-5.2");
+    }
+
+    /// A per-type `routes.subagents` map alongside a main: matched types use
+    /// their own route, unmatched subagents inherit main.
+    #[test]
+    fn per_type_subagents_keep_their_route_unmatched_inherit_main() {
+        let st = load_state_from_json(
+            "per-type",
+            r#"{
+              "endpoints": [
+                {"id": "openrouter", "protocol": "anthropic_messages",
+                 "base_url": "https://openrouter.ai/api", "api_key_env": "OPENROUTER_API_KEY",
+                 "auth": "bearer", "models": ["moonshotai/kimi-k3"]},
+                {"id": "ollama", "protocol": "openai_chat",
+                 "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen3.5:9b"]}
+              ],
+              "routes": {
+                "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k3" },
+                "subagents": { "Explore": { "endpoint": "ollama", "model": "qwen3.5:9b" } }
+              }
+            }"#,
+        );
+
+        let body = json!({"model": DEFAULT_VIRTUAL_MODEL, "messages": []});
+        let explore = select_route(&st, &subagent_headers(), &body, ApiSurface::Anthropic);
+        let mut other = HeaderMap::new();
+        other.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("abc123"),
+        );
+        other.insert(
+            RAYLINE_AGENT_TYPE_HEADER,
+            HeaderValue::from_static("reviewer"),
+        );
+        let reviewer = select_route(&st, &other, &body, ApiSurface::Anthropic);
+
+        assert_eq!(
+            explore.target,
+            RouteSelection::Endpoint("ollama".to_owned())
+        );
+        assert_eq!(explore.selected_model, "qwen3.5:9b");
+        assert_eq!(
+            reviewer.target,
+            RouteSelection::Endpoint("openrouter".to_owned())
+        );
+        assert_eq!(reviewer.selected_model, "moonshotai/kimi-k3");
     }
 }

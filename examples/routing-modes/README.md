@@ -22,6 +22,11 @@ any of these entry points (each is a column in the [Modes](#modes) table):
 (`routes.subagent`) from one file — the thing the old `--router-config-path` /
 `settings.json` surfaces could not express (they are subagent-only).
 
+`routes.subagent` is **optional**: with only `routes.main`, subagents inherit the
+main route, so a one-model config needs a single entry (see
+[`examples/single-model.json`](../single-model.json)). The split modes below spell
+both out precisely because main and subagents differ.
+
 > **Scope.** The modes that ship a config file route end-to-end today — the
 > per-entry-point **Claude / Codex / Router** columns below say where each works
 > (see [What the columns mean](#what-the-columns-mean)) — including `RRCL`/`ARCL`

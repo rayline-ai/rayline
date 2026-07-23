@@ -1053,6 +1053,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// `rayline codex --config <file>` where the file declares only `routes.main`
+    /// (a single-model setup): the sentinel `--model` pins to that main and NO
+    /// `subagent` route is invented. The local router then inherits main for
+    /// subagent turns, so one route entry drives the whole session.
+    #[test]
+    fn materialize_codex_config_leaves_main_only_config_without_subagent() {
+        let home = tmp_home();
+        let path = home.join("codex-main-only.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "endpoints": [{
+                    "id": "openrouter",
+                    "protocol": "anthropic_messages",
+                    "base_url": "https://openrouter.ai/api",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                    "auth": "bearer",
+                    "models": ["moonshotai/kimi-k3"]
+                }],
+                "routes": {
+                    "main": {"endpoint": "openrouter", "model": "moonshotai/kimi-k3"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(cfg["routes"]["main"]["endpoint"], "openrouter");
+        assert!(
+            cfg["routes"].get("subagent").is_none(),
+            "no subagent route should be invented; the router inherits main"
+        );
+        for model in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][model]["endpoint"], "openrouter",
+                "sentinel {model} should pin to the configured main endpoint"
+            );
+            assert_eq!(
+                cfg["routes"]["model_routes"][model]["model"],
+                "moonshotai/kimi-k3"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn materialize_codex_config_skips_subscription_passthrough_main() {
         // A passthrough (subscription) main has no concrete endpoint here, so no
