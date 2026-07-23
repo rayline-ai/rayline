@@ -23,9 +23,10 @@ any of these entry points (each is a column in the [Modes](#modes) table):
 `settings.json` surfaces could not express (they are subagent-only).
 
 `routes.subagent` is **optional**: with only `routes.main`, subagents inherit the
-main route, so a one-model config needs a single entry (see
-[`K-K.json`](./K-K.json), the single-endpoint mode). The split modes below spell
-both out precisely because main and subagents differ.
+main route, so a one-model config needs a single entry — this ships as
+[`K.json`](./K.json). The split modes below spell both out precisely because main
+and subagents differ — including [`K-K.json`](./K-K.json), the two-model form of
+`K.json` (one keyed endpoint, main `kimi-k2.6`, subagents `glm-4.6`).
 
 > **Scope.** The modes that ship a config file route end-to-end today — the
 > per-entry-point **Claude / Codex / Router** columns below say where each works
@@ -135,7 +136,7 @@ by the local model (see ¹/⁴) · ❌ = not supported. See
 | **S-Rcl** § | `subscription` | `rayline` | rayline-cloud | on | subscription (Claude / ChatGPT) | cloud model (RCR may send a subagent → local) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`S-Rcl.json`](./S-Rcl.json) |
 | **S-Rl** | `subscription` | `rayline` | rayline-local | N/A | subscription (Claude / ChatGPT) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`S-Rl.json`](./S-Rl.json) |
 | **S-L** | `subscription` | `local` | N/A | N/A | subscription (Claude / ChatGPT) | local model | subscription | ✅ | ✅ ⁵ | ✅ | [`S-L.json`](./S-L.json) |
-| **K-K** ⁶ | `keyed` | `keyed` | N/A | N/A | keyed provider (API key) | inherits main (keyed) | provider API key | ✅ | ✅ ⁶ | ✅ | [`K-K.json`](./K-K.json) |
+| **K-K** ⁶ | `keyed` | `keyed` | N/A | N/A | keyed provider (API key) | keyed provider (API key, distinct model) | provider API key | ✅ | ✅ ⁶ | ✅ | [`K-K.json`](./K-K.json) |
 | **L-Rc** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | 🟡 | 🟡 ⁴ | 🟡 | [`L-Rc.json`](./L-Rc.json) |
 | **L-Rcl** ³ | `local` | `rayline` | rayline-cloud | on | local model | cloud model (RCR may send a subagent → local) | rayline | ❌ | ❌ | ❌ | — (may-local) |
 | **L-Rl** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | 🟡 | 🟡 ⁴ | 🟡 | [`L-Rl.json`](./L-Rl.json) |
@@ -270,14 +271,18 @@ returned. Run it exactly as written — the default model routes correctly (the
 per-config subscription materialization injects the `rayline-local`/`rayline-codex`
 → subscription model routes).
 
-**⁶ K-K — single keyed endpoint (subagents inherit main).** `K-K` declares one
-**keyed** provider endpoint (the shipped config uses OpenRouter + `moonshotai/kimi-k2.6`,
-`OPENROUTER_API_KEY`) and only `routes.main`; with no `routes.subagent`, **subagents
-inherit the main route**, so both legs land on the same endpoint + model. It is the
-minimal one-model config — swap the endpoint/`models` for any OpenAI-compatible or
-Anthropic-API-key provider. On **Codex**, a keyed `anthropic_messages` main is served
-via the standard down-translation path (Responses → Anthropic Messages → provider),
-not the RCR-native Responses path reserved for the hosted router (⁴).
+**⁶ K-K — one keyed endpoint, two models (main ≠ subagent).** `K-K` declares one
+**keyed** provider endpoint (the shipped config uses OpenRouter,
+`OPENROUTER_API_KEY`) whose `models` lists two entries, then splits them across
+legs: `routes.main` → `moonshotai/kimi-k2.6`, `routes.subagent` → `z-ai/glm-4.6`.
+Both legs are the same keyed provider and auth; only the model differs — the
+pure-keyed analogue of a frontier-main / cheaper-subagent split. Drop
+`routes.subagent` (and the second model) and subagents fall back to **inheriting
+the main route** — the minimal one-model form. Swap the endpoint/`models` for any
+OpenAI-compatible or Anthropic-API-key provider. On **Codex**, a keyed
+`anthropic_messages` main is served via the standard down-translation path
+(Responses → Anthropic Messages → provider), not the RCR-native Responses path
+reserved for the hosted router (⁴).
 
 ### What the columns mean
 
@@ -322,7 +327,8 @@ local-main capability limit). Per-cell status:
 
 ## Files ↔ modes
 
-The supported modes ship as **19 config files** (the `❌` modes have none yet):
+The supported modes ship as **19 config files** (the `❌` modes have none yet),
+plus one non-mode minimal config ([`K.json`](./K.json), below the table):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
@@ -337,7 +343,7 @@ The supported modes ship as **19 config files** (the `❌` modes have none yet):
 | [`S-Rcl.json`](./S-Rcl.json) | subscription (passthrough) | rayline-cloud (+ `local_models`) | S-Rcl § |
 | [`S-Rl.json`](./S-Rl.json) | subscription (passthrough) | rayline-cloud, `router: rayline-local` (model pinned) | S-Rl |
 | [`S-L.json`](./S-L.json) | subscription (passthrough) | ollama (local) | S-L |
-| [`K-K.json`](./K-K.json) | openrouter (keyed, kimi-k2.6) | inherits main (no `routes.subagent`) | K-K ⁶ |
+| [`K-K.json`](./K-K.json) | openrouter (keyed, kimi-k2.6) | openrouter (keyed, glm-4.6) | K-K ⁶ |
 | [`L-Rc.json`](./L-Rc.json) | ollama (local) | rayline-cloud | L-Rc |
 | [`L-Rl.json`](./L-Rl.json) | ollama (local) | rayline-cloud, `router: rayline-local` (model pinned) | L-Rl |
 | [`L-K.json`](./L-K.json) | ollama (local) | anthropic (API key) | L-K |
@@ -345,6 +351,16 @@ The supported modes ship as **19 config files** (the `❌` modes have none yet):
 | [`Rc-L-per-type.json`](./Rc-L-per-type.json) | rayline-cloud | per-type: `Explore`/`Plan` → ollama, default → rayline-cloud | Rc-L\* |
 | [`S-L-per-type.json`](./S-L-per-type.json) | subscription (passthrough) | per-type: `Explore` → ollama, all other subagents → subscription (passthrough) | S-L\* |
 | [`S-Rc-per-type.json`](./S-Rc-per-type.json) | subscription (passthrough) | per-type: `Explore` → rayline-cloud (RCR), all other subagents → subscription (passthrough) | S-Rc\* |
+
+Plus a minimal single-model config that is **not** a distinct mode:
+
+| File | `routes.main` → | `routes.subagent` → | Mode |
+|---|---|---|---|
+| [`K.json`](./K.json) | openrouter (keyed, kimi-k2.6) | *(none — subagents inherit main)* | K-K (one-model form) |
+
+`K.json` is the degenerate one-model form of `K-K`: a single keyed endpoint with
+only `routes.main`, so subagents inherit it. It shares `K-K`'s class (keyed/keyed)
+— add a `routes.subagent` on a second model and you have `K-K`.
 
 The proxy **scope** is derived from `routes.main`:
 

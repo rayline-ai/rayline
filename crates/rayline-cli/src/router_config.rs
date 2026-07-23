@@ -825,10 +825,14 @@ mod tests {
             ("L-Rc.json", false, true, true),
             ("L-L.json", false, true, false),
             ("L-K.json", false, true, false),
-            // K-K: a single keyed endpoint (openrouter) with only `routes.main` →
+            // K-K: one keyed endpoint (openrouter) serving two models (main + subagent) →
             // main is routed (not passthrough); the on-device router forwards to the
             // non-cloud endpoint; no hosted cloud-router key.
             ("K-K.json", false, true, false),
+            // K: the minimal single-model form of K-K — one keyed endpoint, `routes.main`
+            // only (subagents inherit). Same derivation: routed main, non-cloud endpoint,
+            // no cloud key.
+            ("K.json", false, true, false),
         ];
         for (file, passthrough, needs_local, uses_cloud) in cases {
             let path = examples_dir().join(file);

@@ -13,3 +13,6 @@ __pycache__/
 
 # Local design notes / superpowers specs — kept on disk, never committed
 /docs/superpowers/
+
+# local wrangler upload artifacts
+.wrangler/

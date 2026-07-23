@@ -5305,8 +5305,12 @@ mod tests {
                 include_str!("../../../examples/openrouter.json"),
             ),
             (
-                "K-K (single-model)",
+                "K-K (two keyed models)",
                 include_str!("../../../examples/routing-modes/K-K.json"),
+            ),
+            (
+                "K (single-model, inherit)",
+                include_str!("../../../examples/routing-modes/K.json"),
             ),
         ] {
             serde_json::from_str::<RouterConfig>(raw)
@@ -5424,12 +5428,29 @@ mod tests {
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
-        // K-K: a single keyed endpoint with only `routes.main` — subagents inherit the
-        // main route, so both legs resolve to the same endpoint + model.
+        // K-K: one keyed endpoint (openrouter) serving two models — main pinned to
+        // kimi-k2.6, subagents to a distinct keyed model (glm-4.6) via `routes.subagent`.
         let st = load_state(include_str!("../../../examples/routing-modes/K-K.json"));
-        let kimi = || (ep("openrouter"), "moonshotai/kimi-k2.6".to_owned());
-        assert_eq!(main_route(&st), kimi());
-        assert_eq!(sub_route(&st, "reviewer"), kimi());
+        assert_eq!(
+            main_route(&st),
+            (ep("openrouter"), "moonshotai/kimi-k2.6".to_owned())
+        );
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("openrouter"), "z-ai/glm-4.6".to_owned())
+        );
+
+        // K: single keyed endpoint, `routes.main` only — subagents inherit main, so
+        // both legs resolve to the same endpoint + model (the minimal form of K-K).
+        let st = load_state(include_str!("../../../examples/routing-modes/K.json"));
+        assert_eq!(
+            main_route(&st),
+            (ep("openrouter"), "moonshotai/kimi-k2.6".to_owned())
+        );
+        assert_eq!(
+            sub_route(&st, "reviewer"),
+            (ep("openrouter"), "moonshotai/kimi-k2.6".to_owned())
+        );
 
         // subscription main (stripped) → assert subagents only:
         let st = load_state(include_str!("../../../examples/routing-modes/S-Rc.json"));
