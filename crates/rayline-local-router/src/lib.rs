@@ -2979,6 +2979,39 @@ fn add_decision_headers(headers: &mut HeaderMap, decision: &RouteDecision) {
     headers.insert("x-rayline-route-id", route_id);
 }
 
+/// Stand-in for a turn whose client payload carried no usable content at all.
+/// Upstreams require at least one message and reject empty text, so an empty
+/// conversation needs *some* token rather than a block the provider refuses.
+const EMPTY_TURN_PLACEHOLDER: &str = "(no content)";
+
+/// Strip text blocks the upstream would reject.
+///
+/// Providers behind the Anthropic surface fail the whole request with
+/// "Invalid request: text content is empty" when a text block — or a message's
+/// entire content list — is empty. Codex replays exactly that: an assistant turn
+/// that was only a tool call, a cancelled stream, or content types this router
+/// does not translate all leave a message with nothing in it. Drop empty text
+/// blocks, then drop messages left with no content; `tool_use`/`tool_result`
+/// blocks are never text, so pairings survive.
+fn prune_empty_anthropic_content(messages: &mut Vec<Value>) {
+    for message in messages.iter_mut() {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            content.retain(|block| {
+                block.get("type").and_then(Value::as_str) != Some("text")
+                    || block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            });
+        }
+    }
+    messages.retain(|message| match message.get("content") {
+        Some(Value::Array(content)) => !content.is_empty(),
+        Some(Value::String(text)) => !text.is_empty(),
+        _ => true,
+    });
+}
+
 fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolNameRewrites) {
     let rewrites = ToolNameRewrites::from_responses_body(body);
     let mut messages = Vec::new();
@@ -3000,8 +3033,11 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
             messages.push(json!({"role": "user", "content": [{"type": "text", "text": text}]}));
         }
     }
+    prune_empty_anthropic_content(&mut messages);
     if messages.is_empty() {
-        messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+        messages.push(
+            json!({"role": "user", "content": [{"type": "text", "text": EMPTY_TURN_PLACEHOLDER}]}),
+        );
     }
 
     let mut out = Map::new();
@@ -5569,6 +5605,71 @@ mod tests {
         assert_eq!(converted["system"], "Follow repo rules.");
         assert_eq!(converted["messages"][0]["content"][0]["text"], "hello");
         assert_eq!(converted["tools"][0]["name"], "exec_command");
+    }
+
+    #[test]
+    fn empty_text_blocks_never_reach_the_upstream() {
+        // Codex replays assistant turns that carried no text (tool-call-only
+        // turns, cancelled streams). Providers reject those outright with
+        // "Invalid request: text content is empty", failing the whole turn.
+        let request = json!({
+            "model": "rayline-codex",
+            "tools": [{"type": "function", "name": "shell",
+                       "parameters": {"type": "object", "properties": {}}}],
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "weather?"}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": ""}
+                ]},
+                {"type": "message", "role": "assistant", "content": []},
+                {"type": "function_call", "call_id": "call_1", "name": "shell",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": ""}
+            ]
+        });
+
+        let (converted, _rewrites) = responses_to_anthropic_request(&request, "claude-test");
+
+        let messages = converted["messages"].as_array().unwrap();
+        for message in messages {
+            let content = message["content"].as_array().unwrap();
+            assert!(!content.is_empty(), "empty content list: {message}");
+            for block in content {
+                if block["type"] == "text" {
+                    assert!(
+                        !block["text"].as_str().unwrap().is_empty(),
+                        "empty text block: {message}"
+                    );
+                }
+            }
+        }
+        // The tool call and its result survive the pruning.
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"][0]["type"] == "tool_use"),
+            "tool_use was pruned: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["content"][0]["type"] == "tool_result"),
+            "tool_result was pruned: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn contentless_request_still_sends_one_non_empty_message() {
+        let (converted, _rewrites) =
+            responses_to_anthropic_request(&json!({"model": "rayline-codex"}), "claude-test");
+
+        assert_eq!(converted["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            converted["messages"][0]["content"][0]["text"],
+            "(no content)"
+        );
     }
 
     #[test]

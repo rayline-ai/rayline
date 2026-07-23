@@ -607,9 +607,14 @@ WARN rayline_local_router: upstream returned HTTP 400 (task=main selected=…)
 ```
 
 The response body is passed through to the client untouched — read it there for
-the provider's own message. Tool names are not a cause: names Codex namespaces
-with characters providers reject (`server.tool`, `server/tool`) are rewritten to
-the provider-safe charset on the way upstream and restored on the way back.
+the provider's own message. Two payload shapes providers commonly reject are
+already handled on the Codex path, so they are not the cause:
+
+- Tool names namespaced with characters outside `[A-Za-z][A-Za-z0-9_-]*`
+  (`server.tool`, `server/tool`) are rewritten on the way upstream and restored
+  on the way back.
+- Empty text blocks (a replayed assistant turn that was only a tool call, a
+  cancelled stream) are pruned before the request is sent.
 
 To validate the full end-to-end Claude Code path through Rayline Local, see
 [Acceptance testing](acceptance-testing.md).
