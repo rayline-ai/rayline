@@ -21,6 +21,7 @@ pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
 /// shared `rayline_metrics::DEFAULT_METRICS_PORT` (20813) so an isolated and a
 /// non-isolated cloud-only session can both expose metrics at once.
 const DEFAULT_ISOLATED_METRICS_PORT: u16 = 20814;
+const DEFAULT_SUBSCRIPTION_METRICS_PORT: u16 = 20816;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_TIMEOUT_SECONDS: u64 = 240;
 const HEALTH_TIMEOUT_DOWNLOAD_SECONDS: u64 = 3600;
@@ -95,6 +96,8 @@ pub struct RouterStartRequest {
     /// `RAYLINE_ROUTER_API_KEY` (e.g. the `rayline auth login` key for a hosted
     /// cloud-router endpoint). When `None`, the normal resolution applies.
     pub router_api_key_override: Option<String>,
+    pub subscription_config_path: Option<PathBuf>,
+    pub subscription_pool: Option<String>,
     pub root_env_explicit: bool,
 }
 
@@ -111,6 +114,8 @@ pub struct LocalProxyStartRequest {
     pub diagnose: bool,
     pub upstream_ca_path: Option<PathBuf>,
     pub isolated: bool,
+    pub subscription_config_path: Option<PathBuf>,
+    pub subscription_pool: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +202,8 @@ impl RouterStartRequest {
             proxy_routing_mode: PROXY_ROUTING_MODE_ALL.to_owned(),
             no_local_model: false,
             router_api_key_override: None,
+            subscription_config_path: None,
+            subscription_pool: None,
             root_env_explicit,
         }
     }
@@ -314,7 +321,13 @@ async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Re
     let serve_meta = read_meta(&RouterPaths::new(home).meta_file);
     let proxy_meta = read_meta(&RouterPaths::new(home).proxy_meta_file);
     let isolated_proxy_meta = read_meta(&RouterPaths::new_isolated(home).proxy_meta_file);
-    let candidates = metrics_port_candidates(&serve_meta, &proxy_meta, &isolated_proxy_meta);
+    let subscription_proxy_meta = read_meta(&RouterPaths::new_subscription(home).proxy_meta_file);
+    let candidates = metrics_port_candidates(
+        &serve_meta,
+        &proxy_meta,
+        &isolated_proxy_meta,
+        &subscription_proxy_meta,
+    );
     let client = reqwest::Client::builder()
         .timeout(HEALTH_TIMEOUT)
         .build()
@@ -1490,8 +1503,8 @@ pub fn local_router_log_path(home: &Path) -> PathBuf {
 /// Filesystem path of the proxy log, for `--diagnose`. `isolated` selects the
 /// `--isolated` proxy's state dir (the `cc/` subdir) so diagnostics point users
 /// at the right log for isolated failures.
-pub fn proxy_log_path(home: &Path, isolated: bool) -> PathBuf {
-    RouterPaths::for_isolation(home, isolated).proxy_log_file
+pub fn proxy_log_path(home: &Path, isolated: bool, subscription_pool: bool) -> PathBuf {
+    RouterPaths::for_proxy(home, isolated, subscription_pool).proxy_log_file
 }
 
 pub async fn start(request: &RouterStartRequest) -> io::Result<String> {
@@ -1827,6 +1840,8 @@ pub async fn start_proxy_from_home(
     // (`routes.subagents`), so a config can route specific subagent types to the
     // hosted router and pass the rest through. `None` keeps today's behavior.
     router_config_path: Option<&Path>,
+    subscription_config_path: Option<&Path>,
+    subscription_pool: Option<&str>,
 ) -> io::Result<String> {
     if router_api_key.is_empty() {
         return Err(io::Error::other(
@@ -1851,6 +1866,8 @@ pub async fn start_proxy_from_home(
         isolated,
         router_config_path,
         None,
+        subscription_config_path,
+        subscription_pool,
         &client,
     )
     .await
@@ -1883,6 +1900,8 @@ pub async fn start_local_proxy_from_home(
         request.isolated,
         request.router_config_path.as_deref(),
         Some(&local),
+        request.subscription_config_path.as_deref(),
+        request.subscription_pool.as_deref(),
         &client,
     )
     .await
@@ -1952,13 +1971,18 @@ pub async fn stop_from_home(home: &Path) -> io::Result<String> {
     let mut output = String::new();
     stop_router(&paths, &client, &mut output).await?;
     stop_proxy(&paths, &client, &mut output, false).await?;
-    // Also clean up the `--isolated` proxy so it does not orphan on its own port
-    // in the `cc/` state dir. Only act (and print) when one is actually present,
-    // so the common no-isolated case keeps its existing output.
+    // Also clean up separately-scoped proxies so they do not orphan on their own
+    // ports. Only act (and print) when one is actually present, so the common
+    // shared-proxy case keeps its existing output.
     let isolated = RouterPaths::new_isolated(home);
     if read_pid(&isolated.proxy_pid_file).is_some() {
         output.push_str("--isolated:\n");
         stop_proxy(&isolated, &client, &mut output, false).await?;
+    }
+    let subscription = RouterPaths::new_subscription(home);
+    if read_pid(&subscription.proxy_pid_file).is_some() {
+        output.push_str("--subscription-pool:\n");
+        stop_proxy(&subscription, &client, &mut output, false).await?;
     }
     Ok(output)
 }
@@ -2110,10 +2134,13 @@ async fn start_proxy_from_home_with_client(
     isolated: bool,
     router_config_path: Option<&Path>,
     local_config: Option<&ProxyLocalConfig>,
+    subscription_config_path: Option<&Path>,
+    subscription_pool: Option<&str>,
     client: &reqwest::Client,
 ) -> io::Result<String> {
-    let paths = RouterPaths::for_isolation(home, isolated);
-    std::fs::create_dir_all(paths.data_dir())?;
+    let subscription_instance = subscription_config_path.is_some();
+    let paths = RouterPaths::for_proxy(home, isolated, subscription_instance);
+    create_proxy_state_dir(&paths, subscription_instance)?;
     let mut output = String::new();
     if force_restart {
         stop_proxy(&paths, client, &mut output, true).await?;
@@ -2122,7 +2149,7 @@ async fn start_proxy_from_home_with_client(
     let metrics_url = serve_metrics_forward_url(home, client).await;
     let self_hosted_metrics_port = metrics_url
         .is_none()
-        .then(|| resolve_metrics_port(isolated));
+        .then(|| resolve_metrics_port(isolated, subscription_instance));
     let requested_meta = proxy_meta(
         home,
         router_url,
@@ -2135,6 +2162,8 @@ async fn start_proxy_from_home_with_client(
         local_config,
         metrics_url.as_deref(),
         self_hosted_metrics_port,
+        subscription_config_path,
+        subscription_pool,
     );
     // ---------- locked window: read-pid → decide → spawn → atomic meta write ----------
     // Hold the proxy-specific advisory lock across the check-then-spawn sequence
@@ -2209,7 +2238,7 @@ async fn start_proxy_from_home_with_client(
         if let Some(health) = healthz(client, proxy_port).await {
             if !proxy_health_matches_meta(&health, &requested_meta) {
                 return Err(io::Error::other(format!(
-                    "proxy :{proxy_port} is already responding, but it does not match the requested {} proxy config. Stop the process using that port or set RAYLINE_PROXY_PORT/RAYLINE_ISOLATED_PROXY_PORT to a free port.",
+                    "proxy :{proxy_port} is already responding, but it does not match the requested {} proxy config. Stop the process using that port or set RAYLINE_PROXY_PORT/RAYLINE_ISOLATED_PROXY_PORT/RAYLINE_SUBSCRIPTION_PROXY_PORT to a free port.",
                     daemon_name()
                 )));
             }
@@ -2228,6 +2257,8 @@ async fn start_proxy_from_home_with_client(
             router_config_path,
             local_config,
             metrics_url.as_deref(),
+            subscription_config_path,
+            subscription_pool,
         )?
         // _lock dropped here → advisory lock released before long readiness wait
     };
@@ -2338,6 +2369,12 @@ fn spawn_router(
             "--proxy-routing-mode",
             &request.proxy_routing_mode,
         ]);
+        if let Some(path) = request.subscription_config_path.as_deref() {
+            command.arg("--subscription-config").arg(path);
+        }
+        if let Some(pool) = request.subscription_pool.as_deref() {
+            command.args(["--subscription-pool", pool]);
+        }
         set_proxy_child_env(
             &mut command,
             router_api_key.unwrap_or_default(),
@@ -2420,10 +2457,13 @@ fn spawn_proxy(
     router_config_path: Option<&Path>,
     local_config: Option<&ProxyLocalConfig>,
     metrics_url: Option<&str>,
+    subscription_config_path: Option<&Path>,
+    subscription_pool: Option<&str>,
 ) -> io::Result<StartedProxy> {
-    let paths = RouterPaths::for_isolation(home, isolated);
-    std::fs::create_dir_all(paths.data_dir())?;
-    let metrics_port = resolve_metrics_port(isolated);
+    let subscription_instance = subscription_config_path.is_some();
+    let paths = RouterPaths::for_proxy(home, isolated, subscription_instance);
+    create_proxy_state_dir(&paths, subscription_instance)?;
+    let metrics_port = resolve_metrics_port(isolated, subscription_instance);
     let self_hosted_metrics_port = metrics_url.is_none().then_some(metrics_port);
     let requested_meta = proxy_meta(
         home,
@@ -2437,6 +2477,8 @@ fn spawn_proxy(
         local_config,
         metrics_url,
         self_hosted_metrics_port,
+        subscription_config_path,
+        subscription_pool,
     );
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -2473,6 +2515,14 @@ fn spawn_proxy(
         command
             .arg("--router-config-path")
             .arg(router_config_path.as_os_str());
+    }
+    if let Some(subscription_config_path) = subscription_config_path {
+        command
+            .arg("--subscription-config")
+            .arg(subscription_config_path.as_os_str());
+    }
+    if let Some(subscription_pool) = subscription_pool {
+        command.args(["--subscription-pool", subscription_pool]);
     }
     if let Some(local_config) = local_config {
         let adapter_port = local_config.adapter_port.to_string();
@@ -2717,6 +2767,23 @@ fn router_meta(
             proxy_ca_key_path(home).display().to_string(),
         );
         meta.insert("upstream_ca_path".to_owned(), String::new());
+        meta.insert(
+            "subscription_config_path".to_owned(),
+            request
+                .subscription_config_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+        meta.insert(
+            "subscription_pool".to_owned(),
+            request.subscription_pool.clone().unwrap_or_default(),
+        );
+        if let Some(fingerprint) =
+            router_config_fingerprint(request.subscription_config_path.as_deref())
+        {
+            meta.insert("subscription_config_sha256".to_owned(), fingerprint);
+        }
     }
     meta
 }
@@ -2793,6 +2860,8 @@ fn proxy_meta(
     local_config: Option<&ProxyLocalConfig>,
     metrics_url: Option<&str>,
     self_hosted_metrics_port: Option<u16>,
+    subscription_config_path: Option<&Path>,
+    subscription_pool: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut meta = BTreeMap::new();
     meta.insert("router_url".to_owned(), router_url.to_owned());
@@ -2852,6 +2921,19 @@ fn proxy_meta(
     if let Some(fingerprint) = router_config_fingerprint(router_config_path) {
         meta.insert("router_config_sha256".to_owned(), fingerprint);
     }
+    meta.insert(
+        "subscription_config_path".to_owned(),
+        subscription_config_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    );
+    meta.insert(
+        "subscription_pool".to_owned(),
+        subscription_pool.unwrap_or_default().to_owned(),
+    );
+    if let Some(fingerprint) = router_config_fingerprint(subscription_config_path) {
+        meta.insert("subscription_config_sha256".to_owned(), fingerprint);
+    }
     if let Some(bin_path) = bin_path {
         meta.insert("bin_path".to_owned(), bin_path.display().to_string());
     }
@@ -2902,6 +2984,9 @@ fn format_meta(meta: &BTreeMap<String, String>) -> String {
         "local_router_port",
         "router_config_path",
         "router_config_sha256",
+        "subscription_config_path",
+        "subscription_config_sha256",
+        "subscription_pool",
         "local_model_id",
         "local_adapter_port",
         "local_custom",
@@ -3245,12 +3330,20 @@ mod tests {
         unsafe {
             std::env::remove_var("RAYLINE_METRICS_PORT");
             std::env::remove_var("RAYLINE_ISOLATED_METRICS_PORT");
+            std::env::remove_var("RAYLINE_SUBSCRIPTION_METRICS_PORT");
         }
         assert_eq!(
-            resolve_metrics_port(false),
+            resolve_metrics_port(false, false),
             rayline_metrics::DEFAULT_METRICS_PORT
         );
-        assert_eq!(resolve_metrics_port(true), DEFAULT_ISOLATED_METRICS_PORT);
+        assert_eq!(
+            resolve_metrics_port(true, false),
+            DEFAULT_ISOLATED_METRICS_PORT
+        );
+        assert_eq!(
+            resolve_metrics_port(false, true),
+            DEFAULT_SUBSCRIPTION_METRICS_PORT
+        );
         assert_ne!(
             DEFAULT_ISOLATED_METRICS_PORT,
             rayline_metrics::DEFAULT_METRICS_PORT
@@ -3273,6 +3366,8 @@ mod tests {
             None,
             None,
             Some(20814),
+            None,
+            None,
         );
         assert_eq!(
             self_hosted.get("metrics_port").map(String::as_str),
@@ -3291,8 +3386,62 @@ mod tests {
             None,
             Some("http://127.0.0.1:20813"),
             None,
+            None,
+            None,
         );
         assert_eq!(forwarding.get("metrics_port"), None);
+    }
+
+    #[test]
+    fn proxy_meta_fingerprints_subscription_registry_and_pool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("subscriptions.json");
+        fs::write(&config_path, b"{\"schema\":1}").expect("write");
+        let first = proxy_meta(
+            temp.path(),
+            "https://r",
+            "key",
+            20810,
+            "selective-subagents",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config_path),
+            Some("team"),
+        );
+        assert_eq!(
+            first.get("subscription_pool").map(String::as_str),
+            Some("team")
+        );
+        assert!(first.contains_key("subscription_config_sha256"));
+        let persisted = format_meta(&first);
+        assert!(persisted.contains("subscription_config_path="));
+        assert!(persisted.contains("subscription_config_sha256="));
+        assert!(persisted.contains("subscription_pool=team"));
+
+        fs::write(&config_path, b"{\"schema\":1,\"changed\":true}").expect("rewrite");
+        let second = proxy_meta(
+            temp.path(),
+            "https://r",
+            "key",
+            20810,
+            "selective-subagents",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&config_path),
+            Some("team"),
+        );
+        assert_ne!(
+            first.get("subscription_config_sha256"),
+            second.get("subscription_config_sha256")
+        );
     }
 
     fn meta_with_metrics_port(port: u16) -> BTreeMap<String, String> {
@@ -3302,16 +3451,58 @@ mod tests {
     }
 
     #[test]
-    fn metrics_port_candidates_order_serve_then_proxy_then_isolated_then_default() {
+    fn subscription_proxy_uses_distinct_state_files() {
+        let home = Path::new("/tmp/rayline-test-home");
+        let shared = RouterPaths::new(home);
+        let isolated = RouterPaths::new_isolated(home);
+        let subscription = RouterPaths::new_subscription(home);
+
+        assert_ne!(subscription.proxy_pid_file, shared.proxy_pid_file);
+        assert_ne!(subscription.proxy_pid_file, isolated.proxy_pid_file);
+        assert_eq!(
+            subscription.proxy_pid_file,
+            home.join(crate::ROUTER_STATE_DIR)
+                .join("subscriptions")
+                .join(format!("{}-proxy.pid", crate::ROUTER_FILE_PREFIX))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscription_proxy_state_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = unique_test_dir("subscription-state-mode");
+        let paths = RouterPaths::new_subscription(&home);
+        create_proxy_state_dir(&paths, true).expect("create subscription state");
+
+        let mode = fs::metadata(paths.data_dir())
+            .expect("subscription state metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn metrics_port_candidates_order_all_instances_then_default() {
         let serve = meta_with_metrics_port(20900);
         let proxy = meta_with_metrics_port(20901);
         let isolated = meta_with_metrics_port(20902);
+        let subscription = meta_with_metrics_port(20903);
 
-        let ports = metrics_port_candidates(&serve, &proxy, &isolated);
+        let ports = metrics_port_candidates(&serve, &proxy, &isolated, &subscription);
 
         assert_eq!(
             ports,
-            vec![20900, 20901, 20902, rayline_metrics::DEFAULT_METRICS_PORT]
+            vec![
+                20900,
+                20901,
+                20902,
+                20903,
+                rayline_metrics::DEFAULT_METRICS_PORT
+            ]
         );
     }
 
@@ -3319,7 +3510,7 @@ mod tests {
     fn metrics_port_candidates_fall_back_to_default_when_all_meta_empty() {
         let empty = BTreeMap::new();
 
-        let ports = metrics_port_candidates(&empty, &empty, &empty);
+        let ports = metrics_port_candidates(&empty, &empty, &empty, &empty);
 
         assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
     }
@@ -3597,7 +3788,7 @@ mod tests {
         let empty = BTreeMap::new();
         let isolated = meta_with_metrics_port(20814);
 
-        let ports = metrics_port_candidates(&empty, &empty, &isolated);
+        let ports = metrics_port_candidates(&empty, &empty, &isolated, &empty);
 
         assert_eq!(ports, vec![20814, rayline_metrics::DEFAULT_METRICS_PORT]);
     }
@@ -3608,7 +3799,7 @@ mod tests {
         let proxy = meta_with_metrics_port(rayline_metrics::DEFAULT_METRICS_PORT);
         let empty = BTreeMap::new();
 
-        let ports = metrics_port_candidates(&serve, &proxy, &empty);
+        let ports = metrics_port_candidates(&serve, &proxy, &empty, &empty);
 
         assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
     }
@@ -4645,16 +4836,30 @@ fn clear_proxy_state(paths: &RouterPaths) {
     let _ = std::fs::remove_file(&paths.proxy_meta_file);
 }
 
-/// Report the `--isolated` proxy in `router status` so users can see (and clean
-/// up with `router stop`) a proxy left running in the isolated `cc/` state dir
-/// on its own port. No-op when no isolated proxy is running.
+fn create_proxy_state_dir(paths: &RouterPaths, subscription_instance: bool) -> io::Result<()> {
+    std::fs::create_dir_all(paths.data_dir())?;
+    #[cfg(unix)]
+    if subscription_instance {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(paths.data_dir(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Report separately-scoped proxies in `router status` so users can see (and
+/// clean up with `router stop`) an isolated or subscription-pool proxy left
+/// running on its own port. No-op when neither proxy is running.
 async fn append_isolated_proxy_status(output: &mut String, home: &Path, client: &reqwest::Client) {
     let isolated = RouterPaths::new_isolated(home);
-    if read_pid(&isolated.proxy_pid_file).is_none() {
-        return;
+    if read_pid(&isolated.proxy_pid_file).is_some() {
+        output.push_str("--isolated:\n");
+        append_proxy_sidecar_status(output, &isolated, client).await;
     }
-    output.push_str("--isolated:\n");
-    append_proxy_sidecar_status(output, &isolated, client).await;
+    let subscription = RouterPaths::new_subscription(home);
+    if read_pid(&subscription.proxy_pid_file).is_some() {
+        output.push_str("--subscription-pool:\n");
+        append_proxy_sidecar_status(output, &subscription, client).await;
+    }
 }
 
 async fn append_proxy_sidecar_status(
@@ -4738,14 +4943,21 @@ fn parse_optional_port(value: Option<&String>) -> Option<u16> {
 }
 
 /// Metrics-control port the proxy self-hosts on, mirroring `resolve_proxy_port`:
-/// an env override (`RAYLINE_METRICS_PORT` / `RAYLINE_ISOLATED_METRICS_PORT`)
-/// wins, otherwise the per-isolation default. A malformed override falls back to
-/// the default — metrics are best-effort and must not block a launch.
-fn resolve_metrics_port(isolated: bool) -> u16 {
+/// an env override (`RAYLINE_METRICS_PORT`,
+/// `RAYLINE_ISOLATED_METRICS_PORT`, or
+/// `RAYLINE_SUBSCRIPTION_METRICS_PORT`) wins, otherwise the per-instance
+/// default. A malformed override falls back to the default — metrics are
+/// best-effort and must not block a launch.
+fn resolve_metrics_port(isolated: bool, subscription_pool: bool) -> u16 {
     let (env_var, default_port) = if isolated {
         (
             "RAYLINE_ISOLATED_METRICS_PORT",
             DEFAULT_ISOLATED_METRICS_PORT,
+        )
+    } else if subscription_pool {
+        (
+            "RAYLINE_SUBSCRIPTION_METRICS_PORT",
+            DEFAULT_SUBSCRIPTION_METRICS_PORT,
         )
     } else {
         (
@@ -4761,14 +4973,16 @@ fn resolve_metrics_port(isolated: bool) -> u16 {
 
 /// Ordered, de-duplicated list of metrics-control ports `rayline top` should try,
 /// most-authoritative first: the local-router `serve` daemon, then the
-/// non-isolated proxy's self-hosted server, then the isolated proxy's, with the
-/// default metrics port as a final fallback. The proxy only records its
-/// `metrics_port` in meta when it self-hosts (i.e. when it is not forwarding to a
-/// serve daemon), so a present entry always names a port the proxy owns.
+/// ordinary shared proxy's self-hosted server, then the isolated proxy's and the
+/// subscription proxy's, with the default metrics port as a final fallback.
+/// The proxy only records its `metrics_port` in meta when it self-hosts (i.e.
+/// when it is not forwarding to a serve daemon), so a present entry always names
+/// a port the proxy owns.
 fn metrics_port_candidates(
     serve_meta: &BTreeMap<String, String>,
     proxy_meta: &BTreeMap<String, String>,
     isolated_proxy_meta: &BTreeMap<String, String>,
+    subscription_proxy_meta: &BTreeMap<String, String>,
 ) -> Vec<u16> {
     let mut ports = Vec::new();
     let mut push = |port: u16| {
@@ -4776,7 +4990,12 @@ fn metrics_port_candidates(
             ports.push(port);
         }
     };
-    for meta in [serve_meta, proxy_meta, isolated_proxy_meta] {
+    for meta in [
+        serve_meta,
+        proxy_meta,
+        isolated_proxy_meta,
+        subscription_proxy_meta,
+    ] {
         if let Some(port) = parse_optional_port(meta.get("metrics_port")) {
             push(port);
         }
@@ -5056,9 +5275,18 @@ impl RouterPaths {
         Self::in_dir(home.join(crate::ROUTER_STATE_DIR).join("cc"))
     }
 
-    fn for_isolation(home: &Path, isolated: bool) -> Self {
+    /// Pool-aware proxies stay separate from both the ordinary shared proxy
+    /// and `--isolated`, so enabling credential switching cannot change the
+    /// behavior of an already-running non-pooled Claude session.
+    fn new_subscription(home: &Path) -> Self {
+        Self::in_dir(home.join(crate::ROUTER_STATE_DIR).join("subscriptions"))
+    }
+
+    fn for_proxy(home: &Path, isolated: bool, subscription_pool: bool) -> Self {
         if isolated {
             Self::new_isolated(home)
+        } else if subscription_pool {
+            Self::new_subscription(home)
         } else {
             Self::new(home)
         }
