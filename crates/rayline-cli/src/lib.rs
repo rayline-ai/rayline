@@ -180,7 +180,13 @@ Usage: rayline subscriptions list [--config <path>] [--json]
 ";
 
 const SUBSCRIPTIONS_STATUS_HELP: &str = "\
-Usage: rayline subscriptions status [--pool <name>] [--config <path>] [--json]
+Usage: rayline subscriptions status [OPTIONS]
+
+Options:
+  --pool <name>       Pool name (default: default)
+  --config <path>     Subscription registry path
+  --verbose, -v       Show every normalized limit claim and placement detail
+  --json              Emit the complete machine-readable status
 ";
 
 const CODEX_HELP: &str = "\
@@ -924,6 +930,7 @@ where
     let mut claude_config_dir = None;
     let mut control_config_dir = None;
     let mut json = false;
+    let mut verbose = false;
     let mut account_id = None;
 
     if matches!(command, "add" | "remove") {
@@ -959,6 +966,7 @@ where
                 control_config_dir = Some(PathBuf::from(args.next()?));
             }
             "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
             _ => return None,
         }
     }
@@ -971,7 +979,9 @@ where
             claude_config_dir: claude_config_dir?,
             control_config_dir,
         }),
-        "remove" if claude_config_dir.is_none() && control_config_dir.is_none() && !json => {
+        "remove"
+            if claude_config_dir.is_none() && control_config_dir.is_none() && !json && !verbose =>
+        {
             Some(subscriptions::SubscriptionCommand::Remove {
                 account_id: account_id?,
                 pool_id,
@@ -982,6 +992,7 @@ where
             if account_id.is_none()
                 && claude_config_dir.is_none()
                 && control_config_dir.is_none()
+                && !verbose
                 && pool_id == "default" =>
         {
             Some(subscriptions::SubscriptionCommand::List { config_path, json })
@@ -995,6 +1006,7 @@ where
                 pool_id,
                 config_path,
                 json,
+                verbose,
             })
         }
         _ => None,
@@ -2425,6 +2437,21 @@ mod tests {
             panic!("expected ClaudeRun for {args:?}");
         };
         request
+    }
+
+    #[test]
+    fn subscriptions_status_parses_verbose_flag() {
+        let dispatch =
+            rayline_dispatch_for_argv(&argv(&["rayline", "subscriptions", "status", "--verbose"]));
+        assert_eq!(
+            dispatch,
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
+                pool_id: "default".to_owned(),
+                config_path: None,
+                json: false,
+                verbose: true,
+            })
+        );
     }
 
     // ── Connection mechanism resolution (the two-axis model) ──────────────
