@@ -398,6 +398,34 @@ Real `EndpointConfig` fields only: `id`, `protocol`
 > Note: `routes.subagent` (singular) is the subagent **default**;
 > `routes.subagents` (the map) is **only** for per-type overrides.
 
+### What `model` means at the `rayline-cloud` endpoint
+
+A route's `model` is rewritten into the request body, so at the hosted RCR it is
+the whole instruction. Two values, two meanings:
+
+| `model` on the wire | RCR behaviour |
+|---|---|
+| `rayline-router` (or absent) | **route** — the RCR's rules/ML pick the model |
+| any concrete id (`claude-opus-5`, `z-ai/glm-5.2`, `gpt-5.5`, …) | **pin** — that exact model is used, and the rules/ML tiering, stickiness and ML override are all skipped |
+
+The rule is the same for every provider. Asking to be routed is what
+`rayline-router` is *for*; naming a model instead means you want that model.
+
+Two lanes are deliberately **not** pins, because there the model id is whatever
+the Claude Code session happened to be on rather than a deliberate choice:
+
+- **haiku ids** are intercepted — Claude Code emits them for background work
+  (auto-title, compact, tool-result analysis), so they are redirected regardless.
+- **subagent turns** carrying Claude Code's `x-claude-code-agent-id` header use
+  the delegated-subagent policy, so `routes.subagent.model` does not pin at the
+  RCR. Use `router: rayline-local` (`Rl`) to decide subagent models on-device.
+
+> Before the pin fix, `claude-*` ids were the exception: the RCR routed them
+> anyway and merely relabelled the response when the tier happened to land on
+> Anthropic, so an explicit `claude-opus-*` could silently be served by GLM on a
+> low-risk turn. Non-Anthropic ids already pinned. If you are on an older
+> deployment, expect the old asymmetry.
+
 ### `rayline`-only route fields
 
 A route targeting the `rayline` cloud endpoint accepts two optional fields:
