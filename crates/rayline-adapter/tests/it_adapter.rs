@@ -1052,3 +1052,158 @@ async fn adapter_healthz() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["port"], port);
 }
+
+/// Fake Responses-shaped upstream (mimics llama-server / LM Studio's
+/// `/v1/responses`): records the forwarded body, returns a minimal Response.
+async fn fake_responses_upstream(port: u16, captured: CapturedBody) {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+        let captured = captured.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req: Request<Incoming>| {
+                let captured = captured.clone();
+                async move {
+                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                    *captured.lock().unwrap() = Some(bytes.to_vec());
+                    let body = json!({
+                        "id": "resp_fake",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "qwen3.6-27b-iq3xxs",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}]
+                        }],
+                        "usage": {"input_tokens": 12, "output_tokens": 3}
+                    });
+                    let resp: Response<Full<Bytes>> = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                        .unwrap();
+                    Ok::<_, Infallible>(resp)
+                }
+            });
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
+}
+
+/// The `web_search` hosted tool a real Codex explorer subagent ships cannot run
+/// on any local backend: llama-server drops it silently, LM Studio misroutes the
+/// model's search intent onto another tool. The adapter must strip it from the
+/// body it forwards on the Responses path (both may-local 307 → `/api/v1/responses`
+/// and direct `/v1/responses`), leaving the executable function tools intact.
+#[tokio::test]
+async fn adapter_strips_web_search_hosted_tool_on_responses_path() {
+    let upstream_port = free_port();
+    let adapter_port = free_port();
+    let captured: CapturedBody = Arc::new(Mutex::new(None));
+    tokio::spawn(fake_responses_upstream(upstream_port, captured.clone()));
+    tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
+        port: adapter_port,
+        target: format!("http://127.0.0.1:{upstream_port}"),
+        upstream_model: "qwen3.6-27b-iq3xxs".into(),
+        router_url: "http://127.0.0.1:1".into(),
+        auth_cache: None,
+        metrics: None,
+        collect_llama_progress: false,
+    }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let req_body = json!({
+        "model": "rayline-router",
+        "stream": false,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "find it"}]}],
+        "tools": [
+            {"type": "web_search"},
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}
+        ]
+    });
+    let resp = client
+        .post(format!("http://127.0.0.1:{adapter_port}/api/v1/responses"))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream never received");
+    let sent_json: Value = serde_json::from_slice(&sent).unwrap();
+    let tools = sent_json["tools"].as_array().unwrap();
+    // web_search is gone; the executable function tool survives.
+    assert!(
+        !tools.iter().any(|t| t["type"] == "web_search"),
+        "web_search must be stripped before the local forward"
+    );
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "exec_command");
+}
+
+/// Symmetric to the Responses test: on the Anthropic `/v1/messages` path the
+/// hosted server-tool shape is `{"type":"web_search_20250305"}`. It must be
+/// stripped before the local forward, leaving client-executed tools (no `type`)
+/// intact.
+#[tokio::test]
+async fn adapter_strips_web_search_hosted_tool_on_messages_path() {
+    let upstream_port = free_port();
+    let adapter_port = free_port();
+    let captured: CapturedBody = Arc::new(Mutex::new(None));
+    tokio::spawn(fake_anthropic_upstream(upstream_port, captured.clone()));
+    tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
+        port: adapter_port,
+        target: format!("http://127.0.0.1:{upstream_port}"),
+        upstream_model: "qwen3.6-35b-a3b".into(),
+        router_url: "http://127.0.0.1:1".into(),
+        auth_cache: None,
+        metrics: None,
+        collect_llama_progress: false,
+    }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let req_body = json!({
+        "model": "claude-test",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "find it"}],
+        "tools": [
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "Bash", "input_schema": {"type": "object"}}
+        ]
+    });
+    let resp = client
+        .post(format!("http://127.0.0.1:{adapter_port}/v1/messages"))
+        .json(&req_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream never received");
+    let sent_json: Value = serde_json::from_slice(&sent).unwrap();
+    let tools = sent_json["tools"].as_array().unwrap();
+    // The versioned web_search server tool is gone; the client tool survives.
+    assert!(
+        !tools.iter().any(|t| t["type"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("web_search"))),
+        "web_search_* must be stripped before the local forward"
+    );
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "Bash");
+}
