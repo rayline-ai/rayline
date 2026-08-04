@@ -106,6 +106,10 @@ pub struct ProxyOptions {
     /// In selective-subagents mode, route only these exact Claude Code agent ids
     /// to the router. Empty preserves the legacy behavior: route every subagent.
     pub selective_subagent_ids: Vec<String>,
+    /// Launch-scoped C82 episode namespace. Routed main turns use the prefix;
+    /// routed subagents append Claude's agent id so their policy state is
+    /// independent. `None` preserves ordinary proxy behavior.
+    pub episode_prefix: Option<String>,
     /// When the router URL points at the in-process local router, that router
     /// records router request lifecycle metrics using the same request
     /// id. The proxy still records Anthropic passthrough traffic.
@@ -137,6 +141,7 @@ impl ProxyOptions {
             route_status_path: None,
             routing_mode: ProxyRoutingMode::All,
             selective_subagent_ids: Vec::new(),
+            episode_prefix: None,
             local_router_owns_metrics: false,
             metrics: None,
         }
@@ -653,11 +658,24 @@ async fn forward_anthropic_request(
         if should_drop_header_for_route(name, &decision.target) {
             continue;
         }
+        if state.opts.episode_prefix.is_some()
+            && name.as_str().eq_ignore_ascii_case("x-rayline-episode-id")
+        {
+            continue;
+        }
         outbound = outbound.header(name.as_str(), value.as_bytes());
     }
     outbound = outbound.header(REQUEST_ID_HEADER, &request_id);
 
     if decision.target == RouteTarget::Router {
+        if let Some(prefix) = state.opts.episode_prefix.as_deref() {
+            let episode_id = if agent_id == "<none>" {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}:{agent_id}")
+            };
+            outbound = outbound.header("x-rayline-episode-id", episode_id);
+        }
         if !state.opts.router_api_key.is_empty() {
             outbound = outbound.header("x-api-key", &state.opts.router_api_key);
         }
@@ -3549,6 +3567,7 @@ mod tests {
             route_status_path: None,
             routing_mode: ProxyRoutingMode::All,
             selective_subagent_ids: Vec::new(),
+            episode_prefix: None,
             local_router_owns_metrics: false,
             metrics: None,
         };

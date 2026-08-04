@@ -13,6 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+const HF_TOKEN_ENV_VARS: [&str; 4] = [
+    "HF_TOKEN",
+    "HF_API_TOKEN",
+    "HUGGINGFACE_HUB_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+];
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -315,9 +322,11 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", "rayline")
+    let mut request = client.get(&url).header("User-Agent", "rayline");
+    if let Some(token) = hf_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .map_err(|e| format!("HF API request failed: {e}"))?;
 
@@ -871,6 +880,7 @@ fn download_file_to_path(
         .tcp_keepalive(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let token = hf_token();
 
     // No unconditional pre-delete here: the caller (download_to_hf_cache)
     // already validates that any pre-existing tmp file belongs to this same
@@ -890,6 +900,7 @@ fn download_file_to_path(
             bytes_offset,
             total_override,
             report_filename,
+            token.as_deref(),
         ) {
             Ok(bytes) => return Ok(bytes),
             Err(DownloadAttemptError::Cancelled) => {
@@ -925,6 +936,19 @@ fn download_file_to_path(
     }
 }
 
+/// Resolve an inherited Hugging Face token without reading shell profiles or
+/// persisting the value. Empty variables are ignored.
+pub fn hf_token() -> Option<String> {
+    hf_token_from(|name| std::env::var(name).ok())
+}
+
+fn hf_token_from(mut read: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    HF_TOKEN_ENV_VARS
+        .iter()
+        .filter_map(|name| read(name))
+        .find(|value| !value.trim().is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attempt_download(
     url: &str,
@@ -936,6 +960,7 @@ fn attempt_download(
     bytes_offset: u64,
     total_override: u64,
     report_filename: Option<&str>,
+    token: Option<&str>,
 ) -> Result<u64, DownloadAttemptError> {
     // Honor any partial file on disk — either retained from a previous
     // process invocation (via the .tmp.url sidecar guarding the call site)
@@ -943,6 +968,9 @@ fn attempt_download(
     let existing_bytes = fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0);
 
     let mut request = client.get(url).header("User-Agent", "rayline");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
     if existing_bytes > 0 {
         request = request.header("Range", format!("bytes={existing_bytes}-"));
     }
@@ -1123,6 +1151,20 @@ mod tests {
             repo_to_folder_name("unsloth/Qwen3.5-2B-GGUF"),
             "models--unsloth--Qwen3.5-2B-GGUF"
         );
+    }
+
+    #[test]
+    fn hf_token_resolution_supports_documented_variables_and_precedence() {
+        let values = std::collections::HashMap::from([
+            ("HF_TOKEN", "".to_owned()),
+            ("HF_API_TOKEN", "api-token".to_owned()),
+            ("HUGGINGFACE_HUB_TOKEN", "hub-token".to_owned()),
+        ]);
+        assert_eq!(
+            hf_token_from(|name| values.get(name).cloned()),
+            Some("api-token".to_owned())
+        );
+        assert_eq!(hf_token_from(|_| None), None);
     }
 
     #[test]

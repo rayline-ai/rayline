@@ -103,9 +103,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run llama-server + adapter + injector under one supervisor (foreground).
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Run only the transparent Claude Code HTTPS proxy (foreground).
-    Proxy(ProxyArgs),
+    Proxy(Box<ProxyArgs>),
     /// Render the router's per-turn picked model for a Claude Code status line.
     Statusline(StatuslineArgs),
     /// Inspect cached GGUFs.
@@ -242,6 +242,30 @@ struct ServeArgs {
     /// serves; local availability is advertised as unavailable.
     #[arg(long, env = NO_LOCAL_MODEL_ENV)]
     no_local_model: bool,
+
+    /// Immutable C82 runtime directory containing manifest.json.
+    #[arg(long)]
+    c82_runtime_dir: Option<PathBuf>,
+
+    /// Pinned native libllama C82 encoder executable.
+    #[arg(long)]
+    c82_native_binary: Option<PathBuf>,
+
+    /// Manifest-pinned BF16 GGUF for the frozen C82 encoder.
+    #[arg(long)]
+    c82_native_model: Option<PathBuf>,
+
+    /// Accelerator selected for the frozen C82 encoder.
+    #[arg(long, default_value = "auto")]
+    c82_device: String,
+
+    /// Optional GPU-memory ceiling for C82 encoder state.
+    #[arg(long)]
+    c82_memory_budget_gib: Option<String>,
+
+    /// Launch-scoped episode namespace injected by the transparent proxy.
+    #[arg(long)]
+    c82_episode_prefix: Option<String>,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -316,6 +340,10 @@ struct ProxyArgs {
     /// self-hosts metrics (i.e. when --metrics-url is not set).
     #[arg(long, env = METRICS_PORT_ENV, default_value_t = rayline_metrics::DEFAULT_METRICS_PORT, hide = true)]
     metrics_port: u16,
+
+    /// Launch-scoped C82 episode namespace for a standalone isolated proxy.
+    #[arg(long, hide = true)]
+    episode_prefix: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -350,8 +378,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve(args) => run_serve(args).await,
-        Cmd::Proxy(args) => run_proxy(args).await,
+        Cmd::Serve(args) => run_serve(*args).await,
+        Cmd::Proxy(args) => run_proxy(*args).await,
         Cmd::Statusline(args) => {
             statusline::run(resolve_route_status_path(args.route_status_path));
             Ok(())
@@ -438,6 +466,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         })
         .ok_or_else(|| anyhow!("Could not resolve data dir"))?;
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
+    let c82 = c82_options(&args, &data_dir)?;
     let hosted_router_url = args
         .router_url
         .as_deref()
@@ -639,6 +668,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         opts.route_status_path = Some(resolve_route_status_path(args.route_status_path.clone()));
         opts.routing_mode = args.proxy_routing_mode.into();
         opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
+        opts.episode_prefix = args.c82_episode_prefix.clone();
         opts.local_router_owns_metrics = args.decision_plane == DecisionPlaneArg::Local;
         opts.metrics = Some(metrics_sink.clone());
         Some(opts)
@@ -652,6 +682,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             local_model_id: args.local_model_id.clone(),
             config_path: args.router_config_path.clone(),
             metrics: Some(metrics_sink.clone()),
+            c82,
         })
     } else {
         None
@@ -741,6 +772,74 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     }
 }
 
+fn c82_options(
+    args: &ServeArgs,
+    data_dir: &Path,
+) -> Result<Option<rayline_local_router::C82Options>> {
+    let requested = args.c82_runtime_dir.is_some()
+        || args.c82_native_binary.is_some()
+        || args.c82_native_model.is_some()
+        || args.c82_episode_prefix.is_some();
+    if !requested {
+        return Ok(None);
+    }
+    let runtime_dir = args
+        .c82_runtime_dir
+        .clone()
+        .ok_or_else(|| anyhow!("--c82-runtime-dir is required for C82"))?;
+    let binary = args
+        .c82_native_binary
+        .as_ref()
+        .ok_or_else(|| anyhow!("--c82-native-binary is required for C82"))?;
+    let model = args
+        .c82_native_model
+        .as_ref()
+        .ok_or_else(|| anyhow!("--c82-native-model is required for C82"))?;
+    let prefix = args
+        .c82_episode_prefix
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("--c82-episode-prefix is required for C82"))?;
+    if !args.no_local_model || args.decision_plane != DecisionPlaneArg::Local {
+        return Err(anyhow!(
+            "C82 requires --no-local-model and --decision-plane=local"
+        ));
+    }
+    if std::env::var_os("OPENROUTER_API_KEY").is_none() {
+        return Err(anyhow!("C82 requires inherited OPENROUTER_API_KEY"));
+    }
+    if !runtime_dir.join("manifest.json").is_file() || !binary.is_file() || !model.is_file() {
+        return Err(anyhow!("C82 runtime, native binary, or GGUF is missing"));
+    }
+    let device = match args.c82_device.as_str() {
+        "mps" => "metal",
+        value => value,
+    };
+    let mut native_encoder = rayline_mtrouter::NativeEncoderOptions::c82(
+        binary.clone(),
+        model.clone(),
+        device.to_owned(),
+    );
+    native_encoder.memory_budget_gib = args
+        .c82_memory_budget_gib
+        .as_deref()
+        .map(str::parse::<f64>)
+        .transpose()
+        .context("parse --c82-memory-budget-gib")?;
+    info!(
+        "C82 native encoder configured (device={}, episode_namespace={})",
+        device,
+        &prefix[..prefix.len().min(8)]
+    );
+    Ok(Some(rayline_local_router::C82Options {
+        runtime_dir,
+        native_encoder,
+        artifact_commit: rayline_local_router::C82_ARTIFACT_COMMIT.to_owned(),
+        decision_log_path: data_dir.join("c82-decisions.jsonl"),
+        openrouter_url: "https://openrouter.ai/api/v1/messages".to_owned(),
+    }))
+}
+
 async fn run_proxy(args: ProxyArgs) -> Result<()> {
     let router_url = args
         .router_url
@@ -780,6 +879,7 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
     opts.route_status_path = Some(resolve_route_status_path(args.route_status_path.clone()));
     opts.routing_mode = args.proxy_routing_mode.into();
     opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
+    opts.episode_prefix = args.episode_prefix.clone();
     opts.local_router_owns_metrics = args.local_router_owns_metrics;
     // Forward to a serve daemon when one owns metrics; otherwise self-host so
     // `rayline top` works for cloud-only and isolated proxy sessions too.
@@ -1349,14 +1449,14 @@ mod tests {
 
     fn parse_serve(argv: &[&str]) -> ServeArgs {
         match Cli::try_parse_from(argv).unwrap().cmd {
-            Cmd::Serve(args) => args,
+            Cmd::Serve(args) => *args,
             _ => panic!("expected serve subcommand"),
         }
     }
 
     fn parse_proxy(argv: &[&str]) -> ProxyArgs {
         match Cli::try_parse_from(argv).unwrap().cmd {
-            Cmd::Proxy(args) => args,
+            Cmd::Proxy(args) => *args,
             _ => panic!("expected proxy subcommand"),
         }
     }

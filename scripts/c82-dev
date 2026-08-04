@@ -1,0 +1,677 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+semantic_router_root="${C82_SEMANTIC_ROUTER_ROOT:-$repo_root/../semantic-router}"
+vllm_root="${C82_VLLM_ROOT:-$repo_root/../vllm}"
+state_dir="${C82_DEV_STATE_DIR:-$HOME/.config/rayline-c82}"
+modal_proxy_file="$state_dir/modal-proxy-token.json"
+compose_file="$repo_root/dev/c82-vsr/compose.yaml"
+rayline_bin="${C82_RAYLINE_BIN:-$repo_root/target/release/rayline}"
+rld_bin="${C82_RLD_BIN:-$repo_root/target/release/rld}"
+artifact_commit="5a723bbdd5e65aeec991e73c2453100f03f5ebd5"
+semantic_router_commit="f8ece7b2bdf1b978b03516074345923f16210521"
+vllm_commit="162bcefe1b41c5bb35eccc2f2219ea39e2c74bb7"
+encoder_build_id="vllm@$vllm_commit"
+encoder_url="${C82_VSR_ENCODER_URL:-https://atlasfutures-dev--rayline-arc-encoder-serve.modal.run}"
+api_port="${C82_VSR_API_PORT:-18882}"
+envoy_port="${C82_VSR_ENVOY_PORT:-18888}"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/c82-dev <command>
+
+Native C82 (fastest path):
+  bootstrap       Build/install matching Rayline binaries and run C82 doctor
+  doctor          Verify artifact hashes and Metal/CUDA parity
+  demo-claude     Run a live Claude Code turn through C82
+  start           Start the native C82 router in the background
+  status          Show native and VSR service status
+  stop            Stop native and VSR services
+
+vLLM Semantic Router + ARC:
+  vsr-auth        Create/reuse a dev-scoped Modal endpoint proxy token
+  vsr-deploy      Deploy the pinned Modal Rung-B encoder
+  vsr-start       Start Redis, Semantic Router, and Envoy locally
+  vsr-demo        Send one live OpenAI-compatible request through VSR + ARC
+  vsr-codex       Run one Codex CLI turn through VSR + ARC
+  vsr-claude      Run one Claude Code turn through VSR + ARC
+  vsr-pii         Detect PII with VSR's mmBERT-32K PII model
+  vsr-restart     Prove the local VSR stack restarts cleanly
+  vsr-logs        Follow the local VSR stack logs
+  vsr-stop        Stop the local stack (the Modal app stays scale-to-zero)
+EOF
+}
+
+load_shell_credentials() {
+  if [[ -f "$HOME/.bash_profile" ]]; then
+    # The profile is intentionally quiet here: keys must never reach logs.
+    # shellcheck disable=SC1090,SC1091
+    source "$HOME/.bash_profile" >/dev/null 2>&1
+  fi
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+require_file() {
+  [[ -f "$1" ]] || {
+    echo "Missing required file: $1" >&2
+    exit 1
+  }
+}
+
+check_source_pins() {
+  local semantic_head vllm_head
+  semantic_head="$(git -C "$semantic_router_root" rev-parse HEAD 2>/dev/null || true)"
+  vllm_head="$(git -C "$vllm_root" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$semantic_head" == "$semantic_router_commit" ]] || {
+    echo "Semantic Router must be at $semantic_router_commit; found ${semantic_head:-missing}" >&2
+    exit 1
+  }
+  [[ "$vllm_head" == "$vllm_commit" ]] || {
+    echo "vLLM must be at $vllm_commit; found ${vllm_head:-missing}" >&2
+    exit 1
+  }
+}
+
+modern_modal() {
+  if command -v uvx >/dev/null 2>&1; then
+    uvx --from modal modal "$@"
+    return
+  fi
+  if modal workspace proxy-tokens --help >/dev/null 2>&1; then
+    modal "$@"
+    return
+  fi
+  echo "Install a current Modal CLI or uv: https://modal.com/docs/reference/cli" >&2
+  exit 1
+}
+
+ensure_modal_proxy_token() {
+  local proxy_id temporary_file
+  require_command jq
+  if jq -e '
+    (.["Modal-Key"] | strings | startswith("wk-")) and
+    (.["Modal-Secret"] | strings | startswith("ws-"))
+  ' "$modal_proxy_file" >/dev/null 2>&1; then
+    return
+  fi
+
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+  umask 077
+  temporary_file="$(mktemp "$state_dir/modal-proxy-token.XXXXXX")"
+  modern_modal workspace proxy-tokens create --json >"$temporary_file"
+  jq -e '
+    (.["Modal-Key"] | strings | startswith("wk-")) and
+    (.["Modal-Secret"] | strings | startswith("ws-"))
+  ' "$temporary_file" >/dev/null || {
+    echo "Modal did not return a valid endpoint proxy token." >&2
+    exit 1
+  }
+  mv "$temporary_file" "$modal_proxy_file"
+  chmod 600 "$modal_proxy_file"
+  proxy_id="$(jq -er '.["Modal-Key"]' "$modal_proxy_file")"
+  modern_modal workspace proxy-tokens allow "$proxy_id" dev >/dev/null
+  echo "Created a dev-scoped Modal endpoint proxy token."
+}
+
+load_modal_credentials() {
+  if [[ -n "${RAYLINE_ARC_MODAL_KEY:-}" && -n "${RAYLINE_ARC_MODAL_SECRET:-}" ]]; then
+    return
+  fi
+  ensure_modal_proxy_token
+  RAYLINE_ARC_MODAL_KEY="$(jq -er '.["Modal-Key"]' "$modal_proxy_file")"
+  RAYLINE_ARC_MODAL_SECRET="$(jq -er '.["Modal-Secret"]' "$modal_proxy_file")"
+  export RAYLINE_ARC_MODAL_KEY RAYLINE_ARC_MODAL_SECRET
+  [[ -n "$RAYLINE_ARC_MODAL_KEY" && -n "$RAYLINE_ARC_MODAL_SECRET" ]] || {
+    echo "The Modal endpoint proxy credentials are incomplete." >&2
+    exit 1
+  }
+}
+
+artifact_dir() {
+  local candidate
+  if [[ -n "${C82_ARTIFACT_DIR:-}" ]]; then
+    printf '%s\n' "$C82_ARTIFACT_DIR"
+    return
+  fi
+  for candidate in \
+    "$HOME/Library/Caches/huggingface/hub/models--rayline-ai--mtrouter-c82/snapshots/$artifact_commit/runtime" \
+    "$HOME/.cache/huggingface/hub/models--rayline-ai--mtrouter-c82/snapshots/$artifact_commit/runtime"; do
+    if [[ -f "$candidate/manifest.json" && -f "$candidate/model.safetensors" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  echo "C82 artifact is not provisioned. Run: scripts/c82-dev doctor" >&2
+  exit 1
+}
+
+ensure_pii_model() {
+  local model_dir="$state_dir/models/mmbert32k-pii-detector-merged"
+  if [[ -f "$model_dir/model.safetensors" && -f "$model_dir/pii_type_mapping.json" ]]; then
+    return
+  fi
+  require_command hf
+  mkdir -p "$state_dir/models"
+  echo "Downloading the public VSR PII classifier (first run only)..."
+  hf download llm-semantic-router/mmbert32k-pii-detector-merged \
+    --local-dir "$model_dir"
+}
+
+require_native_bins() {
+  require_file "$rayline_bin"
+  require_file "$rld_bin"
+  export RLD_BIN="$rld_bin"
+}
+
+native_doctor() {
+  load_shell_credentials
+  require_native_bins
+  "$rayline_bin" orchestrator doctor c82
+}
+
+generate_vsr_config() {
+  local runtime_dir manifest materialized_dir models_dir config_path redis_password_path relative
+  runtime_dir="$(artifact_dir)"
+  manifest="$runtime_dir/manifest.json"
+  materialized_dir="$state_dir/artifact"
+  models_dir="$state_dir/models"
+  config_path="$state_dir/vsr-config.json"
+  redis_password_path="$state_dir/redis-password"
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+
+  # Hugging Face snapshots are symlink forests whose blob targets sit outside
+  # the runtime directory. Materialize only the files the VSR artifact loader
+  # verifies so the read-only container mount remains self-contained.
+  mkdir -p "$materialized_dir"
+  for relative in \
+    "manifest.json" \
+    "$(jq -r '.weights.file' "$manifest")" \
+    "$(jq -r '.golden.head.file' "$manifest")" \
+    "$(jq -r '.encoder.golden.file // empty' "$manifest")"; do
+    [[ -n "$relative" ]] || continue
+    mkdir -p "$materialized_dir/$(dirname "$relative")"
+    cp -L "$runtime_dir/$relative" "$materialized_dir/$relative"
+    chmod 600 "$materialized_dir/$relative"
+  done
+
+  if [[ ! -f "$redis_password_path" ]]; then
+    umask 077
+    openssl rand -hex 32 >"$redis_password_path"
+  fi
+  chmod 600 "$redis_password_path"
+
+  jq \
+    --arg encoder_url "$encoder_url" \
+    --arg encoder_build_id "$encoder_build_id" \
+    '
+    def per_million: . * 1000000;
+    {
+      version: "v0.3",
+      listeners: [{
+        name: "c82-vsr-live",
+        address: "0.0.0.0",
+        port: 8888,
+        timeout: "300s"
+      }],
+      providers: {
+        defaults: {default_model: .workers[0].id},
+        models: [.workers[] | {
+          name: .id,
+          provider_model_id: .model,
+          api_format: "openai",
+          pricing: {
+            currency: "USD",
+            prompt_per_1m: (.estimated_input_cost_per_token | per_million),
+            cached_input_per_1m: (.estimated_cache_read_cost_per_token | per_million),
+            cache_write_per_1m: (.estimated_cache_write_cost_per_token | per_million),
+            completion_per_1m: (.estimated_output_cost_per_token | per_million)
+          },
+          backend_refs: [{
+            name: "openrouter",
+            endpoint: "openrouter.ai:443",
+            protocol: "https",
+            type: "openai",
+            base_url: "https://openrouter.ai/api/v1",
+            provider: "openai",
+            auth_header: "Authorization",
+            auth_prefix: "Bearer",
+            api_key_env: .api_key_env
+          }]
+        }]
+      },
+      routing: {
+        signals: {
+          pii: [{
+            name: "c82_pii_detector",
+            threshold: 0.9,
+            include_history: false,
+            pii_types_allowed: [],
+            description: "Initialize and expose the local mmBERT-32K PII detector"
+          }]
+        },
+        modelCards: [.workers[] | {name: .id, modality: "text"}],
+        decisions: [
+          {
+            name: "c82-arc",
+            description: "Immutable C82 ARC orchestration policy",
+            priority: 100,
+            rules: {operator: "AND", conditions: []},
+            modelRefs: [.workers[] | {
+              model: .id,
+              use_reasoning: (.thinking_mode != "disabled")
+            }],
+            adaptations: {mode: "bypass"},
+            plugins: [{
+              type: "router_replay",
+              configuration: {enabled: false}
+            }],
+            algorithm: {
+              type: "rayline_arc",
+              on_error: "fail_closed",
+              rayline_arc: {
+                artifact_dir: "/var/lib/vllm-sr/rayline-arc",
+                artifact_revision: .artifact_id,
+                encoder: {
+                  base_url: $encoder_url,
+                  model: .encoder.model,
+                  model_revision: .encoder.revision,
+                  expected_build_id: $encoder_build_id,
+                  expected_io_plugin_version: "rayline-arc-io@0.1.0",
+                  serializer_version: .encoder.serialization,
+                  serving_rung: "B",
+                  required_pooling_capabilities: ["chunked_causal_mean"],
+                  modal_key_env: "RAYLINE_ARC_MODAL_KEY",
+                  modal_secret_env: "RAYLINE_ARC_MODAL_SECRET",
+                  connect_timeout_seconds: 5,
+                  total_timeout_seconds: 180,
+                  max_retries: 1
+                },
+                episode: {
+                  id_header: "x-rayline-episode-id",
+                  backend: "redis",
+                  key_prefix: "vsr:rayline-arc:",
+                  acquire_timeout_seconds: 30,
+                  lease_ttl_seconds: 60,
+                  idle_ttl_seconds: 900,
+                  max_in_memory_episodes: 1024,
+                  redis: {
+                    address: "redis:6379",
+                    db: 0,
+                    password_env: "C82_VSR_REDIS_PASSWORD",
+                    use_tls: false,
+                    pool_size: 32
+                  }
+                }
+              }
+            }
+          },
+          {
+            name: "c82-pii-loader",
+            description: "Keep the PII model available without superseding ARC",
+            priority: 1,
+            rules: {type: "pii", name: "c82_pii_detector"},
+            modelRefs: [{
+              model: .workers[0].id,
+              use_reasoning: (.workers[0].thinking_mode != "disabled")
+            }],
+            adaptations: {mode: "bypass"}
+          }
+        ]
+      },
+      global: {
+        services: {
+          response_api: {
+            enabled: true,
+            store_backend: "memory",
+            ttl_seconds: 3600,
+            max_responses: 100
+          },
+          router_replay: {
+            enabled: false,
+            store_backend: "memory"
+          }
+        },
+        stores: {semantic_cache: {enabled: false}},
+        model_catalog: {
+          embeddings: {semantic: {
+            mmbert_model_path: "",
+            qwen3_model_path: "",
+            gemma_model_path: "",
+            bert_model_path: "",
+            multimodal_model_path: ""
+          }},
+          system: {
+            pii_classifier: "models/mmbert32k-pii-detector-merged"
+          },
+          modules: {
+            prompt_guard: {
+              enabled: false,
+              model_ref: "",
+              model_id: "",
+              jailbreak_mapping_path: "",
+              use_mmbert_32k: false
+            },
+            classifier: {
+              domain: {
+                model_ref: "",
+                model_id: "",
+                category_mapping_path: "",
+                use_mmbert_32k: false
+              },
+              pii: {
+                model_ref: "pii_classifier",
+                model_id: "models/mmbert32k-pii-detector-merged",
+                threshold: 0.9,
+                use_cpu: true,
+                pii_mapping_path: "models/mmbert32k-pii-detector-merged/pii_type_mapping.json",
+                use_mmbert_32k: true
+              }
+            },
+            feedback_detector: {
+              enabled: false,
+              model_ref: "",
+              model_id: "",
+              use_mmbert_32k: false
+            }
+          }
+        }
+      }
+    }
+    ' "$manifest" >"$config_path"
+  chmod 600 "$config_path"
+
+  C82_VSR_CONFIG_PATH="$config_path"
+  C82_VSR_ARTIFACT_DIR="$materialized_dir"
+  C82_VSR_MODELS_DIR="$models_dir"
+  C82_VSR_REDIS_PASSWORD="$(<"$redis_password_path")"
+  export C82_VSR_CONFIG_PATH C82_VSR_ARTIFACT_DIR C82_VSR_MODELS_DIR
+  export C82_VSR_REDIS_PASSWORD
+}
+
+prepare_vsr_environment() {
+  load_shell_credentials
+  check_source_pins
+  require_command docker
+  require_command jq
+  [[ -n "${OPENROUTER_API_KEY:-}" ]] || {
+    echo "OPENROUTER_API_KEY is not set after loading ~/.bash_profile." >&2
+    exit 1
+  }
+  docker info >/dev/null 2>&1 || {
+    echo "Docker is not ready. Start OrbStack, then retry." >&2
+    exit 1
+  }
+  ensure_pii_model
+  load_modal_credentials
+  generate_vsr_config
+}
+
+compose() {
+  docker compose --project-name c82-vsr-live --file "$compose_file" "$@"
+}
+
+wait_for_url() {
+  local url="$1" label="$2" attempts="${3:-180}" status
+  for ((status=1; status<=attempts; status++)); do
+    if curl --fail --silent --show-error --max-time 3 "$url" >/dev/null 2>&1; then
+      echo "$label ready: $url"
+      return
+    fi
+    sleep 2
+  done
+  echo "$label did not become ready: $url" >&2
+  compose logs --no-color --tail 160 router envoy >&2 || true
+  exit 1
+}
+
+wait_for_arc_readiness() {
+  local attempts="${1:-360}" attempt
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if docker logs c82-vsr-live-router-1 2>&1 \
+      | grep -F '"msg":"rayline_arc_component_readiness"' \
+      | grep -F '"ready":true' \
+      >/dev/null; then
+      echo "VSR ARC component ready (artifact, encoder, and episode store verified)"
+      return
+    fi
+    if docker logs c82-vsr-live-router-1 2>&1 \
+      | grep -F '"msg":"rayline_arc_component_readiness"' \
+      | grep -F '"ready":false' \
+      >/dev/null; then
+      echo "VSR ARC component failed readiness." >&2
+      docker logs --tail 160 c82-vsr-live-router-1 >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "VSR ARC component did not become ready." >&2
+  docker logs --tail 160 c82-vsr-live-router-1 >&2
+  exit 1
+}
+
+vsr_start() {
+  prepare_vsr_environment
+  docker image inspect \
+    "${C82_VSR_ROUTER_IMAGE:-ghcr.io/vllm-project/semantic-router/vllm-sr:latest}" \
+    >/dev/null 2>&1 || {
+      echo "Semantic Router image is missing. Run 'make vllm-sr-dev' in $semantic_router_root." >&2
+      exit 1
+    }
+  compose up --detach --force-recreate
+  wait_for_url "http://127.0.0.1:$api_port/health" "VSR health"
+  wait_for_arc_readiness
+  wait_for_url "http://127.0.0.1:$api_port/ready" "VSR ARC readiness" 360
+}
+
+vsr_demo() {
+  local attempt episode response_file headers_file http_status selected
+  require_command curl
+  require_command jq
+  response_file="$(mktemp)"
+  headers_file="$(mktemp)"
+  trap 'rm -f "$response_file" "$headers_file"' RETURN
+
+  http_status=""
+  for attempt in 1 2 3 4 5; do
+    episode="c82-vsr-demo-$(date +%s)-$$-$attempt"
+    : >"$response_file"
+    : >"$headers_file"
+    if http_status="$(
+      curl --silent --show-error \
+        --max-time 300 \
+        --write-out "%{http_code}" \
+        --dump-header "$headers_file" \
+        --output "$response_file" \
+        --header "content-type: application/json" \
+        --header "x-rayline-episode-id: $episode" \
+        --data '{
+          "model": "auto",
+          "messages": [{
+            "role": "user",
+            "content": "Review a pull request for correctness and hidden regressions, then reply only C82_VSR_LIVE_OK."
+          }],
+          "max_tokens": 32,
+          "stream": false
+        }' \
+        "http://127.0.0.1:$envoy_port/v1/chat/completions"
+    )" && [[ "$http_status" == "200" ]]; then
+      break
+    fi
+    if [[ "$http_status" != "429" && "$http_status" != "502" && "$http_status" != "503" ]]; then
+      echo "VSR demo failed with HTTP ${http_status:-transport error}." >&2
+      jq . "$response_file" >&2 2>/dev/null || true
+      exit 1
+    fi
+    echo "Selected provider arm returned HTTP $http_status; retrying a fresh ARC episode ($attempt/5)." >&2
+    sleep 3
+  done
+  if [[ "$http_status" != "200" ]]; then
+    echo "VSR demo exhausted fresh-episode retries (last HTTP $http_status)." >&2
+    jq . "$response_file" >&2 2>/dev/null || true
+    exit 1
+  fi
+
+  selected="$(
+    tr -d '\r' <"$headers_file" \
+      | awk -F': ' 'tolower($1) == "x-vsr-selected-model" || tolower($1) == "x-selected-model" {print $2}' \
+      | tail -n 1
+  )"
+  jq --arg selected "$selected" '{
+    live: true,
+    selected_model: ($selected // ""),
+    response_model: .model,
+    content: .choices[0].message.content
+  }' "$response_file"
+}
+
+vsr_codex() {
+  require_command codex
+  C82_VSR_EPISODE_ID="c82-vsr-codex-$(date +%s)-$$"
+  export C82_VSR_EPISODE_ID
+  codex exec \
+    --model auto \
+    --config 'model_provider="c82_vsr"' \
+    --config 'model_providers.c82_vsr.name="C82 VSR"' \
+    --config "model_providers.c82_vsr.base_url=\"http://127.0.0.1:$envoy_port/v1\"" \
+    --config 'model_providers.c82_vsr.wire_api="responses"' \
+    --config 'model_providers.c82_vsr.requires_openai_auth=false' \
+    --config 'model_providers.c82_vsr.env_http_headers={"x-rayline-episode-id"="C82_VSR_EPISODE_ID"}' \
+    "Reply with exactly: C82_CODEX_VSR_OK"
+}
+
+vsr_claude() {
+  require_command claude
+  ANTHROPIC_BASE_URL="http://127.0.0.1:$envoy_port"
+  ANTHROPIC_API_KEY="local-vsr"
+  ANTHROPIC_CUSTOM_HEADERS="x-rayline-episode-id: c82-vsr-claude-$(date +%s)-$$"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  export ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_CUSTOM_HEADERS
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  claude --bare --model auto --no-session-persistence \
+    -p "Reply with exactly: C82_CLAUDE_VSR_OK"
+}
+
+vsr_pii() {
+  require_command curl
+  require_command jq
+  curl --fail-with-body --silent --show-error \
+    --max-time 180 \
+    --header "content-type: application/json" \
+    --data '{
+      "text": "Contact Ada Lovelace at ada@example.com or +1 415-555-0137.",
+      "options": {
+        "return_positions": true,
+        "mask_entities": true,
+        "reveal_entity_text": false
+      }
+    }' \
+    "http://127.0.0.1:$api_port/api/v1/classify/pii" \
+    | jq '{
+        live: true,
+        model: "llm-semantic-router/mmbert32k-pii-detector-merged",
+        has_pii,
+        entity_types: [.entities[].type] | unique,
+        entities,
+        masked_text,
+        security_recommendation,
+        processing_time_ms
+      }'
+}
+
+case "${1:-}" in
+  bootstrap)
+    load_shell_credentials
+    require_command cargo
+    cargo install --path "$repo_root/crates/rayline-daemon" --locked --root "$HOME/.rayline" --force
+    cargo install --path "$repo_root/crates/rayline-cli" --locked --root "$HOME/.rayline" --force
+    rayline_bin="$HOME/.rayline/bin/rayline"
+    rld_bin="$HOME/.rayline/bin/rld"
+    native_doctor
+    ;;
+  doctor)
+    native_doctor
+    ;;
+  demo-claude)
+    load_shell_credentials
+    require_native_bins
+    "$rayline_bin" claude --orchestrator c82 --route all -- \
+      -p "Reply with exactly: C82_CLAUDE_LIVE_OK"
+    ;;
+  start)
+    load_shell_credentials
+    require_native_bins
+    "$rayline_bin" router start --orchestrator c82 --route all
+    ;;
+  status)
+    if [[ -f "$rayline_bin" && -f "$rld_bin" ]]; then
+      export RLD_BIN="$rld_bin"
+      "$rayline_bin" router status || true
+    fi
+    docker ps \
+      --filter "label=com.docker.compose.project=c82-vsr-live" \
+      --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
+      2>/dev/null || true
+    ;;
+  stop)
+    if [[ -f "$rayline_bin" && -f "$rld_bin" ]]; then
+      export RLD_BIN="$rld_bin"
+      "$rayline_bin" router stop || true
+    fi
+    prepare_vsr_environment
+    compose down --remove-orphans
+    ;;
+  vsr-deploy)
+    load_shell_credentials
+    check_source_pins
+    ensure_modal_proxy_token
+    modern_modal deploy "$semantic_router_root/src/vllm-plugins/rayline_arc_io/modal_service.py"
+    ;;
+  vsr-auth)
+    ensure_modal_proxy_token
+    echo "Modal endpoint proxy authentication is ready."
+    ;;
+  vsr-start)
+    vsr_start
+    ;;
+  vsr-demo)
+    vsr_demo
+    ;;
+  vsr-codex)
+    vsr_codex
+    ;;
+  vsr-claude)
+    vsr_claude
+    ;;
+  vsr-pii)
+    vsr_pii
+    ;;
+  vsr-restart)
+    prepare_vsr_environment
+    compose restart redis router envoy
+    wait_for_url "http://127.0.0.1:$api_port/health" "VSR health"
+    wait_for_arc_readiness
+    wait_for_url "http://127.0.0.1:$api_port/ready" "VSR ARC readiness" 360
+    vsr_demo
+    ;;
+  vsr-logs)
+    prepare_vsr_environment
+    compose logs --follow --tail 160
+    ;;
+  vsr-stop)
+    prepare_vsr_environment
+    compose down --remove-orphans
+    ;;
+  *)
+    usage
+    [[ -z "${1:-}" ]] || exit 1
+    ;;
+esac

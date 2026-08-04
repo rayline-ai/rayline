@@ -33,6 +33,7 @@ rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-mtrouter = { path = "../rayline-mtrouter" }
 zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]

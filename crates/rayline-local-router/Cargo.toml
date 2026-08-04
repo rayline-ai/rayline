@@ -27,6 +27,8 @@ tokio.workspace = true
 tokio-stream = "0.1"
 tracing.workspace = true
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-mtrouter = { path = "../rayline-mtrouter" }
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

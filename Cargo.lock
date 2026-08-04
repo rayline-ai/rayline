@@ -1434,6 +1434,7 @@ dependencies = [
  "rayline-llama",
  "rayline-local-router",
  "rayline-metrics",
+ "rayline-mtrouter",
  "reqwest",
  "serde_json",
  "sha2",
@@ -1460,6 +1461,7 @@ dependencies = [
  "rayline-llama",
  "rayline-local-router",
  "rayline-metrics",
+ "rayline-mtrouter",
  "rayline-proxy",
  "reqwest",
  "serde",
@@ -1528,9 +1530,11 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rayline-metrics",
+ "rayline-mtrouter",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -1541,6 +1545,18 @@ name = "rayline-metrics"
 version = "0.2.6"
 dependencies = [
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "rayline-mtrouter"
+version = "0.2.6"
+dependencies = [
+ "anyhow",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -1787,6 +1803,16 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "safetensors"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc0cdb7198d738a111f6df8fef42cb175412c311d0c4ac9126ff4e550ad1a0e8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "schannel"

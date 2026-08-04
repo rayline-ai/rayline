@@ -5,6 +5,8 @@
 //! OSS-shaped milestone local/client-side only: static rules, configured
 //! provider endpoints, and local-model redirects.
 
+mod c82;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -24,6 +26,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
+use rayline_mtrouter::NativeEncoderOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
@@ -50,6 +53,18 @@ const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 const OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 const OPENAI_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
+pub const C82_ARTIFACT_COMMIT: &str = "5a723bbdd5e65aeec991e73c2453100f03f5ebd5";
+
+#[derive(Clone)]
+pub struct C82Options {
+    pub runtime_dir: PathBuf,
+    pub native_encoder: NativeEncoderOptions,
+    pub artifact_commit: String,
+    pub decision_log_path: PathBuf,
+    /// Fixed in production; configurable to provide a real network seam for
+    /// local integration tests.
+    pub openrouter_url: String,
+}
 
 #[derive(Clone)]
 pub struct LocalRouterOptions {
@@ -58,6 +73,7 @@ pub struct LocalRouterOptions {
     pub local_model_id: String,
     pub config_path: Option<PathBuf>,
     pub metrics: Option<SharedMetricsSink>,
+    pub c82: Option<C82Options>,
 }
 
 impl Default for LocalRouterOptions {
@@ -68,6 +84,7 @@ impl Default for LocalRouterOptions {
             local_model_id: "qwen3.6-35b-a3b-q4-k-m".to_owned(),
             config_path: None,
             metrics: None,
+            c82: None,
         }
     }
 }
@@ -181,6 +198,7 @@ struct AppState {
     http_ipv4: reqwest::Client,
     route_counter: Arc<AtomicU64>,
     started_at: String,
+    c82: Option<Arc<c82::C82Runtime>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -232,6 +250,10 @@ struct OpenAIPassthroughRequest<'a> {
 }
 
 pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
+    let c82 = match opts.c82.clone() {
+        Some(options) => Some(Arc::new(c82::C82Runtime::load(options).await?)),
+        None => None,
+    };
     let config = load_config(&opts)?;
     let mut subagent_keys = config.routes.subagents.keys().cloned().collect::<Vec<_>>();
     subagent_keys.sort();
@@ -266,6 +288,7 @@ pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
         http_ipv4: outbound_http_client(true)?,
         route_counter: Arc::new(AtomicU64::new(1)),
         started_at: chrono_like_now(),
+        c82,
     };
     loop {
         let (stream, _) = listener.accept().await?;
@@ -682,6 +705,7 @@ fn healthz_response(state: &AppState) -> Response<BoxBody> {
             "local_adapter_port": state.opts.local_adapter_port,
             "local_model_id": state.opts.local_model_id,
             "startedAt": state.started_at,
+            "orchestrator": state.c82.as_ref().map(|_| "c82"),
         }),
     )
 }
@@ -1123,6 +1147,11 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if let Some(runtime) = state.c82.as_ref() {
+        return runtime
+            .handle_messages(&headers, &parsed, state.opts.metrics.as_ref())
+            .await;
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic);
     let request_id = headers
         .get(REQUEST_ID_HEADER)
@@ -1219,6 +1248,12 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
 }
 
 async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
+    if state.c82.is_some() {
+        return Ok(json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            json!({"error":{"type":"unsupported_endpoint","message":"C82 currently supports Anthropic Messages only"}}),
+        ));
+    }
     let t_start = Instant::now();
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
@@ -5172,6 +5207,7 @@ mod tests {
             http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
+            c82: None,
         }
     }
 
@@ -6609,6 +6645,7 @@ mod tests {
             http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
+            c82: None,
         };
 
         // agent_type header is set but NO agent_id header — this triggers

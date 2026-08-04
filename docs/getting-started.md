@@ -225,6 +225,25 @@ the replacement:
 | `--routing-mode proxy` | `--route all` |
 | `--routing-mode proxy-subagents` | `--route subagents` |
 
+### Experimental C82 policy
+
+C82 is a separate, explicit local decision plane: its frozen encoder uses the
+user's Metal or CUDA GPU, while its seven selected workers are called through
+OpenRouter. It requires inherited private-Hugging-Face and OpenRouter
+credentials and does not store either one.
+
+```bash
+rayline orchestrator doctor c82
+rayline claude --orchestrator c82 --route all
+rayline claude --orchestrator c82 --route subagents
+```
+
+The routing scope is mandatory. C82 cannot be combined with `--local`,
+`--config`, `--model`, or `--via env`. The installation invokes a hash-pinned
+native libllama binary and BF16 GGUF.
+`--router-device` accepts `auto`, `mps`, `cuda`, or `cpu`; use
+`--router-memory-budget <GiB>` to impose a stricter readiness ceiling.
+
 ## Signing In to Hosted Rayline
 
 Skip this section if you only use `--local` — the local path never needs an

@@ -34,6 +34,7 @@ rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-metrics = { path = "../rayline-metrics" }
 rayline-local-router = { path = "../rayline-local-router" }
+rayline-mtrouter = { path = "../rayline-mtrouter" }
 rayline-adapter = { path = "../rayline-adapter" }
 rayline-injector = { path = "../rayline-injector" }
 rayline-proxy = { path = "../rayline-proxy" }

@@ -95,6 +95,8 @@ pub struct RouterStartRequest {
     /// `RAYLINE_ROUTER_API_KEY` (e.g. the `rayline auth login` key for a hosted
     /// cloud-router endpoint). When `None`, the normal resolution applies.
     pub router_api_key_override: Option<String>,
+    /// Immutable C82 native runtime coordinates.
+    pub c82: Option<crate::c82::StartConfig>,
     pub root_env_explicit: bool,
 }
 
@@ -111,6 +113,7 @@ pub struct LocalProxyStartRequest {
     pub diagnose: bool,
     pub upstream_ca_path: Option<PathBuf>,
     pub isolated: bool,
+    pub episode_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +121,7 @@ struct ProxyLocalConfig {
     local_model_id: String,
     adapter_port: u16,
     custom_mode: bool,
+    episode_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +166,9 @@ pub struct RouterStartCliRequest {
     /// The Codex run/app paths populate this via
     /// [`crate::codex::resolve_cloud_router_key`]; `None` falls back to the env.
     pub router_api_key_override: Option<String>,
+    pub orchestrator: Option<String>,
+    pub router_device: String,
+    pub router_memory_budget_gib: Option<String>,
 }
 
 impl RouterStatusRequest {
@@ -197,6 +204,7 @@ impl RouterStartRequest {
             proxy_routing_mode: PROXY_ROUTING_MODE_ALL.to_owned(),
             no_local_model: false,
             router_api_key_override: None,
+            c82: None,
             root_env_explicit,
         }
     }
@@ -1632,6 +1640,20 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             == crate::codex::EffectiveCodexAuthMode::Subscription;
     start_request.enable_proxy = !codex_mode;
 
+    if request.orchestrator.as_deref() == Some("c82") {
+        let c82 = crate::c82::start_config(
+            &home,
+            &request.router_device,
+            request.router_memory_budget_gib.as_deref(),
+        )
+        .await?;
+        start_request.c82 = Some(c82);
+        start_request.no_local_model = true;
+        start_request.local_model_id = "rayline/router".to_owned();
+        start_request.proxy_routing_mode = request.proxy_routing_mode.clone();
+        return finish_start_from_cli(&home, &start_request, &bin_path, false).await;
+    }
+
     // v2: `--config <file>` drives BOTH main + subagents for headless/agent use.
     // The local router reads the config's `endpoints` + `routes` directly; scope is
     // derived from `routes.main` (passthrough sentinel → selective-subagents, else
@@ -1869,6 +1891,7 @@ pub async fn start_local_proxy_from_home(
         local_model_id: request.local_model_id.clone(),
         adapter_port: request.adapter_port,
         custom_mode: request.custom_mode,
+        episode_prefix: request.episode_prefix.clone(),
     };
     start_proxy_from_home_with_client(
         home,
@@ -2078,6 +2101,8 @@ async fn start_from_home_with_client(
             client,
             pid: started.pid,
             injector_port: request.injector_port,
+            local_router_port: (request.decision_plane == DECISION_PLANE_LOCAL)
+                .then_some(request.local_router_port),
             requested_meta: &started.meta,
             proxy_port: if request.enable_proxy {
                 Some(request.proxy_port)
@@ -2319,6 +2344,20 @@ fn spawn_router(
         "--metrics-port",
         &metrics_port,
     ]);
+    if let Some(c82) = request.c82.as_ref() {
+        command
+            .arg("--c82-runtime-dir")
+            .arg(&c82.runtime_dir)
+            .arg("--c82-native-binary")
+            .arg(&c82.native_binary)
+            .arg("--c82-native-model")
+            .arg(&c82.native_model)
+            .args(["--c82-device", &c82.device])
+            .args(["--c82-episode-prefix", &c82.episode_prefix]);
+        if let Some(budget) = c82.memory_budget_gib.as_deref() {
+            command.args(["--c82-memory-budget-gib", budget]);
+        }
+    }
     if let Some(path) = request.router_config_path.as_deref() {
         command.arg("--router-config-path").arg(path);
     }
@@ -2486,6 +2525,9 @@ fn spawn_proxy(
         if local_config.custom_mode {
             command.arg("--local-custom");
         }
+        if let Some(prefix) = local_config.episode_prefix.as_deref() {
+            command.args(["--episode-prefix", prefix]);
+        }
         command.arg("--local-router-owns-metrics");
     }
     if let Some(metrics_url) = metrics_url {
@@ -2533,6 +2575,7 @@ struct RouterReadyWait<'a> {
     client: &'a reqwest::Client,
     pid: i32,
     injector_port: u16,
+    local_router_port: Option<u16>,
     requested_meta: &'a BTreeMap<String, String>,
     proxy_port: Option<u16>,
     timeout: Duration,
@@ -2553,6 +2596,12 @@ async fn wait_for_router_ready(state: RouterReadyWait<'_>, output: &mut String) 
             .as_ref()
             .is_some_and(|health| router_health_matches_meta(health, state.requested_meta));
         if injector_ready {
+            if let Some(local_router_port) = state.local_router_port
+                && healthz(state.client, local_router_port).await.is_none()
+            {
+                tokio::time::sleep(HEALTH_POLL).await;
+                continue;
+            }
             if let Some(proxy_port) = state.proxy_port {
                 if !healthz(state.client, proxy_port)
                     .await
@@ -2677,6 +2726,27 @@ fn router_meta(
         meta.insert("router_config_sha256".to_owned(), fingerprint);
     }
     meta.insert("local_model_id".to_owned(), request.local_model_id.clone());
+    if let Some(c82) = request.c82.as_ref() {
+        meta.insert("orchestrator".to_owned(), "c82".to_owned());
+        meta.insert(
+            "c82_runtime_dir".to_owned(),
+            c82.runtime_dir.display().to_string(),
+        );
+        meta.insert(
+            "c82_native_binary".to_owned(),
+            c82.native_binary.display().to_string(),
+        );
+        meta.insert(
+            "c82_native_model".to_owned(),
+            c82.native_model.display().to_string(),
+        );
+        meta.insert("c82_device".to_owned(), c82.device.clone());
+        meta.insert(
+            "c82_memory_budget_gib".to_owned(),
+            c82.memory_budget_gib.clone().unwrap_or_default(),
+        );
+        meta.insert("c82_episode_prefix".to_owned(), c82.episode_prefix.clone());
+    }
     meta.insert("adapter_port".to_owned(), request.adapter_port.to_string());
     meta.insert(
         "injector_port".to_owned(),
@@ -2819,6 +2889,10 @@ fn proxy_meta(
             "local_custom".to_owned(),
             local_config.custom_mode.to_string(),
         );
+        meta.insert(
+            "episode_prefix".to_owned(),
+            local_config.episode_prefix.clone().unwrap_or_default(),
+        );
     }
     if let Some(metrics_url) = metrics_url {
         meta.insert("metrics_url".to_owned(), metrics_url.to_owned());
@@ -2903,6 +2977,13 @@ fn format_meta(meta: &BTreeMap<String, String>) -> String {
         "router_config_path",
         "router_config_sha256",
         "local_model_id",
+        "orchestrator",
+        "c82_runtime_dir",
+        "c82_native_binary",
+        "c82_native_model",
+        "c82_device",
+        "c82_memory_budget_gib",
+        "c82_episode_prefix",
         "local_adapter_port",
         "local_custom",
         "adapter_port",

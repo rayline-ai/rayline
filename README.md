@@ -118,6 +118,53 @@ only ever need `--local`** — the other two are advanced overrides.
 The [Getting Started guide](docs/getting-started.md#choosing-where-requests-go)
 has the full matrix and every valid combination.
 
+### Experimental C82 orchestrator
+
+C82 is an experimental orchestrator that chooses among seven OpenRouter models
+on every agent turn. Its small routing encoder runs on your GPU through native
+libllama; the selected model call uses your OpenRouter account.
+
+The C82 weights are not publicly downloadable yet. Before using it, your
+Hugging Face account must have read access to the private
+[`rayline-ai/mtrouter-c82`](https://huggingface.co/rayline-ai/mtrouter-c82)
+repo. Create a read token for that account and expose it, along with your
+OpenRouter key, to the Rayline process:
+
+```bash
+export HF_TOKEN="hf_..."
+export OPENROUTER_API_KEY="sk-or-..."
+
+rayline orchestrator doctor c82
+```
+
+`doctor` downloads the immutable C82 bundle on first use, verifies every
+artifact hash, and confirms that the native encoder is active on Metal or CUDA.
+Then launch Claude Code with one explicit routing scope:
+
+```bash
+# Let C82 choose the model for every Claude Code turn.
+rayline claude --orchestrator c82 --route all
+
+# Keep the main Claude session unchanged; use C82 for subagents only.
+rayline claude --orchestrator c82 --route subagents
+```
+
+That is the complete setup: Rayline provisions and owns the local router
+lifecycle. It never stores either key. `--route subagents` uses your normal
+Claude login for the main agent. For diagnostics or constrained machines, add
+`--router-device auto|mps|cuda|cpu` or `--router-memory-budget <GiB>` to either
+command.
+
+C82 currently targets Apple Silicon Metal and NVIDIA CUDA. The private bundle
+pins the BF16 GGUF, Metal and CUDA helpers, libllama revision, policy weights,
+provider order, retry behavior, and pricing snapshot. It is an experimental
+serving path, not a production-promotion claim.
+
+For the complete native and vLLM Semantic Router development environment,
+including Modal ARC encoding, Codex/Claude Code smoke commands, and the
+mmBERT-32K PII model, see the
+[C82 development guide](docs/c82-development.md).
+
 ## Use Rayline From Code or Agents
 
 You can also send your own Anthropic API traffic through Rayline — from a script

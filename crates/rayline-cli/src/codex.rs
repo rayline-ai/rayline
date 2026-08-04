@@ -191,6 +191,9 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
         codex_auth_mode: request.auth_mode,
         root_env_explicit: request.root_env_explicit,
         router_api_key_override,
+        orchestrator: None,
+        router_device: "auto".to_owned(),
+        router_memory_budget_gib: None,
     };
     match crate::router::start_from_cli(&start_request).await {
         Ok(_) => {

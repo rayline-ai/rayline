@@ -4,6 +4,7 @@ use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+pub mod c82;
 pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
@@ -55,6 +56,7 @@ Commands:
   claude     Run Claude Code through Rayline routing
   codex      Run Codex CLI through Rayline local Responses routing
   router     Start, inspect, or stop the local Rayline router runtime
+  orchestrator  Inspect experimental local orchestrators
   top        Show live router request metrics
   local      Configure local model routing
   update     Check for or install a rayline launcher update
@@ -135,6 +137,9 @@ Options:
                                     main passes through; any endpoint routes it).
   --router-config-path <path>       Local-router static router JSON config
                                     (refines `--local`'s subagent allowlist)
+  --orchestrator <name>             Experimental local orchestrator (`c82`)
+  --router-device <device>          auto|mps|cuda|cpu (default: auto)
+  --router-memory-budget <GiB>      GPU memory ceiling for router KV state
   --help                            Show this message and exit
 ";
 
@@ -230,7 +235,21 @@ Options:
   --config <path>           Routing config (endpoints + routes) driving BOTH
                             main and subagents; scope derived from routes.main.
                             Overrides --route.
+  --orchestrator <name>     Experimental local orchestrator (`c82`)
+  --router-device <device>  auto|mps|cuda|cpu (default: auto)
+  --router-memory-budget <GiB>  GPU memory ceiling for router KV state
   --help                    Show this message and exit
+";
+
+const ORCHESTRATOR_HELP: &str = "\
+Usage: rayline orchestrator doctor c82 [OPTIONS]
+
+Provision and validate the immutable C82 artifact and native GPU runtime.
+
+Options:
+  --router-device <device>       auto|mps|cuda|cpu (default: auto)
+  --router-memory-budget <GiB>   GPU memory ceiling for router KV state
+  --help                         Show this message and exit
 ";
 
 const ROUTER_STATUS_HELP: &str = "\
@@ -473,6 +492,16 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        RaylineDispatch::OrchestratorDoctor(request) => match c82::doctor(&request).await {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::from(1)
+            }
+        },
         RaylineDispatch::RouterStart(request) => {
             match crate::router::start_from_cli(&request).await {
                 Ok(message) => {
@@ -710,6 +739,7 @@ pub enum RaylineDispatch {
     CodexRun(codex::RunRequest),
     CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
+    OrchestratorDoctor(c82::DoctorRequest),
     RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
     RouterLogs(router::RouterLogsRequest),
@@ -836,6 +866,9 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "router" => parse_router_dispatch(args, root_env_explicit)
+                .unwrap_or(RaylineDispatch::Unavailable),
+            "orchestrator" => parse_orchestrator_dispatch(args)
+                .map(RaylineDispatch::OrchestratorDoctor)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::Status)
@@ -1053,6 +1086,10 @@ where
     // engaging the on-device router without `--local`. Distinct from the legacy
     // `--router-config-path` (which only refines `--local`'s subagent allowlist).
     let mut config_path = None;
+    let mut orchestrator = None;
+    let mut router_device = "auto".to_owned();
+    let mut router_memory_budget_gib = None;
+    let mut router_runtime_option_seen = false;
     let mut claude_args = Vec::new();
 
     if args
@@ -1129,6 +1166,20 @@ where
                     config_path = Some(PathBuf::from(value));
                     continue;
                 }
+                "--orchestrator" => {
+                    orchestrator = Some(value.to_owned());
+                    continue;
+                }
+                "--router-device" => {
+                    router_device = crate::c82::validate_device(value)?;
+                    router_runtime_option_seen = true;
+                    continue;
+                }
+                "--router-memory-budget" => {
+                    router_memory_budget_gib = Some(crate::c82::validate_memory_budget(value)?);
+                    router_runtime_option_seen = true;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1196,6 +1247,21 @@ where
                 config_path = Some(PathBuf::from(args.next()?));
                 continue;
             }
+            "--orchestrator" => {
+                orchestrator = Some(args.next()?.to_str()?.to_owned());
+                continue;
+            }
+            "--router-device" => {
+                router_device = crate::c82::validate_device(args.next()?.to_str()?)?;
+                router_runtime_option_seen = true;
+                continue;
+            }
+            "--router-memory-budget" => {
+                router_memory_budget_gib =
+                    Some(crate::c82::validate_memory_budget(args.next()?.to_str()?)?);
+                router_runtime_option_seen = true;
+                continue;
+            }
             "--no-telemetry" => {
                 return None;
             }
@@ -1230,6 +1296,21 @@ where
     if config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
         return None;
     }
+    if let Some(name) = orchestrator.as_deref() {
+        if name != "c82"
+            || route_scope.is_none()
+            || local_router
+            || local_provider.is_some()
+            || model.is_some()
+            || config_path.is_some()
+            || router_config_path.is_some()
+            || matches!(via, Some(ViaArg::Env))
+        {
+            return None;
+        }
+    } else if router_runtime_option_seen {
+        return None;
+    }
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -1250,6 +1331,9 @@ where
         upstream_ca_path,
         router_config_path,
         config_path,
+        orchestrator,
+        router_device,
+        router_memory_budget_gib,
         root_env_explicit,
     })
 }
@@ -1643,6 +1727,12 @@ where
     let mut config_path = None;
     let mut api_mode = crate::router::ROUTER_API_MODE_ANTHROPIC.to_owned();
     let mut codex_auth_mode = crate::codex::CodexAuthMode::Auto;
+    let mut orchestrator = None;
+    let mut router_device = "auto".to_owned();
+    let mut router_memory_budget_gib = None;
+    let mut router_runtime_option_seen = false;
+    let mut route_scope_explicit = false;
+    let mut local_seen = false;
     while let Some(arg) = args.next() {
         let arg = arg.to_str()?;
         if arg == "--help" {
@@ -1651,6 +1741,7 @@ where
         // Accepted for symmetry with the routing surface; the router daemon is
         // inherently local, so this is a no-op.
         if arg == "--local" {
+            local_seen = true;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--mode=") {
@@ -1675,10 +1766,12 @@ where
         }
         if let Some(value) = arg.strip_prefix("--route=") {
             route_scope = parse_route_scope(value)?;
+            route_scope_explicit = true;
             continue;
         }
         if arg == "--route" {
             route_scope = parse_route_scope(args.next()?.to_str()?)?;
+            route_scope_explicit = true;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--config=") {
@@ -1689,6 +1782,47 @@ where
             config_path = Some(PathBuf::from(args.next()?));
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--orchestrator=") {
+            orchestrator = Some(value.to_owned());
+            continue;
+        }
+        if arg == "--orchestrator" {
+            orchestrator = Some(args.next()?.to_str()?.to_owned());
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--router-device=") {
+            router_device = crate::c82::validate_device(value)?;
+            router_runtime_option_seen = true;
+            continue;
+        }
+        if arg == "--router-device" {
+            router_device = crate::c82::validate_device(args.next()?.to_str()?)?;
+            router_runtime_option_seen = true;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--router-memory-budget=") {
+            router_memory_budget_gib = Some(crate::c82::validate_memory_budget(value)?);
+            router_runtime_option_seen = true;
+            continue;
+        }
+        if arg == "--router-memory-budget" {
+            router_memory_budget_gib =
+                Some(crate::c82::validate_memory_budget(args.next()?.to_str()?)?);
+            router_runtime_option_seen = true;
+            continue;
+        }
+        return None;
+    }
+    if let Some(name) = orchestrator.as_deref() {
+        if name != "c82"
+            || !route_scope_explicit
+            || local_seen
+            || config_path.is_some()
+            || api_mode != crate::router::ROUTER_API_MODE_ANTHROPIC
+        {
+            return None;
+        }
+    } else if router_runtime_option_seen {
         return None;
     }
     let proxy_routing_mode = match route_scope {
@@ -1703,6 +1837,40 @@ where
         codex_auth_mode,
         root_env_explicit,
         router_api_key_override: None,
+        orchestrator,
+        router_device,
+        router_memory_budget_gib,
+    })
+}
+
+fn parse_orchestrator_dispatch<'a, I>(
+    mut args: std::iter::Peekable<I>,
+) -> Option<crate::c82::DoctorRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    if args.next()?.to_str()? != "doctor" || args.next()?.to_str()? != "c82" {
+        return None;
+    }
+    let mut device = "auto".to_owned();
+    let mut memory_budget_gib = None;
+    while let Some(arg) = args.next() {
+        let arg = arg.to_str()?;
+        if let Some(value) = arg.strip_prefix("--router-device=") {
+            device = crate::c82::validate_device(value)?;
+        } else if arg == "--router-device" {
+            device = crate::c82::validate_device(args.next()?.to_str()?)?;
+        } else if let Some(value) = arg.strip_prefix("--router-memory-budget=") {
+            memory_budget_gib = Some(crate::c82::validate_memory_budget(value)?);
+        } else if arg == "--router-memory-budget" {
+            memory_budget_gib = Some(crate::c82::validate_memory_budget(args.next()?.to_str()?)?);
+        } else {
+            return None;
+        }
+    }
+    Some(crate::c82::DoctorRequest {
+        device,
+        memory_budget_gib,
     })
 }
 
@@ -2124,6 +2292,9 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["router", "logs"] => Some(ROUTER_LOGS_HELP),
         ["router", "top"] => Some(ROUTER_TOP_HELP),
         ["router", "stop"] => Some(ROUTER_STOP_HELP),
+        ["orchestrator"] | ["orchestrator", "doctor"] | ["orchestrator", "doctor", "c82"] => {
+            Some(ORCHESTRATOR_HELP)
+        }
         ["status"] => Some(STATUS_HELP),
         ["top"] => Some(ROUTER_TOP_HELP),
         ["update"] => Some(UPDATE_HELP),
@@ -2206,6 +2377,10 @@ fn is_value_option(arg: &str) -> bool {
             | "--local-injector-port"
             | "--upstream-ca-path"
             | "--router-config-path"
+            | "--config"
+            | "--orchestrator"
+            | "--router-device"
+            | "--router-memory-budget"
             | "--lines"
             | "--channel"
             | "--url"
@@ -2843,6 +3018,145 @@ mod tests {
             }
             other => panic!("expected RouterStart, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_c82_requires_explicit_scope_and_accepts_device_budget() {
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--orchestrator",
+            "c82",
+            "--route",
+            "all",
+            "--router-device",
+            "mps",
+            "--router-memory-budget",
+            "24",
+            "--",
+            "-p",
+            "hello",
+        ]);
+        assert_eq!(request.orchestrator.as_deref(), Some("c82"));
+        assert_eq!(request.routing_mode, RoutingMode::Proxy);
+        assert_eq!(request.router_device, "mps");
+        assert_eq!(request.router_memory_budget_gib.as_deref(), Some("24"));
+        assert_eq!(request.args, argv(&["-p", "hello"]));
+    }
+
+    #[test]
+    fn claude_c82_rejects_missing_scope_and_static_overrides() {
+        for args in [
+            vec!["rayline", "claude", "--orchestrator", "c82"],
+            vec![
+                "rayline",
+                "claude",
+                "--orchestrator",
+                "c82",
+                "--route",
+                "all",
+                "--model",
+                "x",
+            ],
+            vec![
+                "rayline",
+                "claude",
+                "--orchestrator",
+                "c82",
+                "--route",
+                "all",
+                "--local",
+            ],
+            vec![
+                "rayline",
+                "claude",
+                "--orchestrator",
+                "c82",
+                "--route",
+                "all",
+                "--config",
+                "x.json",
+            ],
+            vec![
+                "rayline",
+                "claude",
+                "--orchestrator",
+                "c82",
+                "--route",
+                "all",
+                "--via",
+                "env",
+            ],
+        ] {
+            assert_eq!(
+                rayline_dispatch_for_argv(&argv(&args)),
+                RaylineDispatch::Unavailable,
+                "must reject {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn router_start_accepts_c82_only_with_explicit_anthropic_scope() {
+        let RaylineDispatch::RouterStart(request) = rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "router",
+            "start",
+            "--mode",
+            "anthropic",
+            "--orchestrator",
+            "c82",
+            "--route",
+            "subagents",
+            "--router-device",
+            "cuda",
+        ])) else {
+            panic!("expected C82 RouterStart");
+        };
+        assert_eq!(request.orchestrator.as_deref(), Some("c82"));
+        assert_eq!(request.router_device, "cuda");
+        assert_eq!(
+            request.proxy_routing_mode,
+            crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
+        );
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "router",
+                "start",
+                "--orchestrator",
+                "c82",
+            ])),
+            RaylineDispatch::Unavailable
+        );
+    }
+
+    #[test]
+    fn orchestrator_doctor_parses_and_has_native_help() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "orchestrator",
+                "doctor",
+                "c82",
+                "--router-device=mps",
+                "--router-memory-budget=16",
+            ])),
+            RaylineDispatch::OrchestratorDoctor(crate::c82::DoctorRequest {
+                device: "mps".to_owned(),
+                memory_budget_gib: Some("16".to_owned()),
+            })
+        );
+        assert!(
+            rayline_help_for_argv(&argv(&[
+                "rayline",
+                "orchestrator",
+                "doctor",
+                "c82",
+                "--help"
+            ]))
+            .is_some()
+        );
     }
 
     #[test]
