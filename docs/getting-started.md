@@ -68,7 +68,11 @@ to the on-device model when one is available). Use `--auth none` for local/no
 hosted auth.
 
 Use `--model <name>` before `--` to request a different Rayline virtual or
-configured model.
+configured model. Without it the session sends the `rayline-router` sentinel and
+the router picks per request; naming a concrete model instead **pins** it, so the
+router's tiering is skipped. Two lanes ignore an inherited `claude-*` id by
+design — background haiku calls and Claude Code subagent turns. See
+[routing-modes](../examples/routing-modes/README.md#what-model-means-at-the-rayline-cloud-endpoint).
 
 ### Desktop app
 
