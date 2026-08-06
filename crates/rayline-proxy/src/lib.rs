@@ -13,7 +13,7 @@
 //! trust store), so corporate TLS-MITM roots validate without the MCP child
 //! needing to trust them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -24,12 +24,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
 pub use rayline_authcache::{
     AuthCache, MAX_AUTH_CACHE_ENTRIES, evict_auth_cache_overflow, new_auth_cache,
     stash_auth_headers,
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -39,6 +43,10 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
+use rayline_subscriptions::{
+    HeaderSnapshot, ResponseClassification, SessionAssignmentReason, SessionRouteStatus,
+    SessionStatusSnapshot, SubscriptionPoolRuntime, classify_response, derive_status_id,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     PublicKeyData,
@@ -46,7 +54,7 @@ use rcgen::{
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -67,6 +75,11 @@ const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// and unresolved, so main-thread traffic is never delayed.
 const AGENT_TYPE_RESOLVE_MAX_ATTEMPTS: usize = 6;
 const AGENT_TYPE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(40);
+const MAX_SUBSCRIPTION_ERROR_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SESSION_STATUS_BYTES: usize = 64 * 1024;
+const SESSION_STATUS_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const SESSION_STATUS_ASSIGNMENT_MAX_ATTEMPTS: usize = 6;
+const SESSION_STATUS_ASSIGNMENT_RETRY_DELAY: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 pub struct ProxyOptions {
@@ -111,6 +124,18 @@ pub struct ProxyOptions {
     /// id. The proxy still records Anthropic passthrough traffic.
     pub local_router_owns_metrics: bool,
     pub metrics: Option<SharedMetricsSink>,
+    /// Local-only Claude subscription pool used for Anthropic `/v1/messages`
+    /// passthrough legs. Credentials are read and refreshed by the daemon and
+    /// never sent to Rayline's hosted router.
+    pub subscription_pool: Option<Arc<SubscriptionPoolRuntime>>,
+    /// Directory containing one credential-free subscription assignment
+    /// snapshot per Claude Code launch. The launch id is hashed before it is
+    /// used as a filename. Best-effort: IO errors never fail proxy traffic.
+    pub session_status_dir: Option<PathBuf>,
+    /// Shared Claude Code config directory used only to resolve local session
+    /// metadata (for selective subagent routing). Credential source profiles
+    /// remain separate and are never used as Claude's runtime config.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 impl ProxyOptions {
@@ -139,6 +164,9 @@ impl ProxyOptions {
             selective_subagent_ids: Vec::new(),
             local_router_owns_metrics: false,
             metrics: None,
+            subscription_pool: None,
+            session_status_dir: None,
+            claude_config_dir: None,
         }
     }
 
@@ -177,6 +205,8 @@ struct AppState {
     ca: Arc<LocalCa>,
     route_status_generation: Arc<AtomicU64>,
     route_status_io: Arc<AsyncMutex<()>>,
+    session_status_generation: Arc<AtomicU64>,
+    session_status_io: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +275,8 @@ pub async fn serve(opts: ProxyOptions) -> Result<()> {
         ca: Arc::new(ca),
         route_status_generation: Arc::new(AtomicU64::new(0)),
         route_status_io: Arc::new(AsyncMutex::new(())),
+        session_status_generation: Arc::new(AtomicU64::new(0)),
+        session_status_io: Arc::new(AsyncMutex::new(())),
     };
 
     loop {
@@ -363,7 +395,8 @@ async fn handle_forward_proxy(
     is_anthropic: bool,
 ) -> Response<BoxBody> {
     let result = if is_anthropic {
-        forward_anthropic_request(state, req).await
+        let launch_id = proxy_launch_id(req.headers());
+        forward_anthropic_request(state, req, launch_id.as_deref()).await
     } else {
         forward_absolute_request(state, req).await
     };
@@ -412,7 +445,7 @@ async fn forward_absolute_request(
         parts.uri,
         status.as_u16()
     );
-    response_from_reqwest(resp, status, None, None, None, None).await
+    response_from_reqwest(resp, status, None, None, None, None, false).await
 }
 
 fn healthz_response(state: &AppState) -> Response<BoxBody> {
@@ -432,12 +465,39 @@ fn healthz_response(state: &AppState) -> Response<BoxBody> {
     )
 }
 
+fn proxy_launch_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(hyper::header::PROXY_AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, encoded) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    let (username, launch_id) = decoded.split_once(':')?;
+    if username != "rayline"
+        || launch_id.is_empty()
+        || launch_id.len() > 128
+        || !launch_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(launch_id.to_owned())
+}
+
 async fn handle_connect(state: AppState, req: Request<Incoming>, authority: String) -> Result<()> {
+    let launch_id = proxy_launch_id(req.headers());
     let upgraded = hyper::upgrade::on(req)
         .await
         .context("upgrade CONNECT stream")?;
     if is_anthropic_authority(&authority) {
-        intercept_anthropic_tls(state, upgraded).await
+        intercept_anthropic_tls(state, upgraded, launch_id).await
     } else {
         blind_tunnel(state, upgraded, &authority).await
     }
@@ -446,6 +506,7 @@ async fn handle_connect(state: AppState, req: Request<Incoming>, authority: Stri
 async fn intercept_anthropic_tls(
     state: AppState,
     upgraded: hyper::upgrade::Upgraded,
+    launch_id: Option<String>,
 ) -> Result<()> {
     let config = state.ca.server_config_for_host(ANTHROPIC_HOST)?;
     let acceptor = TlsAcceptor::from(config);
@@ -456,7 +517,10 @@ async fn intercept_anthropic_tls(
     let io = TokioIo::new(tls);
     let svc = service_fn(move |req| {
         let state = state.clone();
-        async move { Ok::<_, Infallible>(handle_anthropic_request(state, req).await) }
+        let launch_id = launch_id.clone();
+        async move {
+            Ok::<_, Infallible>(handle_anthropic_request(state, req, launch_id.as_deref()).await)
+        }
     });
     auto::Builder::new(TokioExecutor::new())
         .serve_connection(io, svc)
@@ -484,8 +548,12 @@ async fn blind_tunnel(
     Ok(())
 }
 
-async fn handle_anthropic_request(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
-    match forward_anthropic_request(state, req).await {
+async fn handle_anthropic_request(
+    state: AppState,
+    req: Request<Incoming>,
+    launch_id: Option<&str>,
+) -> Response<BoxBody> {
+    match forward_anthropic_request(state, req, launch_id).await {
         Ok(resp) => resp,
         Err(e) => {
             warn!("proxy forward error: {e}");
@@ -533,6 +601,7 @@ fn emit_if_agent_type_unresolved(
 async fn forward_anthropic_request(
     state: AppState,
     req: Request<Incoming>,
+    launch_id: Option<&str>,
 ) -> Result<Response<BoxBody>> {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
@@ -546,7 +615,11 @@ async fn forward_anthropic_request(
         .unwrap_or_else(|| "<none>".to_owned());
     let agent_id_present = agent_id != "<none>";
     let agent_type = if agent_id_present {
-        resolve_claude_code_agent_type_with_retry(&agent_id).await
+        resolve_claude_code_agent_type_with_retry(
+            &agent_id,
+            state.opts.claude_config_dir.as_deref(),
+        )
+        .await
     } else {
         None
     };
@@ -638,6 +711,31 @@ async fn forward_anthropic_request(
     let body_was_rewritten = routed.body_was_rewritten;
     let bytes = routed.body;
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
+
+    if decision.target == RouteTarget::Anthropic
+        && parts.method == Method::POST
+        && parts.uri.path() == "/v1/messages"
+        && let (Some(pool), Some(requested_model)) =
+            (state.opts.subscription_pool.as_ref(), body_model.as_deref())
+    {
+        return forward_subscription_request(SubscriptionForward {
+            state: &state,
+            pool,
+            launch_id: launch_id.unwrap_or_default(),
+            requested_model,
+            original_headers: &parts.headers,
+            method,
+            upstream_url: &upstream_url,
+            body: &bytes,
+            body_was_rewritten,
+            request_id: &request_id,
+            metrics: proxy_owns_metrics
+                .then(|| state.opts.metrics.clone())
+                .flatten(),
+        })
+        .await;
+    }
+
     let mut outbound = state
         .http
         .request(method.clone(), &upstream_url)
@@ -719,33 +817,54 @@ async fn forward_anthropic_request(
     // on *both* the normal path and the local-redirect path
     // (`X-Rayline-Selected-Model: "local"`), but the local adapter's response
     // does not. Write the sidecar here so both paths are covered.
-    if decision.target == RouteTarget::Router {
-        if let Some(path) = state.opts.route_status_path.clone() {
-            if let Some(route_status) =
-                RouteStatus::from_headers(resp.headers(), state.opts.local_model_id.as_deref())
-            {
-                if let Some(metrics) = state.opts.metrics.as_ref().filter(|_| proxy_owns_metrics) {
-                    metrics.record(MetricsUpdate::RouteDecided {
-                        request_id: request_id.clone(),
-                        route_id: route_status.route_id.clone(),
-                        target: route_status_target(&route_status),
-                        endpoint_id: None,
-                        selected_model: Some(route_status.selected_model.clone()),
-                        requested_model: route_status.virtual_model.clone(),
-                        policy: route_status.policy.clone(),
-                        task_class: route_status.task_class.clone(),
-                        agent_id: none_if_marker(&agent_id),
-                        agent_type: agent_type.clone(),
-                    });
-                }
-                let generation = state.route_status_generation.clone();
-                let io = state.route_status_io.clone();
-                tokio::spawn(async move {
-                    route_status
-                        .write_to_if_current(&path, generation, io, route_status_generation)
-                        .await;
-                });
-            }
+    if decision.target == RouteTarget::Router
+        && let Some(route_status) =
+            RouteStatus::from_headers(resp.headers(), state.opts.local_model_id.as_deref())
+    {
+        if let Some(metrics) = state.opts.metrics.as_ref().filter(|_| proxy_owns_metrics) {
+            metrics.record(MetricsUpdate::RouteDecided {
+                request_id: request_id.clone(),
+                route_id: route_status.route_id.clone(),
+                target: route_status_target(&route_status),
+                endpoint_id: None,
+                selected_model: Some(route_status.selected_model.clone()),
+                requested_model: route_status.virtual_model.clone(),
+                policy: route_status.policy.clone(),
+                task_class: route_status.task_class.clone(),
+                agent_id: none_if_marker(&agent_id),
+                agent_type: agent_type.clone(),
+            });
+        }
+        let pooled_launch_status = state.opts.subscription_pool.is_some()
+            && state.opts.session_status_dir.is_some()
+            && launch_id.is_some();
+        if !pooled_launch_status && let Some(path) = state.opts.route_status_path.clone() {
+            let global_route_status = route_status.clone();
+            let generation = state.route_status_generation.clone();
+            let io = state.route_status_io.clone();
+            tokio::spawn(async move {
+                global_route_status
+                    .write_to_if_current(&path, generation, io, route_status_generation)
+                    .await;
+            });
+        }
+        if let (Some(directory), Some(launch_id)) = (
+            state.opts.session_status_dir.clone(),
+            launch_id.map(str::to_owned),
+        ) {
+            let session_route_status = route_status.to_session_status();
+            let generation = Arc::clone(&state.session_status_generation);
+            let io = Arc::clone(&state.session_status_io);
+            tokio::spawn(async move {
+                write_session_route_status(
+                    &directory,
+                    &launch_id,
+                    &session_route_status,
+                    generation,
+                    io,
+                )
+                .await;
+            });
         }
     }
 
@@ -790,8 +909,613 @@ async fn forward_anthropic_request(
             .flatten(),
         Some(request_id),
         Some(approximate_input_tokens(&bytes)),
+        false,
     )
     .await
+}
+
+struct SubscriptionForward<'a> {
+    state: &'a AppState,
+    pool: &'a SubscriptionPoolRuntime,
+    launch_id: &'a str,
+    requested_model: &'a str,
+    original_headers: &'a HeaderMap,
+    method: reqwest::Method,
+    upstream_url: &'a str,
+    body: &'a Bytes,
+    body_was_rewritten: bool,
+    request_id: &'a str,
+    metrics: Option<SharedMetricsSink>,
+}
+
+struct BufferedUpstream {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+}
+
+async fn forward_subscription_request(
+    request: SubscriptionForward<'_>,
+) -> Result<Response<BoxBody>> {
+    let mut excluded = HashSet::new();
+    let mut final_failover_response = None;
+    let mut pending_assignment_reason = None;
+
+    while excluded.len() < request.pool.account_count() {
+        let selected = match request
+            .pool
+            .select(request.launch_id, request.requested_model, &excluded)
+            .await
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                return match final_failover_response {
+                    Some(response) => {
+                        buffered_upstream_response(response, request.metrics, request.request_id)
+                    }
+                    None => {
+                        warn!(
+                            "subscription pool={} has no eligible account for model={}: {}",
+                            request.pool.pool_id(),
+                            request.requested_model,
+                            error
+                        );
+                        if matches!(
+                            error,
+                            rayline_subscriptions::SubscriptionRuntimeError::NoUsableCredentials { .. }
+                        ) {
+                            Ok(subscription_credentials_unavailable_response(
+                                request.pool.pool_id(),
+                            ))
+                        } else {
+                            Ok(subscription_exhausted_response(
+                                request.pool.pool_id(),
+                                request.requested_model,
+                            ))
+                        }
+                    }
+                };
+            }
+        };
+        let account_id = selected.account_id.clone();
+        let assignment_reason = pending_assignment_reason
+            .take()
+            .unwrap_or(selected.assignment_reason);
+        debug!(
+            "subscription placement pool={} account={} model={} reason={:?} score={} active_global_leases={} active_model_leases={}",
+            request.pool.pool_id(),
+            account_id,
+            selected.model,
+            assignment_reason,
+            selected
+                .placement_score
+                .map(|score| format!("{score:.3}"))
+                .unwrap_or_else(|| "unknown".to_owned()),
+            selected.active_global_leases,
+            selected.active_model_leases
+        );
+        write_subscription_status(&request, &account_id, assignment_reason).await;
+        let mut access_token = selected.access_token;
+        let mut refreshed_after_unauthorized = false;
+
+        loop {
+            let mut outbound = request
+                .state
+                .http
+                .request(request.method.clone(), request.upstream_url)
+                .body(request.body.to_vec());
+            for (name, value) in request.original_headers.iter() {
+                if request.body_was_rewritten && *name == hyper::header::CONTENT_LENGTH {
+                    continue;
+                }
+                if name.as_str().eq_ignore_ascii_case(REQUEST_ID_HEADER)
+                    || is_hop_by_hop(name)
+                    || is_subscription_auth_header(name)
+                {
+                    continue;
+                }
+                outbound = outbound.header(name.as_str(), value.as_bytes());
+            }
+            outbound = outbound
+                .header(REQUEST_ID_HEADER, request.request_id)
+                .bearer_auth(access_token.expose());
+
+            let response = match outbound.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(metrics) = request.metrics.as_ref() {
+                        metrics.record(MetricsUpdate::RequestErrored {
+                            request_id: request.request_id.to_owned(),
+                            status_code: None,
+                            error: format!("Anthropic subscription request failed: {error}"),
+                        });
+                    }
+                    // A network failure may have happened after Anthropic accepted
+                    // the request. Never replay it against another subscription.
+                    return Err(error.into());
+                }
+            };
+            let status = response.status();
+            let headers = subscription_header_snapshot(response.headers());
+
+            if status.is_success() {
+                request.pool.observe_response_headers(
+                    &account_id,
+                    request.requested_model,
+                    &headers,
+                )?;
+                write_subscription_status(&request, &account_id, assignment_reason).await;
+                debug!(
+                    "subscription pool={} account={} model={} status={}",
+                    request.pool.pool_id(),
+                    account_id,
+                    request.requested_model,
+                    status.as_u16()
+                );
+                return response_from_reqwest(
+                    response,
+                    status,
+                    None,
+                    request.metrics,
+                    Some(request.request_id.to_owned()),
+                    Some(approximate_input_tokens(request.body)),
+                    true,
+                )
+                .await;
+            }
+
+            let buffered = buffer_subscription_response(response).await?;
+            match classify_response(status.as_u16(), &headers, Some(&buffered.body)) {
+                ResponseClassification::RefreshCredential if !refreshed_after_unauthorized => {
+                    refreshed_after_unauthorized = true;
+                    match request
+                        .pool
+                        .refresh_after_unauthorized(&account_id, &access_token)
+                        .await
+                    {
+                        Ok(refreshed) => {
+                            access_token = refreshed;
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(
+                                "subscription pool={} account={} refresh failed: {}",
+                                request.pool.pool_id(),
+                                account_id,
+                                error
+                            );
+                            final_failover_response = Some(buffered);
+                            pending_assignment_reason =
+                                Some(SessionAssignmentReason::CredentialFailover);
+                        }
+                    }
+                }
+                ResponseClassification::RefreshCredential => {
+                    let _ = request.pool.mark_credential_unavailable(
+                        &account_id,
+                        "Anthropic rejected the refreshed OAuth credential",
+                    );
+                    final_failover_response = Some(buffered);
+                    pending_assignment_reason = Some(SessionAssignmentReason::CredentialFailover);
+                }
+                ResponseClassification::FailoverQuota { .. } => {
+                    // Only a classified quota rejection is authoritative enough
+                    // to mark response-header claims exhausted. Transient 429s
+                    // can carry partial unified headers and must not poison the
+                    // account's allowance snapshot.
+                    request.pool.observe_response_headers(
+                        &account_id,
+                        request.requested_model,
+                        &headers,
+                    )?;
+                    write_subscription_status(&request, &account_id, assignment_reason).await;
+                    final_failover_response = Some(buffered);
+                    pending_assignment_reason = Some(SessionAssignmentReason::QuotaFailover);
+                }
+                ResponseClassification::EntitlementRejected { .. } => {
+                    request
+                        .pool
+                        .mark_entitlement_unavailable(&account_id, request.requested_model)?;
+                    final_failover_response = Some(buffered);
+                    pending_assignment_reason = Some(SessionAssignmentReason::EntitlementFailover);
+                }
+                ResponseClassification::TransientRateLimit
+                | ResponseClassification::ProviderOverloaded
+                | ResponseClassification::PassThrough
+                | ResponseClassification::Success => {
+                    return buffered_upstream_response(
+                        buffered,
+                        request.metrics,
+                        request.request_id,
+                    );
+                }
+            }
+
+            warn!(
+                "subscription pool={} account={} unavailable for model={}; trying another account",
+                request.pool.pool_id(),
+                account_id,
+                request.requested_model
+            );
+            request
+                .pool
+                .clear_affinity(request.launch_id, request.requested_model, &account_id);
+            excluded.insert(account_id.clone());
+            break;
+        }
+    }
+
+    match final_failover_response {
+        Some(response) => buffered_upstream_response(response, request.metrics, request.request_id),
+        None => Ok(subscription_exhausted_response(
+            request.pool.pool_id(),
+            request.requested_model,
+        )),
+    }
+}
+
+async fn write_subscription_status(
+    request: &SubscriptionForward<'_>,
+    account_id: &str,
+    reason: SessionAssignmentReason,
+) {
+    let Some(directory) = request.state.opts.session_status_dir.as_deref() else {
+        return;
+    };
+    let snapshot = match request.pool.session_status(
+        request.launch_id,
+        request.requested_model,
+        account_id,
+        reason,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(
+                "could not build subscription status for pool={} account={}: {}",
+                request.pool.pool_id(),
+                account_id,
+                error
+            );
+            return;
+        }
+    };
+    write_session_status_snapshot(
+        directory,
+        request.launch_id,
+        &snapshot,
+        Arc::clone(&request.state.session_status_generation),
+        Arc::clone(&request.state.session_status_io),
+    )
+    .await;
+}
+
+fn subscription_exhausted_response(pool_id: &str, requested_model: &str) -> Response<BoxBody> {
+    json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": format!(
+                    "Claude subscription pool {pool_id:?} has no remaining included allowance for model {requested_model:?}"
+                )
+            }
+        }),
+    )
+}
+
+fn subscription_credentials_unavailable_response(pool_id: &str) -> Response<BoxBody> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!(
+                    "Claude subscription pool {pool_id:?} has no usable OAuth credential; run `rayline subscriptions status --verbose` for the account-specific error"
+                )
+            }
+        }),
+    )
+}
+
+async fn write_session_status_snapshot(
+    directory: &Path,
+    launch_id: &str,
+    snapshot: &SessionStatusSnapshot,
+    generation: Arc<AtomicU64>,
+    io: Arc<AsyncMutex<()>>,
+) {
+    update_session_status_snapshot(
+        directory,
+        launch_id,
+        SessionStatusUpdate::Assignment(snapshot),
+        generation,
+        io,
+    )
+    .await;
+}
+
+async fn write_session_route_status(
+    directory: &Path,
+    launch_id: &str,
+    route: &SessionRouteStatus,
+    generation: Arc<AtomicU64>,
+    io: Arc<AsyncMutex<()>>,
+) {
+    let destination = directory.join(format!("{}.json", derive_status_id(launch_id)));
+    for attempt in 0..SESSION_STATUS_ASSIGNMENT_MAX_ATTEMPTS {
+        let assignment_exists = tokio::fs::symlink_metadata(&destination)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+        if assignment_exists {
+            break;
+        }
+        if attempt + 1 == SESSION_STATUS_ASSIGNMENT_MAX_ATTEMPTS {
+            return;
+        }
+        tokio::time::sleep(SESSION_STATUS_ASSIGNMENT_RETRY_DELAY).await;
+    }
+    update_session_status_snapshot(
+        directory,
+        launch_id,
+        SessionStatusUpdate::Route(route),
+        generation,
+        io,
+    )
+    .await;
+}
+
+enum SessionStatusUpdate<'a> {
+    Assignment(&'a SessionStatusSnapshot),
+    Route(&'a SessionRouteStatus),
+}
+
+async fn update_session_status_snapshot(
+    directory: &Path,
+    launch_id: &str,
+    update: SessionStatusUpdate<'_>,
+    generation: Arc<AtomicU64>,
+    io: Arc<AsyncMutex<()>>,
+) {
+    let _guard = io.lock().await;
+    if !prepare_private_status_directory(directory).await {
+        return;
+    }
+    let sequence = generation.fetch_add(1, Ordering::Relaxed);
+    if sequence.is_multiple_of(256) {
+        cleanup_stale_session_status(directory).await;
+    }
+
+    let status_id = derive_status_id(launch_id);
+    let destination = directory.join(format!("{status_id}.json"));
+    if tokio::fs::symlink_metadata(&destination)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        warn!(
+            "refusing to replace non-regular subscription status file {}",
+            destination.display()
+        );
+        return;
+    }
+
+    let existing = read_session_status_snapshot(&destination).await;
+    let snapshot = match update {
+        SessionStatusUpdate::Assignment(snapshot) => {
+            let mut snapshot = snapshot.clone();
+            if let Some(route) = existing.and_then(|existing| existing.route) {
+                snapshot.route = Some(route);
+            }
+            snapshot
+        }
+        SessionStatusUpdate::Route(route) => {
+            let Some(mut snapshot) = existing else {
+                return;
+            };
+            snapshot.route = Some(route.clone());
+            snapshot.updated_at_unix = route.updated_at_unix;
+            snapshot
+        }
+    };
+    let Ok(serialized) = serde_json::to_vec_pretty(&snapshot) else {
+        return;
+    };
+    if serialized.len() > MAX_SESSION_STATUS_BYTES {
+        warn!(
+            "subscription status snapshot for pool={} exceeded {} bytes",
+            snapshot.pool_id, MAX_SESSION_STATUS_BYTES
+        );
+        return;
+    }
+
+    let temporary = directory.join(format!(
+        ".{status_id}.tmp-{}-{sequence}",
+        std::process::id()
+    ));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let Ok(mut file) = options.open(&temporary).await else {
+        return;
+    };
+    if file.write_all(&serialized).await.is_err() || file.flush().await.is_err() {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return;
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    if tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .await
+        .is_err()
+    {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return;
+    }
+
+    if tokio::fs::rename(&temporary, &destination).await.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+}
+
+async fn read_session_status_snapshot(path: &Path) -> Option<SessionStatusSnapshot> {
+    let metadata = tokio::fs::symlink_metadata(path).await.ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_SESSION_STATUS_BYTES as u64
+    {
+        return None;
+    }
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_STATUS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    if bytes.len() > MAX_SESSION_STATUS_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn prepare_private_status_directory(directory: &Path) -> bool {
+    match tokio::fs::symlink_metadata(directory).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            warn!(
+                "subscription status path is not a regular directory: {}",
+                directory.display()
+            );
+            return false;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if tokio::fs::create_dir_all(directory).await.is_err() {
+                return false;
+            }
+            let Ok(metadata) = tokio::fs::symlink_metadata(directory).await else {
+                return false;
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+
+    #[cfg(unix)]
+    if tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    true
+}
+
+async fn cleanup_stale_session_status(directory: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let valid_status_name = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(rayline_subscriptions::is_valid_status_id);
+        if !valid_status_name {
+            continue;
+        }
+        let Ok(metadata) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age > SESSION_STATUS_RETENTION);
+        if stale {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+}
+
+fn is_subscription_auth_header(name: &HeaderName) -> bool {
+    name == hyper::header::AUTHORIZATION || name.as_str().eq_ignore_ascii_case("x-api-key")
+}
+
+fn subscription_header_snapshot(headers: &reqwest::header::HeaderMap) -> HeaderSnapshot {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str(), value.to_owned()))
+        })
+        .collect()
+}
+
+async fn buffer_subscription_response(response: reqwest::Response) -> Result<BufferedUpstream> {
+    use futures::StreamExt as _;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_ERROR_BYTES {
+            return Err(anyhow!(
+                "Anthropic subscription error response exceeded {MAX_SUBSCRIPTION_ERROR_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(BufferedUpstream {
+        status,
+        headers,
+        body: Bytes::from(body),
+    })
+}
+
+fn buffered_upstream_response(
+    response: BufferedUpstream,
+    metrics: Option<SharedMetricsSink>,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    let mut builder = Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        if is_hop_by_hop_str(name.as_str()) || name == reqwest::header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    if let Some(metrics) = metrics {
+        metrics.record(MetricsUpdate::RequestErrored {
+            request_id: request_id.to_owned(),
+            status_code: Some(response.status.as_u16()),
+            error: format!(
+                "Anthropic subscription request returned HTTP {}",
+                response.status.as_u16()
+            ),
+        });
+    }
+    builder
+        .header(hyper::header::CONTENT_LENGTH, response.body.len())
+        .body(full_body(response.body))
+        .map_err(Into::into)
+}
+
+fn is_unified_limit_header(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .starts_with("anthropic-ratelimit-unified-")
 }
 
 fn proxy_owns_metrics_for_route(opts: &ProxyOptions, target: RouteTarget) -> bool {
@@ -820,7 +1544,7 @@ async fn forward_local_redirect(
     let resp = outbound.send().await?;
     let status = resp.status();
     debug!("local redirect {location} -> status={}", status.as_u16());
-    response_from_reqwest(resp, status, None, None, None, None).await
+    response_from_reqwest(resp, status, None, None, None, None, false).await
 }
 
 fn stash_router_auth_for_local_redirect(state: &AppState, location: Option<&str>) {
@@ -842,6 +1566,7 @@ async fn response_from_reqwest(
     metrics: Option<SharedMetricsSink>,
     request_id: Option<String>,
     estimated_input_tokens: Option<u64>,
+    strip_unified_limits: bool,
 ) -> Result<Response<BoxBody>> {
     let content_type = resp
         .headers()
@@ -856,7 +1581,9 @@ async fn response_from_reqwest(
         .map(str::to_owned);
     let mut headers_out = HeaderMap::new();
     for (k, v) in resp.headers().iter() {
-        if is_hop_by_hop_str(k.as_str()) {
+        if is_hop_by_hop_str(k.as_str())
+            || (strip_unified_limits && is_unified_limit_header(k.as_str()))
+        {
             continue;
         }
         if k == reqwest::header::LOCATION {
@@ -1880,6 +2607,20 @@ impl RouteStatus {
         })
     }
 
+    fn to_session_status(&self) -> SessionRouteStatus {
+        SessionRouteStatus {
+            selected_model: self.selected_model.clone(),
+            virtual_model: self.virtual_model.clone(),
+            policy: self.policy.clone(),
+            task_class: self.task_class.clone(),
+            route_id: self.route_id.clone(),
+            updated_at_unix: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0),
+        }
+    }
+
     /// Atomically write the status to `path` (temp file + rename). Best-effort:
     /// any IO error is swallowed so a sidecar problem never affects the proxied
     /// request. The temp filename is keyed by route id (and falls back to the
@@ -2267,21 +3008,23 @@ fn subagent_filter_allows(
         })
 }
 
-fn resolve_claude_code_agent_type(agent_id: &str) -> Option<String> {
-    let filename = format!("agent-{agent_id}.meta.json");
-    resolve_claude_code_agent_type_from_roots(
-        &filename,
-        &claude_projects_roots(),
-        env::current_dir().ok().as_deref(),
-    )
-}
-
 /// Resolve the subagent type, briefly retrying to absorb the race between
 /// Claude Code writing `agent-<id>.meta.json` and the subagent's first request
 /// reaching the proxy. Returns as soon as the type resolves; only loops while
 /// it is still unresolved, up to a bounded total wait.
-async fn resolve_claude_code_agent_type_with_retry(agent_id: &str) -> Option<String> {
-    retry_until_some(|| resolve_claude_code_agent_type(agent_id)).await
+async fn resolve_claude_code_agent_type_with_retry(
+    agent_id: &str,
+    config_dir: Option<&Path>,
+) -> Option<String> {
+    let filename = format!("agent-{agent_id}.meta.json");
+    retry_until_some(|| {
+        resolve_claude_code_agent_type_from_roots(
+            &filename,
+            &claude_projects_roots_from(config_dir.map(Path::to_owned), claude_home_dir()),
+            env::current_dir().ok().as_deref(),
+        )
+    })
+    .await
 }
 
 /// Call `resolve` up to `AGENT_TYPE_RESOLVE_MAX_ATTEMPTS` times, returning the
@@ -2299,13 +3042,6 @@ where
         }
     }
     None
-}
-
-fn claude_projects_roots() -> Vec<PathBuf> {
-    claude_projects_roots_from(
-        env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        claude_home_dir(),
-    )
 }
 
 /// Resolve the user's home directory cross-platform. `HOME` alone is wrong on
@@ -3407,6 +4143,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_basic_auth_carries_only_a_valid_opaque_launch_id() {
+        use base64::Engine as _;
+
+        let mut headers = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("rayline:launch_abc-123");
+        headers.insert(
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
+        assert_eq!(proxy_launch_id(&headers).as_deref(), Some("launch_abc-123"));
+
+        let invalid = base64::engine::general_purpose::STANDARD.encode("rayline:launch/unsafe");
+        headers.insert(
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {invalid}")).unwrap(),
+        );
+        assert_eq!(proxy_launch_id(&headers), None);
+    }
+
     fn classify(method: Method, target: &str) -> ProxyAction {
         classify_proxy_request(&method, &target.parse::<Uri>().unwrap())
     }
@@ -3551,6 +4307,9 @@ mod tests {
             selective_subagent_ids: Vec::new(),
             local_router_owns_metrics: false,
             metrics: None,
+            subscription_pool: None,
+            session_status_dir: None,
+            claude_config_dir: None,
         };
         let state = AppState {
             opts: Arc::new(opts),
@@ -3559,6 +4318,8 @@ mod tests {
             ca: Arc::new(LocalCa::generate().unwrap()),
             route_status_generation: Arc::new(AtomicU64::new(0)),
             route_status_io: Arc::new(AsyncMutex::new(())),
+            session_status_generation: Arc::new(AtomicU64::new(0)),
+            session_status_io: Arc::new(AsyncMutex::new(())),
         };
 
         stash_router_auth_for_local_redirect(
@@ -3725,6 +4486,87 @@ mod tests {
         let headers = header_map(&[("x-rayline-selected-model", "local")]);
         let status = RouteStatus::from_headers(&headers, None).unwrap();
         assert_eq!(status.selected_model, "local");
+    }
+
+    #[tokio::test]
+    async fn launch_status_merges_route_and_later_assignment_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = Arc::new(AtomicU64::new(0));
+        let io = Arc::new(AsyncMutex::new(()));
+        let mut assignment = SessionStatusSnapshot {
+            schema: rayline_subscriptions::SESSION_STATUS_SCHEMA,
+            pool_id: "default".to_owned(),
+            assignment: rayline_subscriptions::SessionAssignmentStatus {
+                primary_account_id: "a".to_owned(),
+                current_account_id: "a".to_owned(),
+                current_model_family: "sonnet".to_owned(),
+                kind: rayline_subscriptions::SessionAssignmentKind::Primary,
+                reason: SessionAssignmentReason::BalancedNewLaunch,
+                assigned_at_unix: 100,
+                last_seen_at_unix: 100,
+            },
+            capacity: rayline_subscriptions::SessionCapacityStatus {
+                usage_snapshot_fresh: true,
+                effective_headroom: Some(0.8),
+                bottleneck: None,
+                applicable: Vec::new(),
+                eligible_accounts: 2,
+                total_accounts: 2,
+            },
+            placement: rayline_subscriptions::SessionPlacementStatus {
+                strategy: "balanced_sessions".to_owned(),
+                score: Some(0.8),
+                active_global_leases: 1,
+                active_model_leases: 1,
+            },
+            route: None,
+            updated_at_unix: 100,
+        };
+        write_session_status_snapshot(
+            dir.path(),
+            "launch",
+            &assignment,
+            Arc::clone(&generation),
+            Arc::clone(&io),
+        )
+        .await;
+
+        let route = SessionRouteStatus {
+            selected_model: "glm-4.6".to_owned(),
+            virtual_model: Some("rayline-router".to_owned()),
+            policy: Some("balanced".to_owned()),
+            task_class: Some("debugging".to_owned()),
+            route_id: Some("route-1".to_owned()),
+            updated_at_unix: 101,
+        };
+        write_session_route_status(
+            dir.path(),
+            "launch",
+            &route,
+            Arc::clone(&generation),
+            Arc::clone(&io),
+        )
+        .await;
+
+        assignment.assignment.current_account_id = "b".to_owned();
+        assignment.assignment.kind = rayline_subscriptions::SessionAssignmentKind::ModelOverride;
+        assignment.updated_at_unix = 102;
+        write_session_status_snapshot(dir.path(), "launch", &assignment, generation, io).await;
+
+        let path = dir
+            .path()
+            .join(format!("{}.json", derive_status_id("launch")));
+        let merged: SessionStatusSnapshot =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(merged.assignment.current_account_id, "b");
+        assert_eq!(
+            merged
+                .route
+                .as_ref()
+                .map(|route| route.selected_model.as_str()),
+            Some("glm-4.6")
+        );
+        assert_eq!(merged.updated_at_unix, 102);
     }
 
     #[tokio::test]

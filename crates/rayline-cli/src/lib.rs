@@ -16,6 +16,7 @@ pub mod providers;
 pub mod router;
 pub mod router_config;
 pub mod status;
+pub mod subscriptions;
 pub mod update;
 
 pub const CLI_BIN: &str = "rayline";
@@ -57,6 +58,7 @@ Commands:
   router     Start, inspect, or stop the local Rayline router runtime
   top        Show live router request metrics
   local      Configure local model routing
+  subscriptions  Manage local Claude subscription pools
   update     Check for or install a rayline launcher update
 ";
 
@@ -135,7 +137,57 @@ Options:
                                     main passes through; any endpoint routes it).
   --router-config-path <path>       Local-router static router JSON config
                                     (refines `--local`'s subagent allowlist)
+  --subscription-pool <name>        Use a local multi-subscription pool for
+                                    Anthropic passthrough requests
+  --subscription-config <path>      Subscription registry (default:
+                                    ~/.config/rayline/subscriptions.json)
   --help                            Show this message and exit
+";
+
+const SUBSCRIPTIONS_HELP: &str = "\
+Usage: rayline subscriptions COMMAND
+
+Manage local Claude subscription pools. Credential profiles are used only for
+OAuth credentials; Claude Code itself uses one shared control config directory.
+
+Commands:
+  add       Register an existing Claude credential profile
+  remove    Remove a profile from a pool
+  list      List pools without reading credentials
+  status    Poll and show each account's limit pools
+";
+
+const SUBSCRIPTIONS_ADD_HELP: &str = "\
+Usage: rayline subscriptions add <account-id> --claude-config-dir <path> [OPTIONS]
+
+Options:
+  --pool <name>                     Pool name (default: default)
+  --config <path>                   Subscription registry path
+  --control-config-dir <path>       Shared Claude Code config directory
+                                    (default: ~/.claude)
+";
+
+const SUBSCRIPTIONS_REMOVE_HELP: &str = "\
+Usage: rayline subscriptions remove <account-id> [OPTIONS]
+
+Options:
+  --pool <name>       Pool name (default: default)
+  --config <path>     Subscription registry path
+";
+
+const SUBSCRIPTIONS_LIST_HELP: &str = "\
+Usage: rayline subscriptions list [--config <path>] [--json]
+";
+
+const SUBSCRIPTIONS_STATUS_HELP: &str = "\
+Usage: rayline subscriptions status [OPTIONS]
+
+Options:
+  --pool <name>       Pool name (default: default)
+  --config <path>     Subscription registry path
+  --verbose, -v       Show every normalized limit claim and placement detail
+  --json              Emit the complete machine-readable status
+  --live-only         Fail when no pool daemon is running instead of reading credentials
 ";
 
 const CODEX_HELP: &str = "\
@@ -461,6 +513,16 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
+        RaylineDispatch::Subscriptions(command) => match subscriptions::run(&command).await {
+            Ok(message) => {
+                print!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::from(1)
+            }
+        },
         RaylineDispatch::CodexRun(request) => codex::run(request).await,
         RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
         RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
@@ -707,6 +769,7 @@ pub enum RaylineDispatch {
     AuthToken(status::AuthTokenRequest),
     AuthLogout(status::AuthLogoutRequest),
     ClaudeRun(claude::RunRequest),
+    Subscriptions(subscriptions::SubscriptionCommand),
     CodexRun(codex::RunRequest),
     CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
@@ -831,6 +894,9 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             "claude" => parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::ClaudeRun)
                 .unwrap_or(RaylineDispatch::Unavailable),
+            "subscriptions" => parse_subscriptions_dispatch(args)
+                .map(RaylineDispatch::Subscriptions)
+                .unwrap_or(RaylineDispatch::Unavailable),
             "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
@@ -851,6 +917,104 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
     }
 
     RaylineDispatch::Unavailable
+}
+
+fn parse_subscriptions_dispatch<'a, I>(
+    mut args: std::iter::Peekable<I>,
+) -> Option<subscriptions::SubscriptionCommand>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let command = args.next()?.to_str()?;
+    let mut pool_id = "default".to_owned();
+    let mut config_path = None;
+    let mut claude_config_dir = None;
+    let mut control_config_dir = None;
+    let mut json = false;
+    let mut verbose = false;
+    let mut live_only = false;
+    let mut account_id = None;
+
+    if matches!(command, "add" | "remove") {
+        let value = args.next()?.to_str()?;
+        if value.starts_with('-') {
+            return None;
+        }
+        account_id = Some(value.to_owned());
+    }
+
+    while let Some(argument) = args.next() {
+        let argument = argument.to_str()?;
+        if argument == "--help" {
+            return None;
+        }
+        if let Some((option, value)) = argument.split_once('=') {
+            match option {
+                "--pool" => pool_id = value.to_owned(),
+                "--config" => config_path = Some(PathBuf::from(value)),
+                "--claude-config-dir" => claude_config_dir = Some(PathBuf::from(value)),
+                "--control-config-dir" => control_config_dir = Some(PathBuf::from(value)),
+                _ => return None,
+            }
+            continue;
+        }
+        match argument {
+            "--pool" => pool_id = args.next()?.to_str()?.to_owned(),
+            "--config" => config_path = Some(PathBuf::from(args.next()?)),
+            "--claude-config-dir" => {
+                claude_config_dir = Some(PathBuf::from(args.next()?));
+            }
+            "--control-config-dir" => {
+                control_config_dir = Some(PathBuf::from(args.next()?));
+            }
+            "--json" => json = true,
+            "--verbose" | "-v" => verbose = true,
+            "--live-only" if command == "status" => live_only = true,
+            _ => return None,
+        }
+    }
+
+    match command {
+        "add" => Some(subscriptions::SubscriptionCommand::Add {
+            account_id: account_id?,
+            pool_id,
+            config_path,
+            claude_config_dir: claude_config_dir?,
+            control_config_dir,
+        }),
+        "remove"
+            if claude_config_dir.is_none() && control_config_dir.is_none() && !json && !verbose =>
+        {
+            Some(subscriptions::SubscriptionCommand::Remove {
+                account_id: account_id?,
+                pool_id,
+                config_path,
+            })
+        }
+        "list"
+            if account_id.is_none()
+                && claude_config_dir.is_none()
+                && control_config_dir.is_none()
+                && !verbose
+                && pool_id == "default" =>
+        {
+            Some(subscriptions::SubscriptionCommand::List { config_path, json })
+        }
+        "status"
+            if account_id.is_none()
+                && claude_config_dir.is_none()
+                && control_config_dir.is_none() =>
+        {
+            Some(subscriptions::SubscriptionCommand::Status {
+                pool_id,
+                config_path,
+                json,
+                verbose,
+                live_only,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_auth_dispatch<'a, I>(
@@ -1053,6 +1217,8 @@ where
     // engaging the on-device router without `--local`. Distinct from the legacy
     // `--router-config-path` (which only refines `--local`'s subagent allowlist).
     let mut config_path = None;
+    let mut subscription_pool = None;
+    let mut subscription_config_path = None;
     let mut claude_args = Vec::new();
 
     if args
@@ -1129,6 +1295,14 @@ where
                     config_path = Some(PathBuf::from(value));
                     continue;
                 }
+                "--subscription-pool" => {
+                    subscription_pool = Some(value.to_owned());
+                    continue;
+                }
+                "--subscription-config" => {
+                    subscription_config_path = Some(PathBuf::from(value));
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1196,6 +1370,14 @@ where
                 config_path = Some(PathBuf::from(args.next()?));
                 continue;
             }
+            "--subscription-pool" => {
+                subscription_pool = Some(args.next()?.to_str()?.to_owned());
+                continue;
+            }
+            "--subscription-config" => {
+                subscription_config_path = Some(PathBuf::from(args.next()?));
+                continue;
+            }
             "--no-telemetry" => {
                 return None;
             }
@@ -1230,7 +1412,20 @@ where
     if config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
         return None;
     }
-    let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
+    if subscription_config_path.is_some() && subscription_pool.is_none() {
+        subscription_pool = Some("default".to_owned());
+    }
+    if subscription_pool.is_some()
+        && (matches!(via, Some(ViaArg::Env))
+            || isolated
+            || matches!(route_scope, Some(RouteScope::All)))
+    {
+        return None;
+    }
+    let mut routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
+    if subscription_pool.is_some() && route_scope.is_none() {
+        routing_mode = crate::claude::RoutingMode::ProxySubagents;
+    }
 
     Some(crate::claude::RunRequest {
         env_name,
@@ -1250,6 +1445,8 @@ where
         upstream_ca_path,
         router_config_path,
         config_path,
+        subscription_pool,
+        subscription_config_path,
         root_env_explicit,
     })
 }
@@ -2102,6 +2299,11 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["auth", "status"] => Some(AUTH_STATUS_HELP),
         ["auth", "token"] => Some(AUTH_TOKEN_HELP),
         ["claude"] | ["claude", "run"] => Some(CLAUDE_HELP),
+        ["subscriptions"] => Some(SUBSCRIPTIONS_HELP),
+        ["subscriptions", "add"] => Some(SUBSCRIPTIONS_ADD_HELP),
+        ["subscriptions", "remove"] => Some(SUBSCRIPTIONS_REMOVE_HELP),
+        ["subscriptions", "list"] => Some(SUBSCRIPTIONS_LIST_HELP),
+        ["subscriptions", "status"] => Some(SUBSCRIPTIONS_STATUS_HELP),
         ["codex"] => Some(CODEX_HELP),
         ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
@@ -2164,7 +2366,12 @@ fn command_path_before_help(original_argv: &[OsString]) -> Option<Vec<&str>> {
         command.push(arg);
     }
 
-    if command.is_empty() || matches!(command.as_slice(), ["auth"] | ["local"] | ["router"]) {
+    if command.is_empty()
+        || matches!(
+            command.as_slice(),
+            ["auth"] | ["local"] | ["router"] | ["subscriptions"]
+        )
+    {
         Some(command)
     } else {
         None
@@ -2206,6 +2413,12 @@ fn is_value_option(arg: &str) -> bool {
             | "--local-injector-port"
             | "--upstream-ca-path"
             | "--router-config-path"
+            | "--config"
+            | "--subscription-pool"
+            | "--subscription-config"
+            | "--pool"
+            | "--control-config-dir"
+            | "--claude-config-dir"
             | "--lines"
             | "--channel"
             | "--url"
@@ -2228,6 +2441,43 @@ mod tests {
             panic!("expected ClaudeRun for {args:?}");
         };
         request
+    }
+
+    #[test]
+    fn subscriptions_status_parses_verbose_flag() {
+        let dispatch =
+            rayline_dispatch_for_argv(&argv(&["rayline", "subscriptions", "status", "--verbose"]));
+        assert_eq!(
+            dispatch,
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
+                pool_id: "default".to_owned(),
+                config_path: None,
+                json: false,
+                verbose: true,
+                live_only: false,
+            })
+        );
+    }
+
+    #[test]
+    fn subscriptions_status_parses_live_only_flag() {
+        let dispatch = rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "subscriptions",
+            "status",
+            "--json",
+            "--live-only",
+        ]));
+        assert_eq!(
+            dispatch,
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
+                pool_id: "default".to_owned(),
+                config_path: None,
+                json: true,
+                verbose: false,
+                live_only: true,
+            })
+        );
     }
 
     // ── Connection mechanism resolution (the two-axis model) ──────────────
@@ -2277,6 +2527,82 @@ mod tests {
         assert_eq!(
             resolve_routing_mode(false, Some(ViaArg::Proxy), None),
             Some(RoutingMode::Proxy)
+        );
+    }
+
+    #[test]
+    fn subscription_pool_defaults_to_passthrough_main_and_shared_config() {
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--subscription-pool",
+            "team",
+            "--subscription-config",
+            "/tmp/subscriptions.json",
+        ]);
+        assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
+        assert_eq!(request.subscription_pool.as_deref(), Some("team"));
+        assert_eq!(
+            request.subscription_config_path.as_deref(),
+            Some(std::path::Path::new("/tmp/subscriptions.json"))
+        );
+        assert!(!request.isolated);
+    }
+
+    #[test]
+    fn subscription_pool_rejects_env_isolation_and_route_all() {
+        for args in [
+            &[
+                "rayline",
+                "claude",
+                "--subscription-pool",
+                "team",
+                "--via",
+                "env",
+            ][..],
+            &[
+                "rayline",
+                "claude",
+                "--subscription-pool",
+                "team",
+                "--isolated",
+            ],
+            &[
+                "rayline",
+                "claude",
+                "--subscription-pool",
+                "team",
+                "--route",
+                "all",
+            ],
+        ] {
+            assert_eq!(
+                rayline_dispatch_for_argv(&argv(args)),
+                RaylineDispatch::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn parses_subscription_management_commands() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "subscriptions",
+                "add",
+                "work",
+                "--claude-config-dir",
+                "/tmp/claude-work",
+                "--pool",
+                "team",
+            ])),
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Add {
+                account_id: "work".to_owned(),
+                pool_id: "team".to_owned(),
+                config_path: None,
+                claude_config_dir: PathBuf::from("/tmp/claude-work"),
+                control_config_dir: None,
+            })
         );
     }
 

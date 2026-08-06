@@ -69,10 +69,13 @@ const PROXY_CA_CERT_PATH_ENV: &str = "RAYLINE_PROXY_CA_CERT_PATH";
 const PROXY_CA_KEY_PATH_ENV: &str = "RAYLINE_PROXY_CA_KEY_PATH";
 const UPSTREAM_CA_FILE_ENV: &str = "RAYLINE_UPSTREAM_CA_FILE";
 const ROUTE_STATUS_PATH_ENV: &str = "RAYLINE_ROUTE_STATUS_PATH";
+const SESSION_STATUS_DIR_ENV: &str = "RAYLINE_SESSION_STATUS_DIR";
 const ANTHROPIC_URL_ENV: &str = "RAYLINE_ANTHROPIC_URL";
 const PROXY_ROUTING_MODE_ENV: &str = "RAYLINE_PROXY_ROUTING_MODE";
 const METRICS_PORT_ENV: &str = "RAYLINE_METRICS_PORT";
 const METRICS_URL_ENV: &str = "RAYLINE_METRICS_URL";
+const SUBSCRIPTION_CONFIG_ENV: &str = "RAYLINE_SUBSCRIPTION_CONFIG";
+const SUBSCRIPTION_POOL_ENV: &str = "RAYLINE_SUBSCRIPTION_POOL";
 
 /// Per-line marker for structured progress events emitted to stderr. The
 /// The launcher parses these to render a live progress bar while
@@ -106,7 +109,7 @@ enum Cmd {
     Serve(ServeArgs),
     /// Run only the transparent Claude Code HTTPS proxy (foreground).
     Proxy(ProxyArgs),
-    /// Render the router's per-turn picked model for a Claude Code status line.
+    /// Render Rayline route and subscription data for a Claude Code status line.
     Statusline(StatuslineArgs),
     /// Inspect cached GGUFs.
     Models {
@@ -118,9 +121,21 @@ enum Cmd {
 #[derive(clap::Args, Debug, Clone)]
 struct StatuslineArgs {
     /// Path to the router-decision sidecar written by the proxy. Defaults to
-    /// Defaults to the brand-specific router status sidecar path.
+    /// the brand-specific router status sidecar path.
     #[arg(long, env = ROUTE_STATUS_PATH_ENV)]
     route_status_path: Option<PathBuf>,
+
+    /// Directory containing launch-scoped Claude subscription assignments.
+    #[arg(long, env = SESSION_STATUS_DIR_ENV)]
+    session_status_dir: Option<PathBuf>,
+
+    /// Status fragment to render.
+    #[arg(long, value_enum, default_value_t = statusline::StatuslineComponent::All)]
+    component: statusline::StatuslineComponent,
+
+    /// Emit machine-readable JSON instead of a rendered text fragment.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -242,6 +257,14 @@ struct ServeArgs {
     /// serves; local availability is advertised as unavailable.
     #[arg(long, env = NO_LOCAL_MODEL_ENV)]
     no_local_model: bool,
+
+    /// Multi-subscription registry used by Anthropic passthrough routes.
+    #[arg(long, env = SUBSCRIPTION_CONFIG_ENV)]
+    subscription_config: Option<PathBuf>,
+
+    /// Pool name in --subscription-config (defaults to "default").
+    #[arg(long, env = SUBSCRIPTION_POOL_ENV)]
+    subscription_pool: Option<String>,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -316,6 +339,14 @@ struct ProxyArgs {
     /// self-hosts metrics (i.e. when --metrics-url is not set).
     #[arg(long, env = METRICS_PORT_ENV, default_value_t = rayline_metrics::DEFAULT_METRICS_PORT, hide = true)]
     metrics_port: u16,
+
+    /// Multi-subscription registry used by Anthropic passthrough routes.
+    #[arg(long, env = SUBSCRIPTION_CONFIG_ENV)]
+    subscription_config: Option<PathBuf>,
+
+    /// Pool name in --subscription-config (defaults to "default").
+    #[arg(long, env = SUBSCRIPTION_POOL_ENV)]
+    subscription_pool: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -353,7 +384,12 @@ async fn main() -> Result<()> {
         Cmd::Serve(args) => run_serve(args).await,
         Cmd::Proxy(args) => run_proxy(args).await,
         Cmd::Statusline(args) => {
-            statusline::run(resolve_route_status_path(args.route_status_path));
+            statusline::run(
+                resolve_route_status_path(args.route_status_path),
+                resolve_session_status_dir(args.session_status_dir),
+                args.component,
+                args.json,
+            );
             Ok(())
         }
         Cmd::Models {
@@ -425,7 +461,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     let metrics = RouterMetrics::new("rayline-router");
     let metrics_sink: SharedMetricsSink = metrics.clone();
     let metrics_listener = bind_metrics_control(args.metrics_port).await?;
-    spawn_metrics_control(metrics, metrics_listener);
 
     let data_dir = args
         .data_dir
@@ -641,6 +676,17 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
         opts.local_router_owns_metrics = args.decision_plane == DecisionPlaneArg::Local;
         opts.metrics = Some(metrics_sink.clone());
+        if let Some(subscription) = load_subscription_pool(
+            args.subscription_config.as_deref(),
+            args.subscription_pool.as_deref(),
+            rayline_proxy::DEFAULT_ANTHROPIC_URL,
+        )
+        .await?
+        {
+            opts.subscription_pool = Some(subscription.runtime);
+            opts.claude_config_dir = Some(subscription.control_config_dir);
+            opts.session_status_dir = Some(resolve_session_status_dir(None));
+        }
         Some(opts)
     } else {
         None
@@ -656,6 +702,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
+    let live_subscription_pool = proxy_opts
+        .as_ref()
+        .and_then(|opts| opts.subscription_pool.clone());
+    spawn_metrics_control(metrics, metrics_listener, live_subscription_pool);
 
     // Stop the bundled llama-server on exit; a no-op in custom mode (no manager).
     let stop_llama = |manager: &Option<rayline_llama::LlamaServerManager>| {
@@ -781,6 +831,17 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
     opts.routing_mode = args.proxy_routing_mode.into();
     opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
     opts.local_router_owns_metrics = args.local_router_owns_metrics;
+    if let Some(subscription) = load_subscription_pool(
+        args.subscription_config.as_deref(),
+        args.subscription_pool.as_deref(),
+        &opts.anthropic_url,
+    )
+    .await?
+    {
+        opts.subscription_pool = Some(subscription.runtime);
+        opts.claude_config_dir = Some(subscription.control_config_dir);
+        opts.session_status_dir = Some(resolve_session_status_dir(None));
+    }
     // Forward to a serve daemon when one owns metrics; otherwise self-host so
     // `rayline top` works for cloud-only and isolated proxy sessions too.
     opts.metrics = match proxy_metrics_plan(args.metrics_url.as_deref(), args.metrics_port) {
@@ -794,7 +855,7 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
             // data path. Degrade to no metrics for this session instead.
             match bind_metrics_control(metrics_port).await {
                 Ok(listener) => {
-                    spawn_metrics_control(metrics, listener);
+                    spawn_metrics_control(metrics, listener, opts.subscription_pool.clone());
                     Some(sink)
                 }
                 Err(error) => {
@@ -815,6 +876,105 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
         opts.ca_cert_path.display()
     );
     rayline_proxy::serve(opts).await
+}
+
+async fn load_subscription_pool(
+    config_path: Option<&Path>,
+    pool_id: Option<&str>,
+    anthropic_base_url: &str,
+) -> Result<Option<LoadedSubscriptionPool>> {
+    let Some(config_path) = config_path else {
+        if pool_id.is_some() {
+            return Err(anyhow!(
+                "--subscription-pool requires --subscription-config"
+            ));
+        }
+        return Ok(None);
+    };
+    let metadata = std::fs::symlink_metadata(config_path)
+        .with_context(|| format!("inspect subscription pool config {}", config_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!(
+            "subscription pool config {} must be a regular file, not a symlink",
+            config_path.display()
+        ));
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err(anyhow!(
+            "subscription pool config {} exceeds 1 MiB",
+            config_path.display()
+        ));
+    }
+    let bytes = std::fs::read(config_path).with_context(|| {
+        format!(
+            "read subscription pool config from {}",
+            config_path.display()
+        )
+    })?;
+    let config: rayline_subscriptions::SubscriptionPoolsConfig = serde_json::from_slice(&bytes)
+        .with_context(|| {
+            format!(
+                "parse subscription pool config from {}",
+                config_path.display()
+            )
+        })?;
+    config
+        .validate()
+        .context("validate subscription pool config")?;
+    let pool_id = pool_id.unwrap_or("default");
+    let pool = config
+        .pools
+        .get(pool_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("subscription pool {pool_id:?} does not exist"))?;
+    let control_config_dir = expand_home_path(&pool.control_config_dir)?
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "resolve subscription control config directory {}",
+                pool.control_config_dir.display()
+            )
+        })?;
+    if !control_config_dir.is_dir() {
+        return Err(anyhow!(
+            "subscription control config directory {} is not a directory",
+            control_config_dir.display()
+        ));
+    }
+    let options = rayline_subscriptions::SubscriptionRuntimeOptions {
+        anthropic_base_url: anthropic_base_url.to_owned(),
+        ..Default::default()
+    };
+    let runtime =
+        rayline_subscriptions::SubscriptionPoolRuntime::start(pool_id, pool, options).await?;
+    let _ = runtime.spawn_monitor();
+    info!(
+        "subscription pool={} ready accounts={}",
+        runtime.pool_id(),
+        runtime.account_count()
+    );
+    Ok(Some(LoadedSubscriptionPool {
+        runtime,
+        control_config_dir,
+    }))
+}
+
+struct LoadedSubscriptionPool {
+    runtime: Arc<rayline_subscriptions::SubscriptionPoolRuntime>,
+    control_config_dir: PathBuf,
+}
+
+fn expand_home_path(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"));
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(suffix))
+            .ok_or_else(|| anyhow!("home directory not found"));
+    }
+    Ok(path.to_owned())
 }
 
 /// How a proxy-mode launch wires up metrics. A serve daemon, when present, owns
@@ -874,9 +1034,13 @@ async fn bind_metrics_control(port: u16) -> Result<TcpListener> {
     Ok(listener)
 }
 
-fn spawn_metrics_control(metrics: Arc<RouterMetrics>, listener: TcpListener) {
+fn spawn_metrics_control(
+    metrics: Arc<RouterMetrics>,
+    listener: TcpListener,
+    subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
+) {
     tokio::spawn(async move {
-        if let Err(error) = serve_metrics_control(metrics, listener).await {
+        if let Err(error) = serve_metrics_control(metrics, listener, subscription_pool).await {
             warn!("metrics control server exited: {error}");
         }
     });
@@ -897,15 +1061,25 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBo
         .unwrap()
 }
 
-async fn serve_metrics_control(metrics: Arc<RouterMetrics>, listener: TcpListener) -> Result<()> {
+async fn serve_metrics_control(
+    metrics: Arc<RouterMetrics>,
+    listener: TcpListener,
+    subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
+) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let metrics = metrics.clone();
+        let subscription_pool = subscription_pool.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let metrics = metrics.clone();
-                async move { Ok::<_, Infallible>(handle_metrics_control(metrics, req).await) }
+                let subscription_pool = subscription_pool.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        handle_metrics_control(metrics, subscription_pool, req).await,
+                    )
+                }
             });
             if let Err(error) = auto::Builder::new(TokioExecutor::new())
                 .serve_connection(io, svc)
@@ -919,6 +1093,7 @@ async fn serve_metrics_control(metrics: Arc<RouterMetrics>, listener: TcpListene
 
 async fn handle_metrics_control(
     metrics: Arc<RouterMetrics>,
+    subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
     match (req.method().clone(), req.uri().path()) {
@@ -929,6 +1104,13 @@ async fn handle_metrics_control(
         (Method::GET, "/v1/router/top/snapshot") => {
             json_response(StatusCode::OK, serde_json::json!(metrics.snapshot()))
         }
+        (Method::GET, "/v1/subscriptions/status") => match subscription_pool {
+            Some(pool) => json_response(StatusCode::OK, serde_json::json!(pool.status())),
+            None => json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"ok": false, "error": "subscription pool unavailable"}),
+            ),
+        },
         (Method::POST, "/v1/router/top/update") => {
             let body = match req.into_body().collect().await {
                 Ok(body) => body.to_bytes(),
@@ -1005,6 +1187,19 @@ fn resolve_route_status_path(explicit: Option<PathBuf>) -> PathBuf {
             .join(RAYLINE_DAEMON_BIN_NAME)
             .join("route-status.json")
     })
+}
+
+fn resolve_session_status_dir(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| std::env::var_os(SESSION_STATUS_DIR_ENV).map(PathBuf::from))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(RAYLINE_DOT_CONFIG_DIR)
+                .join(RAYLINE_DAEMON_BIN_NAME)
+                .join("subscriptions")
+                .join("session-status")
+        })
 }
 
 fn router_api_key() -> Result<String> {
@@ -1261,7 +1456,7 @@ mod tests {
         let metrics = RouterMetrics::new("rayline-proxy");
         let listener = bind_metrics_control(0).await.expect("bind metrics control");
         let port = listener.local_addr().expect("listener addr").port();
-        spawn_metrics_control(metrics, listener);
+        spawn_metrics_control(metrics, listener, None);
 
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
@@ -1272,6 +1467,13 @@ mod tests {
         for key in ["ok", "totals", "active", "recent"] {
             assert!(body.get(key).is_some(), "snapshot missing `{key}`: {body}");
         }
+
+        let subscriptions = client
+            .get(format!("http://127.0.0.1:{port}/v1/subscriptions/status"))
+            .send()
+            .await
+            .expect("subscription status request");
+        assert_eq!(subscriptions.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[test]

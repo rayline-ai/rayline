@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::join_all;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -158,6 +159,153 @@ async fn spawn_fake_local_model() -> FakeHttpServer {
                                 .status(StatusCode::OK)
                                 .header("content-type", "application/json")
                                 .body(Full::new(body))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    FakeHttpServer { port, captured }
+}
+
+async fn spawn_fake_subscription_anthropic() -> FakeHttpServer {
+    let port = free_port();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_task = captured.clone();
+    tokio::spawn(async move {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let captured = captured_for_task.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let captured = captured.clone();
+                    async move {
+                        let request = capture_request(req).await;
+                        let path = request.path_and_query.clone();
+                        let authorization = request.header("authorization").unwrap_or_default();
+                        let body_json = serde_json::from_slice::<serde_json::Value>(&request.body)
+                            .unwrap_or_default();
+                        captured.lock().unwrap().push(request);
+
+                        if path == "/api/oauth/usage" {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"five_hour":{"utilization":10},"seven_day":{"utilization":20},"extra_usage":{"is_enabled":false},"limits":[{"kind":"weekly_scoped","group":"fable_weekly","percent":30,"scope":{"model":{"display_name":"Fable"}}}]}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+
+                        if path == "/v1/messages" && authorization == "Bearer token-stale" {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"authentication_error","message":"expired"}}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+
+                        if path == "/v1/messages" && authorization == "Bearer token-invalid" {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"authentication_error","message":"invalid"}}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+
+                        if path == "/v1/messages"
+                            && authorization == "Bearer token-a"
+                            && body_json["model"]
+                                .as_str()
+                                .is_some_and(|model| model.contains("generic-limit"))
+                        {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::TOO_MANY_REQUESTS)
+                                    .header("content-type", "application/json")
+                                    .header("x-should-retry", "true")
+                                    // A provider-capacity 429 may still carry a
+                                    // partial claim snapshot. The overall
+                                    // allowed status means this is not quota
+                                    // evidence and must not poison pool state.
+                                    .header("anthropic-ratelimit-unified-status", "allowed")
+                                    .header(
+                                        "anthropic-ratelimit-unified-representative-claim",
+                                        "7d",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-7d-status",
+                                        "rejected",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-reset",
+                                        "2030-01-07T00:00:00Z",
+                                    )
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"rate_limit_error","message":"transient"}}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+
+                        if path == "/v1/messages"
+                            && authorization == "Bearer token-a"
+                            && body_json["model"]
+                                .as_str()
+                                .is_some_and(|model| model.contains("fable"))
+                        {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::TOO_MANY_REQUESTS)
+                                    .header("content-type", "application/json")
+                                    .header("anthropic-ratelimit-unified-status", "rejected")
+                                    .header(
+                                        "anthropic-ratelimit-unified-representative-claim",
+                                        "7d_oi",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-7d_oi-status",
+                                        "rejected",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-reset",
+                                        "2030-01-07T00:00:00Z",
+                                    )
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"type":"error","error":{"type":"rate_limit_error","message":"weekly model limit reached"}}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .header("anthropic-ratelimit-unified-status", "allowed")
+                                .header("anthropic-ratelimit-unified-representative-claim", "5h")
+                                .header("anthropic-ratelimit-unified-5h-utilization", "0.25")
+                                .body(Full::new(Bytes::from(format!(
+                                    r#"{{"ok":true,"account":"{}"}}"#,
+                                    authorization.trim_start_matches("Bearer ")
+                                ))))
                                 .unwrap(),
                         )
                     }
@@ -327,6 +475,66 @@ fn proxied_client(proxy_port: u16, ca_cert_path: &Path) -> reqwest::Client {
         .unwrap()
 }
 
+fn proxied_client_with_launch(
+    proxy_port: u16,
+    ca_cert_path: &Path,
+    launch_id: &str,
+) -> reqwest::Client {
+    let proxy_ca = std::fs::read(ca_cert_path).unwrap();
+    reqwest::Client::builder()
+        .proxy(
+            reqwest::Proxy::all(format!("http://rayline:{launch_id}@127.0.0.1:{proxy_port}"))
+                .unwrap(),
+        )
+        .add_root_certificate(reqwest::Certificate::from_pem(&proxy_ca).unwrap())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+}
+
+fn write_subscription_credential(config_dir: &Path, access_token: &str) {
+    std::fs::create_dir_all(config_dir).unwrap();
+    std::fs::write(
+        config_dir.join(".credentials.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access_token,
+                "refreshToken": format!("refresh-{access_token}"),
+                "expiresAt": 4_000_000_000_000_i64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "max"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn subscription_pool_config(
+    control_dir: &Path,
+    account_a: &Path,
+    account_b: &Path,
+) -> rayline_subscriptions::SubscriptionPoolConfig {
+    rayline_subscriptions::SubscriptionPoolConfig {
+        control_config_dir: control_dir.to_owned(),
+        accounts: vec![
+            rayline_subscriptions::SubscriptionAccountConfig {
+                id: "a".to_owned(),
+                credential_source: rayline_subscriptions::CredentialSourceConfig {
+                    claude_config_dir: account_a.to_owned(),
+                },
+            },
+            rayline_subscriptions::SubscriptionAccountConfig {
+                id: "b".to_owned(),
+                credential_source: rayline_subscriptions::CredentialSourceConfig {
+                    claude_config_dir: account_b.to_owned(),
+                },
+            },
+        ],
+        policy: Default::default(),
+    }
+}
+
 #[tokio::test]
 async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
     init_tracing();
@@ -410,6 +618,688 @@ async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
         Some("Bearer claude-oauth".to_string())
     );
     assert_eq!(anthropic_seen[0].header("x-api-key"), None);
+}
+
+#[tokio::test]
+async fn subscription_pool_fails_over_only_the_exhausted_model_pool() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    write_subscription_credential(&account_b, "token-b");
+
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let session_status_dir = temp.path().join("session-status");
+    opts.session_status_dir = Some(session_status_dir.clone());
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    // This stable launch id places the initial equal-capacity tie on account A,
+    // whose fake response exhausts only the Fable claim.
+    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_fable_2");
+    let fable = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("authorization", "Bearer control-profile-token")
+        .header("x-api-key", "control-profile-key")
+        .header("anthropic-version", "2023-06-01")
+        .body(r#"{"model":"claude-fable-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fable.status(), StatusCode::OK);
+    assert_eq!(
+        fable.headers().get("anthropic-ratelimit-unified-status"),
+        None,
+        "per-account unified headers must not leak into Claude Code's cache"
+    );
+    assert_eq!(
+        fable.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-b"
+    );
+    let status_id = rayline_subscriptions::derive_status_id("test_a_fable_2");
+    let status_path = session_status_dir.join(format!("{status_id}.json"));
+    let status_raw = std::fs::read_to_string(&status_path).unwrap();
+    assert!(!status_raw.contains("token-a"));
+    assert!(!status_raw.contains("token-b"));
+    let status: rayline_subscriptions::SessionStatusSnapshot =
+        serde_json::from_str(&status_raw).unwrap();
+    assert_eq!(status.assignment.primary_account_id, "a");
+    assert_eq!(status.assignment.current_account_id, "b");
+    assert_eq!(status.assignment.current_model_family, "fable");
+    assert_eq!(
+        status.assignment.kind,
+        rayline_subscriptions::SessionAssignmentKind::ModelOverride
+    );
+    assert_eq!(
+        status.assignment.reason,
+        rayline_subscriptions::SessionAssignmentReason::QuotaFailover
+    );
+    assert_eq!(status.capacity.eligible_accounts, 1);
+    assert_eq!(status.capacity.total_accounts, 2);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&session_status_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&status_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let fable_again = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("authorization", "Bearer control-profile-token")
+        .body(r#"{"model":"claude-fable-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        fable_again.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-b",
+        "the observed Fable rejection should keep Fable away from account a"
+    );
+
+    let sonnet = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("authorization", "Bearer control-profile-token")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sonnet.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-a",
+        "a model-scoped Fable rejection must not exhaust Sonnet on that account"
+    );
+
+    let message_requests = anthropic
+        .captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path_and_query == "/v1/messages")
+        .cloned()
+        .collect::<Vec<_>>();
+    let authorizations = message_requests
+        .iter()
+        .map(|request| request.header("authorization").unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        authorizations,
+        vec![
+            "Bearer token-a",
+            "Bearer token-b",
+            "Bearer token-b",
+            "Bearer token-a"
+        ]
+    );
+    assert!(
+        message_requests
+            .iter()
+            .all(|request| request.header("x-api-key").is_none())
+    );
+}
+
+#[tokio::test]
+async fn concurrent_new_launches_balance_across_equal_subscriptions() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    write_subscription_credential(&account_b, "token-b");
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let requests = (0..20).map(|index| {
+        let client = proxied_client_with_launch(
+            proxy_port,
+            &ca_cert_path,
+            &format!("balanced_launch_{index}"),
+        );
+        async move {
+            client
+                .post("https://api.anthropic.com/v1/messages")
+                .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["account"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    });
+    let accounts = join_all(requests).await;
+    let account_a_count = accounts
+        .iter()
+        .filter(|account| *account == "token-a")
+        .count();
+    let account_b_count = accounts
+        .iter()
+        .filter(|account| *account == "token-b")
+        .count();
+    assert_eq!(account_a_count + account_b_count, 20);
+    assert!(
+        account_a_count.abs_diff(account_b_count) <= 2,
+        "active leases should keep equal subscriptions balanced"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_subscription_pool_preserves_the_final_real_unified_rejection() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    write_subscription_credential(&account_b, "token-a");
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let runtime_for_assertion = Arc::clone(&runtime);
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "exhausted_launch")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-fable-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-ratelimit-unified-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("rejected")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-ratelimit-unified-representative-claim")
+            .and_then(|value| value.to_str().ok()),
+        Some("7d_oi")
+    );
+    assert_eq!(
+        anthropic
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/v1/messages")
+            .count(),
+        2
+    );
+    assert!(
+        runtime_for_assertion
+            .status()
+            .accounts
+            .iter()
+            .all(|account| {
+                account.claims.iter().any(|claim| {
+                    claim.key == "seven_day_overage_included" && claim.is_hard_exhausted()
+                })
+            }),
+        "a classified unified rejection must persist the exhausted model claim"
+    );
+}
+
+#[tokio::test]
+async fn generic_rate_limit_does_not_rotate_subscription_accounts() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    write_subscription_credential(&account_b, "token-b");
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let runtime_for_assertion = Arc::clone(&runtime);
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    // Exercise the generic 429 response on account A; equal-capacity launches
+    // are intentionally distributed by their stable launch hash.
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_generic-limit_5")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-generic-limit","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let message_requests = anthropic
+        .captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path_and_query == "/v1/messages")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(message_requests.len(), 1);
+    assert_eq!(
+        message_requests[0].header("authorization").as_deref(),
+        Some("Bearer token-a")
+    );
+    let account_a = runtime_for_assertion
+        .status()
+        .accounts
+        .into_iter()
+        .find(|account| account.id == "a")
+        .unwrap();
+    assert!(
+        !account_a
+            .claims
+            .iter()
+            .any(|claim| claim.is_hard_exhausted()),
+        "a transient provider 429 must not exhaust an account's local allowance state"
+    );
+}
+
+#[tokio::test]
+async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::OK,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(
+                br#"{"access_token":"token-refreshed","refresh_token":"refresh-rotated","expires_in":3600,"refresh_token_expires_in":7200,"scope":"user:inference user:profile"}"#,
+            ),
+        },
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_dir = temp.path().join("account");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_dir, "token-stale");
+    let pool = rayline_subscriptions::SubscriptionPoolConfig {
+        control_config_dir: control_dir.clone(),
+        accounts: vec![rayline_subscriptions::SubscriptionAccountConfig {
+            id: "only".to_owned(),
+            credential_source: rayline_subscriptions::CredentialSourceConfig {
+                claude_config_dir: account_dir.clone(),
+            },
+        }],
+        policy: Default::default(),
+    };
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        pool,
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, "refresh_launch");
+    let request_one = client
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send();
+    let request_two = client
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send();
+    let (response_one, response_two) = tokio::join!(request_one, request_two);
+    for response in [response_one.unwrap(), response_two.unwrap()] {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["account"],
+            "token-refreshed"
+        );
+    }
+
+    let credential: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(account_dir.join(".credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        credential["claudeAiOauth"]["accessToken"],
+        "token-refreshed"
+    );
+    assert_eq!(
+        credential["claudeAiOauth"]["refreshToken"],
+        "refresh-rotated"
+    );
+    assert_eq!(
+        oauth
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/oauth/token")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn subscription_pool_recovers_when_another_process_rotates_the_credential() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+        },
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_dir = temp.path().join("account");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_dir, "token-stale");
+    let pool = rayline_subscriptions::SubscriptionPoolConfig {
+        control_config_dir: control_dir.clone(),
+        accounts: vec![rayline_subscriptions::SubscriptionAccountConfig {
+            id: "only".to_owned(),
+            credential_source: rayline_subscriptions::CredentialSourceConfig {
+                claude_config_dir: account_dir.clone(),
+            },
+        }],
+        policy: Default::default(),
+    };
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        pool,
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Simulate a standalone Claude process rotating the profile credential
+    // after the pool daemon cached its original token pair.
+    write_subscription_credential(&account_dir, "token-current");
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime.clone());
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "rotated_elsewhere")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-current"
+    );
+    assert_eq!(
+        runtime.status().accounts[0].credential_health,
+        rayline_subscriptions::CredentialHealth::Healthy
+    );
+    assert_eq!(
+        oauth
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/oauth/token")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+        },
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let invalid_dir = temp.path().join("invalid");
+    let healthy_dir = temp.path().join("healthy");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&invalid_dir, "token-invalid");
+    write_subscription_credential(&healthy_dir, "token-b");
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &invalid_dir, &healthy_dir),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime.clone());
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    // Account A owns the invalid credential in this fixture.
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_sonnet_0")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-b"
+    );
+    let invalid = runtime
+        .status()
+        .accounts
+        .into_iter()
+        .find(|account| account.id == "a")
+        .unwrap();
+    assert_eq!(
+        invalid.credential_health,
+        rayline_subscriptions::CredentialHealth::Quarantined
+    );
+    runtime.refresh_all_usage().await;
+    assert_eq!(
+        oauth
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/oauth/token")
+            .count(),
+        1,
+        "a quarantined credential must not trigger repeated refresh attempts"
+    );
+
+    runtime
+        .mark_credential_unavailable("b", "synthetic credential failure")
+        .unwrap();
+    let unavailable = proxied_client_with_launch(proxy_port, &ca_cert_path, "no_credentials")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-fable-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable_body = unavailable.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        unavailable_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no usable OAuth credential"))
+    );
+    assert!(
+        !unavailable_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("allowance"))
+    );
 }
 
 #[tokio::test]
@@ -624,6 +1514,45 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
     let ca_dir = tempfile::tempdir().unwrap();
     let status_dir = tempfile::tempdir().unwrap();
     let status_path = status_dir.path().join("route-status.json");
+    let session_status_dir = status_dir.path().join("session-status");
+    std::fs::create_dir_all(&session_status_dir).unwrap();
+    let launch_id = "route_status_launch";
+    let session_status_path = session_status_dir.join(format!(
+        "{}.json",
+        rayline_subscriptions::derive_status_id(launch_id)
+    ));
+    std::fs::write(
+        &session_status_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "pool_id": "default",
+            "assignment": {
+                "primary_account_id": "a",
+                "current_account_id": "a",
+                "current_model_family": "sonnet",
+                "kind": "primary",
+                "reason": "balanced_new_launch",
+                "assigned_at_unix": 100,
+                "last_seen_at_unix": 100
+            },
+            "capacity": {
+                "usage_snapshot_fresh": true,
+                "effective_headroom": 0.8,
+                "bottleneck": null,
+                "applicable": []
+            },
+            "placement": {
+                "strategy": "balanced_sessions",
+                "score": 0.8,
+                "active_global_leases": 1,
+                "active_model_leases": 1
+            },
+            "route": null,
+            "updated_at_unix": 100
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let mut opts = proxy_options(
         proxy_port,
         ca_dir.path(),
@@ -632,10 +1561,11 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
         &[&router, &anthropic],
     );
     opts.route_status_path = Some(status_path.clone());
+    opts.session_status_dir = Some(session_status_dir);
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
 
-    let client = proxied_client(proxy_port, &ca_cert_path);
+    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, launch_id);
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("authorization", "Bearer claude-oauth")
@@ -664,6 +1594,22 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
     assert_eq!(parsed["task_class"], "debugging");
     assert_eq!(parsed["route_id"], "route-it");
     assert!(parsed["ts"].as_u64().unwrap() > 0);
+
+    let mut launch_status = None;
+    for _ in 0..50 {
+        if let Ok(raw) = std::fs::read_to_string(&session_status_path) {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if !parsed["route"].is_null() {
+                launch_status = Some(parsed);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let launch_status = launch_status.expect("launch-scoped route should be merged");
+    assert_eq!(launch_status["assignment"]["current_account_id"], "a");
+    assert_eq!(launch_status["route"]["selected_model"], "glm-4.6");
+    assert_eq!(launch_status["route"]["route_id"], "route-it");
 }
 
 #[tokio::test]

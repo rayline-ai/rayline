@@ -118,6 +118,30 @@ only ever need `--local`** — the other two are advanced overrides.
 The [Getting Started guide](docs/getting-started.md#choosing-where-requests-go)
 has the full matrix and every valid combination.
 
+### Pool several Claude subscriptions
+
+Rayline can keep Claude Code on one shared configuration directory while using
+several existing profile directories only as OAuth credential sources:
+
+```bash
+rayline subscriptions add primary \
+  --claude-config-dir ~/.claude \
+  --control-config-dir ~/.claude
+rayline subscriptions add second --claude-config-dir ~/.claude-second
+rayline subscriptions status
+rayline claude --subscription-pool default
+```
+
+The local proxy tracks five-hour, weekly, and model-scoped allowance and can
+fail over a pre-stream quota rejection without moving unrelated model families.
+See [Multi-Subscription Claude Routing](docs/multi-claude-subscription-routing.md)
+for the routing, credential, and safety contracts.
+
+On macOS, the native [Rayline Status menu-bar app](apps/rayline-status/README.md)
+shows the live pool at a glance, including remaining allowance, reset times,
+run-out forecasts, and active sessions. Its background refresh is live-only and
+does not fall back to opening credential stores.
+
 ## Use Rayline From Code or Agents
 
 You can also send your own Anthropic API traffic through Rayline — from a script
