@@ -596,6 +596,35 @@ async fn fake_chunked_sse_upstream(port: u16, sse_body: String, terminate: bool)
     }
 }
 
+/// Like `fake_chunked_sse_upstream` but writes `sse_body` as TWO HTTP chunks split
+/// at `split_at` bytes, so a CRLF frame separator can straddle a chunk boundary.
+async fn fake_chunked_sse_upstream_split(port: u16, sse_body: String, split_at: usize) {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    loop {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let sse_body = sse_body.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            let (a, b) = sse_body.split_at(split_at);
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock
+                .write_all(format!("{:x}\r\n{}\r\n", a.len(), a).as_bytes())
+                .await;
+            let _ = sock.flush().await;
+            // Small gap so the adapter processes the first chunk before the second.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sock
+                .write_all(format!("{:x}\r\n{}\r\n", b.len(), b).as_bytes())
+                .await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+            let _ = sock.flush().await;
+        });
+    }
+}
+
 /// Boot the adapter (+ a usage-capturing fake router) pointed at `upstream_port`,
 /// fire one streaming `/api/v1/messages` carrying `usage_doc_id`, and return the
 /// JSON body of the `/v1/usage/update` close callback the router received.
@@ -699,6 +728,115 @@ async fn streaming_success_closes_as_success() {
     assert_eq!(body["status"], "success");
     assert_eq!(body["outputTokens"], 17);
     assert_eq!(body["selectedModel"], "qwen3.6-35b-a3b");
+}
+
+/// Drive one streaming `/api/v1/responses` (may-local 307 target) carrying
+/// `usage_doc_id`, return the `/v1/usage/update` close-callback body.
+async fn drive_responses_streaming_and_capture_close(upstream_port: u16, doc_id: &str) -> Value {
+    let adapter_port = free_port();
+    let router_port = free_port();
+
+    let captured_body: CapturedJson = Arc::new(Mutex::new(None));
+    tokio::spawn(fake_router_capturing_body(
+        router_port,
+        captured_body.clone(),
+    ));
+
+    let auth_cache: rayline_adapter::AuthCache = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut stash = HashMap::new();
+        stash.insert(
+            "x-api-key".to_string(),
+            "rayline-stashed-router-key".to_string(),
+        );
+        auth_cache.lock().unwrap().insert(doc_id.to_string(), stash);
+    }
+
+    tokio::spawn(rayline_adapter::serve(rayline_adapter::AdapterOptions {
+        port: adapter_port,
+        target: format!("http://127.0.0.1:{upstream_port}"),
+        upstream_model: "qwen3.6-27b-iq3xxs".into(),
+        router_url: format!("http://127.0.0.1:{router_port}"),
+        auth_cache: Some(auth_cache),
+        metrics: None,
+        collect_llama_progress: false,
+    }));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{adapter_port}/api/v1/responses?usage_doc_id={doc_id}"
+        ))
+        .json(&json!({
+            "model": "rayline-router", "stream": true,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+
+    for _ in 0..60 {
+        if let Some(v) = captured_body.lock().unwrap().clone() {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("router never received /v1/usage/update close callback");
+}
+
+/// Regression: a CRLF-delimited Responses SSE stream (standards-compliant
+/// `\r\n\r\n` frame separators) must still be parsed — its `response.completed`
+/// observed and the turn closed as `status: "success"`. A parser that only
+/// splits on `\n\n` never sees the terminal event and wrongly closes a
+/// successful may-local turn as an error.
+#[tokio::test]
+async fn crlf_responses_stream_closes_as_success() {
+    let upstream_port = free_port();
+    // CRLF line endings AND CRLF frame separators, as a compliant SSE server emits.
+    let complete = concat!(
+        "event: response.created\r\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"model\":\"qwen3.6-27b-iq3xxs\"}}\r\n\r\n",
+        "event: response.completed\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":17}}}\r\n\r\n",
+    )
+    .to_string();
+    tokio::spawn(fake_chunked_sse_upstream(upstream_port, complete, true));
+
+    let body = drive_responses_streaming_and_capture_close(upstream_port, "rt_deadbeef-crlf").await;
+    assert_eq!(body["routeId"], "rt_deadbeef-crlf");
+    assert_eq!(body["status"], "success");
+}
+
+/// Regression: a CRLF frame separator split across a TCP chunk boundary (chunk 1
+/// ends with `\r`, chunk 2 starts with `\n`) must still be normalized — otherwise
+/// per-chunk normalization misses it and the terminal event is never observed.
+#[tokio::test]
+async fn crlf_responses_stream_split_across_chunks_closes_as_success() {
+    let upstream_port = free_port();
+    let complete = concat!(
+        "event: response.created\r\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"model\":\"qwen3.6-27b-iq3xxs\"}}\r\n\r\n",
+        "event: response.completed\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":17}}}\r\n\r\n",
+    )
+    .to_string();
+    // Split inside the frame separator after `created`'s data line: place the cut
+    // between the first `\r` and its `\n` so neither chunk contains a whole `\r\n`.
+    let sep = complete.find("}\r\n\r\nevent: response.completed").unwrap();
+    let split_at = sep + 1 + 1; // after `}` and the first `\r`, before its `\n`
+    tokio::spawn(fake_chunked_sse_upstream_split(
+        upstream_port,
+        complete,
+        split_at,
+    ));
+
+    let body =
+        drive_responses_streaming_and_capture_close(upstream_port, "rt_deadbeef-crlf-split").await;
+    assert_eq!(body["routeId"], "rt_deadbeef-crlf-split");
+    assert_eq!(body["status"], "success");
 }
 
 #[tokio::test]

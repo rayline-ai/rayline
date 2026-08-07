@@ -58,6 +58,10 @@ pub struct LocalRouterOptions {
     pub local_model_id: String,
     pub config_path: Option<PathBuf>,
     pub metrics: Option<SharedMetricsSink>,
+    /// Codex may-local: advertise `x-rayline-local-*` on the native OpenAI
+    /// Responses forward to the hosted RCR, and follow the RCR's 307 to the
+    /// on-device adapter. Off for every other run.
+    pub may_local_advertise: bool,
 }
 
 impl Default for LocalRouterOptions {
@@ -68,6 +72,7 @@ impl Default for LocalRouterOptions {
             local_model_id: "qwen3.6-35b-a3b-q4-k-m".to_owned(),
             config_path: None,
             metrics: None,
+            may_local_advertise: false,
         }
     }
 }
@@ -423,6 +428,17 @@ fn client_bearer_base_url_allowed(base_url: &str) -> bool {
         || normalized.starts_with("http://127.0.0.1:")
         || normalized.starts_with("http://localhost:")
         || normalized.starts_with("http://[::1]:")
+}
+
+/// Whether an endpoint's `base_url` is a hosted Rayline RCR (prod or dev). Only
+/// the RCR can issue the may-local 307, so may-local advertise headers must be
+/// scoped to RCR forwards — never sent to a `codex-subscription` ChatGPT
+/// passthrough or any other upstream.
+fn endpoint_is_hosted_rcr(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+        .is_some_and(|host| host == "api.rayline.ai" || host == "api-dev.rayline.ai")
 }
 
 fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Result<()> {
@@ -2048,6 +2064,31 @@ async fn forward_openai_responses_endpoint(
     .await
 }
 
+/// The `x-rayline-subagent` header value for a subagent may-local forward.
+///
+/// Codex collapses its `explorer`/`worker` agent type to the constant
+/// `collab_spawn` on the wire, but the per-agent model survives as the requested
+/// model — so a config that maps an explorer agent to an explore-named model lets
+/// the edge recover the role here. Returns `"explorer"` when the requested model
+/// marks it as one (the RCR classifies that as exploration and lets it route
+/// local despite the shell tool set); otherwise `"true"`, a bare subagent
+/// assertion the RCR still recognises but gates on read-only tools.
+/// The `x-rayline-subagent` role value, derived from EITHER the requested model
+/// or the selected route model. The explore signal can live in either: Codex may
+/// send an explore-named per-agent model as the requested model (the agent TOML's
+/// `model`), OR the config's subagent route may carry an explore-named model that
+/// becomes `selected_model` (when the caller used the sentinel). Materialization
+/// can also fill a non-explore `model` (rayline-router) on that route, so checking
+/// only one field misses the other case. Any `explore` match wins.
+fn subagent_role_signal(requested_model: &str, selected_model: &str) -> &'static str {
+    let indicates_explore = |m: &str| m.to_ascii_lowercase().contains("explore");
+    if indicates_explore(requested_model) || indicates_explore(selected_model) {
+        "explorer"
+    } else {
+        "true"
+    }
+}
+
 async fn forward_openai_passthrough_endpoint(
     state: &AppState,
     endpoint: &EndpointConfig,
@@ -2084,9 +2125,79 @@ async fn forward_openai_passthrough_endpoint(
         !passthrough.body.is_empty(),
         endpoint.auth == Some(AuthMode::ClientBearer),
     );
+    // Codex may-local: advertise the on-device model on the native RCR forward
+    // (the proxy-less analogue of the proxy's `x-rayline-local-*` headers), so the
+    // RCR may 307-redirect an eligible subagent turn to the local adapter. Custom
+    // upstream ⇒ `x-rayline-local-custom` (mirrors rayline-proxy). On a subagent
+    // turn we also set the client-agnostic `x-rayline-subagent` signal: Codex's
+    // subagent prompts match none of the RCR's Claude-Code fingerprints, so the
+    // edge (which holds the ground truth — `task=subagent`) asserts it, and the
+    // RCR's classifier honors it to make the turn local-eligible.
+    //
+    // The VALUE carries the subagent ROLE when we can derive it: Codex strips its
+    // `explorer`/`worker` agent type from the wire header (always `collab_spawn`),
+    // but the per-agent model DOES survive as `requested_model`, so a config that
+    // maps an explorer agent to an explore-named model lets us recover the role.
+    // The RCR classifies `explorer` as exploration directly (and, being read-only
+    // work, lets it route local even though Codex explorers carry `exec_command`);
+    // any other value is treated as a bare subagent assertion. When no role is
+    // derivable we still send `true` so the turn is at least recognised.
+    //
+    // SCOPE: only a hosted RCR can issue the may-local 307, so advertise (and
+    // follow the redirect) ONLY on RCR forwards. A subscription config's main
+    // turns reach this same function targeting the `codex-subscription` ChatGPT
+    // passthrough — those must NOT receive Rayline-internal local-routing headers.
+    let advertise_may_local =
+        state.opts.may_local_advertise && endpoint_is_hosted_rcr(&endpoint.base_url);
+    if advertise_may_local {
+        outbound = outbound
+            .header("x-rayline-local-available", "true")
+            .header("x-rayline-local-model-id", &state.opts.local_model_id)
+            .header("x-rayline-local-custom", "true");
+        if decision.task_class == "subagent" {
+            // Derive the role from EITHER the requested or the selected route
+            // model — the explore signal can live in either (a per-agent explore
+            // model Codex requests, or an explore-named subagent route that becomes
+            // selected_model when the caller used the sentinel). Materialization can
+            // fill a non-explore `model` on the route, so checking only selected
+            // would miss a caller-requested explore model, and vice versa.
+            outbound = outbound.header(
+                "x-rayline-subagent",
+                subagent_role_signal(&decision.requested_model, &decision.selected_model),
+            );
+        }
+    }
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
+    // The RCR signals may-local by returning a 307 whose `Location` points at the
+    // on-device adapter's native Responses surface
+    // (`…/api/v1/responses?usage_doc_id=<routeId>`). Our HTTP client does not
+    // auto-follow, and the Codex client speaks Responses, so follow it here as a
+    // pure Responses passthrough — preserving the RCR's `usage_doc_id` so the
+    // adapter closes the placeholder usage row, and forwarding the router key so
+    // that `/v1/usage/update` callback authenticates. See `forward_local_redirect`.
+    if status == StatusCode::TEMPORARY_REDIRECT && advertise_may_local {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if let Some(location) = location {
+            return follow_local_responses_redirect(
+                state,
+                endpoint,
+                &location,
+                &passthrough.body,
+                passthrough.request_id,
+            )
+            .await;
+        }
+        // A 307 with no/invalid Location can't be followed; the raw 307 falls
+        // through to the client (which won't follow it). Log a breadcrumb so a
+        // future RCR regression isn't silent.
+        warn!("may-local: RCR returned 307 with no/invalid Location header; forwarding raw");
+    }
     response_from_reqwest(
         resp,
         status,
@@ -2096,6 +2207,106 @@ async fn forward_openai_passthrough_endpoint(
         Some(estimated_input_tokens),
     )
     .await
+}
+
+/// Follow the RCR's may-local 307 to the on-device adapter's native Responses
+/// surface. The `location` is the RCR-built URL
+/// (`http://127.0.0.1:<adapter>/api/v1/responses?usage_doc_id=<routeId>`); we
+/// POST the original Responses body there UNCHANGED (a pure passthrough — the
+/// on-device model speaks Responses natively). The RCR's `usage_doc_id` rides
+/// through the URL so the adapter closes the placeholder usage row, and we attach
+/// the router key as `x-api-key` so the adapter's `/v1/usage/update` callback
+/// authenticates to the RCR.
+async fn follow_local_responses_redirect(
+    state: &AppState,
+    endpoint: &EndpointConfig,
+    location: &str,
+    body: &Bytes,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    // SECURITY: only follow a 307 that points at the on-device adapter's expected
+    // loopback Responses surface. This request carries the user's prompt body and
+    // attaches the router key as `x-api-key`, so an unexpected `Location` (a
+    // misconfigured/compromised RCR endpoint returning a non-loopback URL) would
+    // exfiltrate the prompt + credential. Reject anything that is not
+    // `http://<loopback>:<local_adapter_port>/api/v1/responses`.
+    if !is_expected_local_adapter_redirect(location, state.opts.local_adapter_port) {
+        warn!("may-local: refusing 307 to unexpected location {location:?}");
+        return Ok(json_response(
+            StatusCode::BAD_GATEWAY,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "may-local redirect rejected: unexpected location"
+                }
+            }),
+        ));
+    }
+    let mut outbound = state
+        .http
+        .post(location)
+        .header("content-type", "application/json")
+        .header(REQUEST_ID_HEADER, request_id)
+        // `Bytes` clone is a refcount bump, not a copy of the (possibly multi-MB)
+        // prompt body.
+        .body(body.clone());
+    // The adapter's usage-update callback needs the SAME credential the RCR forward
+    // used, so it can authenticate `/v1/usage/update` back to the RCR. An endpoint
+    // may authenticate via its static `headers` map (e.g. an `Authorization` /
+    // `x-api-key` entry) and/or `api_key_env` — mirror BOTH here, matching
+    // `apply_endpoint_headers`. Forwarding only `api_key_env` would leave a
+    // headers-authenticated endpoint's callback unauthenticated, so the RCR usage
+    // row is never closed even though inference succeeded.
+    for (name, value) in &endpoint.headers {
+        // We already set `content-type: application/json` above; skip any config
+        // copy so reqwest doesn't emit a duplicate header.
+        if name.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        outbound = outbound.header(name, value);
+    }
+    if let Some(env_name) = endpoint.api_key_env.as_deref() {
+        if let Ok(key) = std::env::var(env_name) {
+            if !key.is_empty() {
+                outbound = outbound.header("x-api-key", key);
+            }
+        }
+    }
+    let resp = outbound.send().await?;
+    let status = resp.status();
+    // Do NOT pass metrics/request_id here: the local adapter this redirect posts
+    // to already records FirstToken/RequestCompleted for the same request id.
+    // Owning metrics here would double-record and inflate completed totals.
+    response_from_reqwest(resp, status, None, None, None, None).await
+}
+
+/// Whether a may-local 307 `Location` is the expected on-device adapter Responses
+/// surface: `http` scheme, a loopback host, the configured local adapter port,
+/// and the `/api/v1/responses` path. Query (the `usage_doc_id`) is allowed.
+fn is_expected_local_adapter_redirect(location: &str, adapter_port: u16) -> bool {
+    let Ok(url) = reqwest::Url::parse(location) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    // Host must be a literal loopback IP (127.0.0.0/8 or ::1). The RCR builds this
+    // redirect with a literal `127.0.0.1`, so we deliberately do NOT accept the
+    // `localhost` hostname: this request carries the prompt + router key, and an
+    // unresolved name could be pointed off-box by a hijacked hosts file / DNS,
+    // weakening the exfiltration guard. A bare IPv6 host_str() carries brackets,
+    // so strip them before parsing.
+    let is_loopback = match url.host_str() {
+        Some(host) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+        }
+        None => false,
+    };
+    is_loopback && url.port() == Some(adapter_port) && url.path() == "/api/v1/responses"
 }
 
 fn copy_openai_passthrough_headers(
@@ -5161,6 +5372,112 @@ mod tests {
     use super::*;
     use rayline_metrics::MetricsSink as _;
 
+    #[test]
+    fn expected_local_adapter_redirect_accepts_loopback_responses() {
+        let port = 20808;
+        // Accepted: loopback host, right port + path, with/without the usage query.
+        assert!(is_expected_local_adapter_redirect(
+            "http://127.0.0.1:20808/api/v1/responses?usage_doc_id=rt_1",
+            port
+        ));
+        assert!(is_expected_local_adapter_redirect(
+            "http://127.0.0.1:20808/api/v1/responses",
+            port
+        ));
+        assert!(is_expected_local_adapter_redirect(
+            "http://[::1]:20808/api/v1/responses",
+            port
+        ));
+    }
+
+    #[test]
+    fn expected_local_adapter_redirect_rejects_exfiltration() {
+        let port = 20808;
+        // Non-loopback host → would leak the prompt + router key.
+        assert!(!is_expected_local_adapter_redirect(
+            "http://evil.example.com:20808/api/v1/responses",
+            port
+        ));
+        assert!(!is_expected_local_adapter_redirect(
+            "http://169.254.169.254:20808/api/v1/responses",
+            port
+        ));
+        // `localhost` hostname is rejected: only literal loopback IPs are trusted,
+        // so a hijacked hosts file / DNS can't point the prompt + key off-box.
+        assert!(!is_expected_local_adapter_redirect(
+            "http://localhost:20808/api/v1/responses",
+            port
+        ));
+        // https / other schemes.
+        assert!(!is_expected_local_adapter_redirect(
+            "https://127.0.0.1:20808/api/v1/responses",
+            port
+        ));
+        // Wrong port.
+        assert!(!is_expected_local_adapter_redirect(
+            "http://127.0.0.1:9999/api/v1/responses",
+            port
+        ));
+        // Wrong path (e.g. a usage-callback or arbitrary endpoint).
+        assert!(!is_expected_local_adapter_redirect(
+            "http://127.0.0.1:20808/v1/usage/update",
+            port
+        ));
+        assert!(!is_expected_local_adapter_redirect(
+            "http://127.0.0.1:20808/",
+            port
+        ));
+        // Garbage.
+        assert!(!is_expected_local_adapter_redirect("not-a-url", port));
+    }
+
+    #[test]
+    fn endpoint_is_hosted_rcr_only_matches_rayline_rcr_hosts() {
+        assert!(endpoint_is_hosted_rcr("https://api.rayline.ai"));
+        assert!(endpoint_is_hosted_rcr("https://api.rayline.ai/v1"));
+        assert!(endpoint_is_hosted_rcr("https://api-dev.rayline.ai"));
+        assert!(endpoint_is_hosted_rcr("https://API-DEV.RAYLINE.AI/v1"));
+        // The codex-subscription ChatGPT passthrough must NOT count — this is the
+        // P3 regression: may-local headers must never reach a non-RCR upstream.
+        assert!(!endpoint_is_hosted_rcr(
+            "https://chatgpt.com/backend-api/codex"
+        ));
+        assert!(!endpoint_is_hosted_rcr("https://api.openai.com/v1"));
+        assert!(!endpoint_is_hosted_rcr("http://127.0.0.1:11434/v1"));
+        assert!(!endpoint_is_hosted_rcr("not-a-url"));
+    }
+
+    #[test]
+    fn subagent_role_signal_derives_explorer_from_either_model_name() {
+        // Explore in EITHER the requested or the selected model recovers the
+        // explorer role that Codex strips from the wire header.
+        // Requested is the explore per-agent model; selected is a filled sentinel.
+        assert_eq!(
+            subagent_role_signal("rayline-explore", "rayline-router"),
+            "explorer"
+        );
+        // Requested is the sentinel; selected is the explore-named subagent route.
+        assert_eq!(
+            subagent_role_signal("rayline-local", "rayline-explore"),
+            "explorer"
+        );
+        // Both explore.
+        assert_eq!(
+            subagent_role_signal("Rayline-Explore", "rayline-explorer"),
+            "explorer"
+        );
+        // Neither indicates explore → a bare subagent assertion (RCR gates it on
+        // read-only tools): sentinel / worker / unknown.
+        assert_eq!(
+            subagent_role_signal("rayline-local", "rayline-router"),
+            "true"
+        );
+        assert_eq!(
+            subagent_role_signal("rayline-worker", "rayline-builder"),
+            "true"
+        );
+    }
+
     fn state(config: RouterConfig) -> AppState {
         AppState {
             opts: Arc::new(LocalRouterOptions {
@@ -6224,6 +6541,47 @@ mod tests {
         assert_eq!(decision.target, RouteSelection::Local);
         assert_eq!(decision.selected_model, "local-model");
         assert_eq!(decision.policy, "subagent");
+    }
+
+    #[test]
+    fn codex_sentinel_subagent_role_signal_comes_from_selected_route_model() {
+        // The role advertised to the RCR (`x-rayline-subagent`) must be derived
+        // from the SELECTED route model, not the requested one. Codex sends the
+        // sentinel `rayline-local` on subagent turns; the explore-named model lives
+        // on `routes.subagent`. Keying off requested_model would send `true` and
+        // leave the RCR on its stricter tool gate; selected_model yields `explorer`.
+        let mut config = default_config("local-model");
+        config.routes.main = Some(RouteTarget {
+            endpoint: "openai".to_owned(),
+            model: "gpt-5.4".to_owned(),
+            ..Default::default()
+        });
+        config.routes.subagent = Some(RouteTarget {
+            endpoint: "rayline-cloud".to_owned(),
+            model: "rayline-explore".to_owned(),
+            router: Some("rayline-cloud".to_owned()),
+            ..Default::default()
+        });
+        let state = state(config);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OPENAI_SUBAGENT_HEADER,
+            HeaderValue::from_static("collab_spawn"),
+        );
+        headers.insert("x-rayline-local-available", HeaderValue::from_static("1"));
+        let body = json!({"model": "rayline-local", "messages": []});
+
+        let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+
+        assert_eq!(decision.task_class, "subagent");
+        // Requested is the sentinel; the explore signal lives in the selected route
+        // model. The combined signal still yields `explorer`.
+        assert_eq!(decision.requested_model, "rayline-local");
+        assert_eq!(decision.selected_model, "rayline-explore");
+        assert_eq!(
+            subagent_role_signal(&decision.requested_model, &decision.selected_model),
+            "explorer"
+        );
     }
 
     /// Builds an `S-L-per-type`-shaped config: `routes.main` → subscription-ish

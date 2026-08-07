@@ -205,6 +205,21 @@ struct ServeArgs {
     #[arg(long, env = ADAPTER_UPSTREAM_URL_ENV)]
     upstream_url: Option<String>,
 
+    /// Codex may-local: the local router advertises `x-rayline-local-*` on its
+    /// native OpenAI Responses forward to the hosted RCR and follows the RCR's
+    /// 307 to the on-device adapter (the codex, proxy-less analogue of the
+    /// proxy's may-local advertisement).
+    #[arg(long, hide = true)]
+    may_local_advertise: bool,
+
+    /// Codex may-local: the hosted RCR URL the adapter posts its
+    /// `/v1/usage/update` callback to. The RCR issues the `usage_doc_id` in its
+    /// 307, so its placeholder row can only be closed against the RCR — not the
+    /// local router (loopback decision plane, stub OK handler). When unset the
+    /// adapter uses the decision-plane `router_url`.
+    #[arg(long, hide = true)]
+    usage_callback_url: Option<String>,
+
     /// Data directory for llama-server binary + logs.
     #[arg(long, env = DATA_DIR_ENV)]
     data_dir: Option<PathBuf>,
@@ -594,11 +609,22 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         .or_else(|| args.model_repo.clone())
         .unwrap_or_else(|| args.local_model_id.clone());
     let auth_cache = rayline_proxy::new_auth_cache();
+    // The adapter's /v1/usage/update callback must reach whoever owns the
+    // usage_doc_id. On the local decision plane that is normally the local router
+    // itself, but under Codex may-local the doc id comes from the HOSTED RCR's
+    // 307 — so use the explicit callback URL when provided, else the decision
+    // plane's router_url.
+    let adapter_router_url = args
+        .usage_callback_url
+        .as_deref()
+        .unwrap_or(&router_url)
+        .trim_end_matches('/')
+        .to_string();
     let adapter_opts = rayline_adapter::AdapterOptions {
         port: args.adapter_port,
         target: adapter_target,
         upstream_model,
-        router_url: router_url.trim_end_matches('/').to_string(),
+        router_url: adapter_router_url,
         auth_cache: Some(auth_cache.clone()),
         metrics: Some(metrics_sink.clone()),
         collect_llama_progress: !custom_mode,
@@ -652,6 +678,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             local_model_id: args.local_model_id.clone(),
             config_path: args.router_config_path.clone(),
             metrics: Some(metrics_sink.clone()),
+            may_local_advertise: args.may_local_advertise,
         })
     } else {
         None

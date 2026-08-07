@@ -164,6 +164,23 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
                 }
             }
         }
+        // `/api/v1/responses` is the path the cloud router 307s eligible Codex
+        // subagent turns to (with ?usage_doc_id=…), sending a native OpenAI
+        // Responses body. `/v1/responses` is the direct-client path. Both map to
+        // `handle_responses`, a pure Responses passthrough (no Anthropic
+        // thinking/tool-schema processing) — see its docs.
+        (Method::POST, "/api/v1/responses" | "/v1/responses") => {
+            match handle_responses(state, req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("handler error: {e}");
+                    json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": {"type": "api_error", "message": e.to_string()}}),
+                    )
+                }
+            }
+        }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(full_body("not found"))
@@ -718,6 +735,501 @@ async fn pump_stream(
         );
     }
     Ok(())
+}
+
+/// Pure OpenAI Responses passthrough to the on-device model's `/v1/responses`.
+///
+/// The on-device llama-server (`--jinja`) serves the OpenAI Responses API
+/// natively at `/v1/responses`, returning a well-formed reply with a
+/// `usage:{input_tokens,output_tokens}` block and a `model` field. The hosted
+/// router 307-redirects eligible Codex subagent turns here with a native
+/// Responses body; we forward it UNCHANGED (except model substitution) and
+/// return the reply UNCHANGED, while closing the placeholder usage row.
+///
+/// This is a parallel, simpler sibling of `handle_messages`: it reuses the exact
+/// same auth-header resolution, metrics records, error-close discipline, and
+/// usage callback, but deliberately skips all Anthropic-specific processing
+/// (thinking mapping, `anthropic-version` header, tool-schema sanitize) — a
+/// Responses body has a different shape. Tool-schema sanitize is NOT applied to
+/// Responses tools; if the local grammar builder ever chokes on a Responses tool
+/// schema, add a Responses-shaped sanitize here (the Anthropic one keys off
+/// `tools[].input_schema`, which doesn't match Responses tools).
+async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
+    let t_start = Instant::now();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let query_params = parse_query(&query);
+    let usage_doc_id = query_params.get("usage_doc_id").cloned();
+    let query_request_id = query_params.get("rayline_request_id").cloned();
+    let request_id = req
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(query_request_id)
+        .or_else(|| usage_doc_id.clone())
+        .unwrap_or_else(new_request_id);
+    // Auth for the /v1/usage/update callback — identical resolution to
+    // handle_messages: prefer the injector's pre-redirect stash keyed by
+    // usage_doc_id, fall back to inbound headers only when the stash missed.
+    let mut auth_headers = collect_auth_headers(req.headers());
+    if let (Some(doc_id), Some(cache)) = (usage_doc_id.as_ref(), state.opts.auth_cache.as_ref()) {
+        if let Ok(mut guard) = cache.lock() {
+            if let Some(stashed) = guard.remove(doc_id) {
+                auth_headers = stashed;
+            }
+        }
+    }
+
+    let body_bytes = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":{"type":"invalid_request_error","message":format!("read body: {e}")}}),
+            ));
+        }
+    };
+
+    // Peek at request shape for logging + stream detection. Parse failure is
+    // non-fatal — we forward raw bytes.
+    let mut parsed: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+    let want_stream = parsed
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let client_model = parsed
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let estimated_input_tokens = approximate_input_tokens(&parsed);
+
+    let upstream_url = format!("{}/v1/responses", state.opts.target);
+    info!(
+        "/api/v1/responses → {} (client-model={} stream={})",
+        upstream_url, client_model, want_stream
+    );
+    if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+        metrics.record(MetricsUpdate::RequestStarted {
+            request_id: request_id.clone(),
+            source: "adapter".to_owned(),
+            requested_model: Some(client_model.clone()),
+            agent_id: None,
+            agent_type: None,
+        });
+        metrics.record(MetricsUpdate::RouteDecided {
+            request_id: request_id.clone(),
+            route_id: usage_doc_id.clone(),
+            target: "local".to_owned(),
+            endpoint_id: Some("local".to_owned()),
+            selected_model: Some(state.opts.upstream_model.clone()),
+            requested_model: Some(client_model.clone()),
+            policy: Some("local-adapter".to_owned()),
+            task_class: None,
+            agent_id: None,
+            agent_type: None,
+        });
+        metrics.record(MetricsUpdate::TokenUsage {
+            request_id: request_id.clone(),
+            input_tokens: Some(estimated_input_tokens),
+            output_tokens: None,
+            selected_model: Some(state.opts.upstream_model.clone()),
+        });
+    }
+
+    // Model substitution only — the field is still top-level `.model` in a
+    // Responses body. Same rationale as handle_messages: custom endpoints reject
+    // a body whose `model` isn't one they serve; the bundled llama-server
+    // ignores it. No Anthropic thinking/tool-schema/llama-progress processing.
+    let substituted_model = if let Some(obj) = parsed.as_object_mut() {
+        if obj.get("model").and_then(Value::as_str) == Some(state.opts.upstream_model.as_str()) {
+            false
+        } else {
+            obj.insert(
+                "model".to_owned(),
+                Value::String(state.opts.upstream_model.clone()),
+            );
+            true
+        }
+    } else {
+        false
+    };
+    let forward_body = if substituted_model {
+        match serde_json::to_vec(&parsed) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                warn!("re-serialize before forward failed; forwarding raw: {e}");
+                body_bytes.clone()
+            }
+        }
+    } else {
+        body_bytes.clone()
+    };
+
+    let upstream = match state
+        .http
+        .post(&upstream_url)
+        .header("content-type", "application/json")
+        .body(forward_body)
+        .send()
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => {
+            // Local inference died before headers — close the placeholder as an
+            // error instead of letting `?` leak the row.
+            warn!("upstream request failed: {e}");
+            if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: None,
+                    error: format!("upstream request failed: {e}"),
+                });
+            }
+            spawn_error_close(
+                &state,
+                &usage_doc_id,
+                &auth_headers,
+                t_start.elapsed().as_millis() as u64,
+            );
+            return Ok(json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "error": {"type": "api_error", "message": format!("upstream request failed: {e}")}
+                }),
+            ));
+        }
+    };
+
+    if !upstream.status().is_success() {
+        let status = upstream.status();
+        let text = upstream.text().await.unwrap_or_default();
+        let snippet: String = text.chars().take(500).collect();
+        warn!("upstream {}: {}", status, snippet);
+        if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+            metrics.record(MetricsUpdate::RequestErrored {
+                request_id: request_id.clone(),
+                status_code: Some(status.as_u16()),
+                error: format!("upstream {status}: {snippet}"),
+            });
+        }
+        spawn_error_close(
+            &state,
+            &usage_doc_id,
+            &auth_headers,
+            t_start.elapsed().as_millis() as u64,
+        );
+        return Ok(json_response(
+            StatusCode::BAD_GATEWAY,
+            json!({
+                "error": {"type": "api_error", "message": format!("upstream {}: {}", status, snippet)}
+            }),
+        ));
+    }
+
+    if !want_stream {
+        let resp_bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("upstream body read failed: {e}");
+                if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+                    metrics.record(MetricsUpdate::RequestErrored {
+                        request_id: request_id.clone(),
+                        status_code: None,
+                        error: format!("upstream body read failed: {e}"),
+                    });
+                }
+                spawn_error_close(
+                    &state,
+                    &usage_doc_id,
+                    &auth_headers,
+                    t_start.elapsed().as_millis() as u64,
+                );
+                return Ok(json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({
+                        "error": {"type": "api_error", "message": format!("upstream body read failed: {e}")}
+                    }),
+                ));
+            }
+        };
+        if let Some(doc_id) = usage_doc_id.clone() {
+            // llama-server's Responses body carries usage.input_tokens /
+            // usage.output_tokens / model — same pointers as Anthropic here.
+            let v: Value = serde_json::from_slice(&resp_bytes).unwrap_or(Value::Null);
+            let input_tokens = v
+                .pointer("/usage/input_tokens")
+                .and_then(|x| x.as_u64())
+                .filter(|value| *value > 0)
+                .unwrap_or(estimated_input_tokens);
+            let output_tokens = v
+                .pointer("/usage/output_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
+            let selected_model = v
+                .get("model")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(state.opts.upstream_model.as_str())
+                .to_string();
+            if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+                metrics.record(MetricsUpdate::FirstToken {
+                    request_id: request_id.clone(),
+                });
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    selected_model: Some(selected_model.clone()),
+                });
+            }
+            spawn_usage_callback(
+                &state,
+                UsageCallback {
+                    doc_id,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms: t_start.elapsed().as_millis() as u64,
+                    selected_model,
+                    status: "success",
+                    auth_headers,
+                },
+            );
+        }
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(full_body(resp_bytes))
+            .unwrap());
+    }
+
+    // Streaming path: pass the Responses SSE through byte-for-byte and fire the
+    // usage callback at end-of-stream. See pump_responses_stream for how the
+    // terminal event / usage extraction differs from the Anthropic pump.
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
+
+    let state_for_task = state.clone();
+    let usage_doc_id_task = usage_doc_id.clone();
+    let auth_headers_task = auth_headers.clone();
+    let request_id_task = request_id.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = pump_responses_stream(
+            upstream,
+            tx,
+            t_start,
+            usage_doc_id_task,
+            request_id_task,
+            estimated_input_tokens,
+            auth_headers_task,
+            state_for_task,
+        )
+        .await
+        {
+            warn!("stream pump error: {e}");
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(body_out)
+        .unwrap())
+}
+
+/// Passthrough pump for an OpenAI Responses SSE stream. Mirrors `pump_stream`'s
+/// error-close discipline — bytes are forwarded downstream unchanged and usage
+/// is snooped off the events as they flow — but keys off the Responses SSE shape
+/// rather than Anthropic's. The terminal marker is an event whose JSON `.type`
+/// is `response.completed` (or an OpenAI-style `[DONE]` data line), with usage
+/// on `.response.usage.{input_tokens,output_tokens}` and model on
+/// `.response.model`; `.type == "error"` / `response.failed` marks a failed turn.
+///
+/// SIMPLIFIED vs. `pump_stream`: we don't record per-delta TokenUsage/PromptCache
+/// (Responses SSE has no llama prompt-progress frames and only carries usage on
+/// the terminal event); FirstToken fires on the first `response.output_*` delta.
+/// Any non-terminal or error exit closes the placeholder as an error.
+#[allow(clippy::too_many_arguments)]
+async fn pump_responses_stream(
+    upstream: reqwest::Response,
+    tx: mpsc::Sender<std::io::Result<Frame<Bytes>>>,
+    t_start: Instant,
+    usage_doc_id: Option<String>,
+    request_id: String,
+    estimated_input_tokens: u64,
+    auth_headers: HashMap<String, String>,
+    state: AppState,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let mut stream = upstream.bytes_stream();
+    let mut buffer = String::new();
+    let mut input_tokens = estimated_input_tokens;
+    let mut output_tokens: u64 = 0;
+    let mut selected_model: Option<String> = None;
+    let mut saw_first_token = false;
+    let mut saw_terminal = false;
+    let mut saw_error = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                // Transport drop mid-stream: stop draining and fall through to
+                // the callback. saw_terminal stays false unless we already
+                // passed the terminal event, so this closes as an error.
+                warn!("upstream stream error: {e}");
+                break;
+            }
+        };
+        // Forward raw SSE bytes downstream first — the client sees exactly what
+        // llama-server emits.
+        if tx.send(Ok(Frame::data(chunk.clone()))).await.is_err() {
+            // Client hung up; keep draining so the model finishes and we can
+            // still fire the usage callback.
+        }
+        // Normalize CRLF → LF before scanning: a standards-compliant SSE upstream
+        // may separate frames with `\r\n\r\n`, which `find("\n\n")` would never
+        // match — leaving `response.completed`/usage unseen and a successful turn
+        // wrongly closed as an error. Normalize the whole BUFFER after appending
+        // (not the chunk in isolation) so a `\r\n` split across a TCP chunk boundary
+        // is still collapsed. The RAW bytes were already forwarded to the client
+        // above, so this only affects our parse buffer.
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        if buffer.contains('\r') {
+            buffer = buffer.replace("\r\n", "\n");
+        }
+        while let Some(idx) = buffer.find("\n\n") {
+            let event_str = buffer[..idx].to_string();
+            buffer.drain(..idx + 2);
+            for line in event_str.lines() {
+                if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if payload == "[DONE]" {
+                        saw_terminal = true;
+                        continue;
+                    }
+                    let v: Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    match v.get("type").and_then(|x| x.as_str()) {
+                        // Responses terminal event — the turn completed normally.
+                        Some("response.completed") => saw_terminal = true,
+                        // A 200 text/event-stream can still carry an application
+                        // failure and then close cleanly. Treat it as a failed turn.
+                        Some("response.failed") | Some("error") => saw_error = true,
+                        _ => {}
+                    }
+                    if !saw_first_token && is_first_responses_output_event(&v) {
+                        saw_first_token = true;
+                        if let Some(metrics) =
+                            metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id)
+                        {
+                            metrics.record(MetricsUpdate::FirstToken {
+                                request_id: request_id.clone(),
+                            });
+                        }
+                    }
+                    // Responses usage lives on the terminal event under
+                    // `response.usage`; some builds also emit a top-level `usage`.
+                    if let Some(in_tok) = v
+                        .pointer("/response/usage/input_tokens")
+                        .or_else(|| v.pointer("/usage/input_tokens"))
+                        .and_then(|x| x.as_u64())
+                        .filter(|value| *value > 0)
+                    {
+                        input_tokens = in_tok;
+                    }
+                    if let Some(out_tok) = v
+                        .pointer("/response/usage/output_tokens")
+                        .or_else(|| v.pointer("/usage/output_tokens"))
+                        .and_then(|x| x.as_u64())
+                    {
+                        output_tokens = out_tok;
+                    }
+                    if selected_model.is_none() {
+                        if let Some(m) = v
+                            .pointer("/response/model")
+                            .or_else(|| v.get("model"))
+                            .and_then(|x| x.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            selected_model = Some(m.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(doc_id) = usage_doc_id.as_ref() {
+        let status = if saw_terminal && !saw_error {
+            "success"
+        } else {
+            "error"
+        };
+        if let Some(metrics) = metrics_for_usage_doc(&state.opts.metrics, &usage_doc_id) {
+            if status == "success" {
+                metrics.record(MetricsUpdate::RequestCompleted {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    selected_model: selected_model.clone(),
+                });
+            } else {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    error: "local stream ended without terminal success".to_owned(),
+                });
+            }
+        }
+        spawn_usage_callback(
+            &state,
+            UsageCallback {
+                doc_id: doc_id.clone(),
+                input_tokens,
+                output_tokens,
+                duration_ms: t_start.elapsed().as_millis() as u64,
+                selected_model: selected_model.unwrap_or_else(|| state.opts.upstream_model.clone()),
+                status,
+                auth_headers,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// First "real output" event for a Responses SSE stream — used to fire the
+/// FirstToken metric. Responses emits `response.output_text.delta` /
+/// `response.output_item.added` (and similar `response.output_*` events) as the
+/// model produces tokens; the lifecycle events (`response.created`,
+/// `response.in_progress`, `response.completed`, `response.failed`) are not
+/// output.
+fn is_first_responses_output_event(value: &Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some(
+            "response.created"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.failed"
+            | "error",
+        ) => false,
+        Some(t) => t.starts_with("response.output"),
+        None => false,
+    }
 }
 
 fn enable_llama_progress(value: &mut Value) -> bool {

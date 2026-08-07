@@ -49,16 +49,6 @@ fn daemon_bin_env_var() -> &'static str {
     "RLD_BIN"
 }
 
-/// Whether a Codex run's `--config` declares may-local (Rcl-Rcl/Rcl-K) — a route
-/// carrying `local_models`. The may-local adapter branch in `start_from_cli` is
-/// gated `!codex_mode`, so a Codex config declaring may-local silently ignores it
-/// and routes on the cloud RCR. This gates a startup warning so the drop is not
-/// silent. It states a fact about the config, not a per-request routing
-/// prediction; it never changes routing.
-fn codex_may_local_unsupported(codex_mode: bool, config_path: &Path) -> bool {
-    codex_mode && crate::router_config::config_may_local(config_path).is_some()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterStatusRequest {
     pub root_env_explicit: bool,
@@ -95,6 +85,17 @@ pub struct RouterStartRequest {
     /// `RAYLINE_ROUTER_API_KEY` (e.g. the `rayline auth login` key for a hosted
     /// cloud-router endpoint). When `None`, the normal resolution applies.
     pub router_api_key_override: Option<String>,
+    /// Codex may-local (Rcl-Rcl/Rcl-K): the local router advertises
+    /// `x-rayline-local-*` on its native RCR forward and follows the RCR's 307 to
+    /// the on-device adapter. Claude does this in the proxy; codex is proxy-less,
+    /// so the local router does it on the native OpenAI Responses forward.
+    pub may_local_advertise: bool,
+    /// Codex may-local: the hosted RCR URL the on-device adapter must post its
+    /// `/v1/usage/update` callback to. The RCR issues the `usage_doc_id` in its
+    /// 307, so the placeholder row it owns can only be closed against the RCR —
+    /// not the local router (whose decision-plane `router_url` is loopback and
+    /// whose `/v1/usage/update` is a stub OK). `None` outside may-local.
+    pub usage_callback_url: Option<String>,
     pub root_env_explicit: bool,
 }
 
@@ -197,6 +198,8 @@ impl RouterStartRequest {
             proxy_routing_mode: PROXY_ROUTING_MODE_ALL.to_owned(),
             no_local_model: false,
             router_api_key_override: None,
+            may_local_advertise: false,
+            usage_callback_url: None,
             root_env_explicit,
         }
     }
@@ -1644,9 +1647,51 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
         // config's local endpoint with a custom adapter and advertise it, so the RCR
         // may 307-redirect to it. Cloud decision plane + custom upstream; the daemon
         // reads `RAYLINE_ROUTER_API_KEY` from the env for the RCR.
-        if !codex_mode && let Some(may_local) = crate::router_config::config_may_local(path) {
+        if let Some(may_local) = crate::router_config::config_may_local(path) {
+            // Claude keeps the hosted decision plane and lets the MITM proxy
+            // advertise local + follow the RCR's 307. Codex runs proxy-less and
+            // forwards natively, so it uses the local decision plane: the local
+            // router itself advertises `x-rayline-local-*` on the native RCR
+            // forward and follows the RCR's 307 to the on-device adapter.
             let mut start_request = if codex_mode {
-                RouterStartRequest::local_router_defaults(request.root_env_explicit)
+                let mut req = RouterStartRequest::local_router_defaults(request.root_env_explicit);
+                // Materialize the codex-native config (rayline-cloud →
+                // openai_responses + `x-rayline-client: codex`) so the main
+                // forwards natively to the RCR; the local router advertises
+                // may-local on that forward. When the config's main is the
+                // subscription sentinel (main on ChatGPT, subagents may-local),
+                // use the subscription materializer instead — it wires the
+                // `codex-subscription` main (so Codex exposes `spawn_agent` and
+                // can spawn subagents) while still forwarding the `rayline-cloud`
+                // subagent route natively for may-local advertise/307.
+                req.router_config_path = Some(if codex_subscription_auth {
+                    crate::router_config::materialize_codex_subscription_for_local_router(
+                        path, &home,
+                    )?
+                } else {
+                    crate::router_config::materialize_codex_config_for_local_router(path, &home)?
+                });
+                req.may_local_advertise = true;
+                req.router_api_key_override = request.router_api_key_override.clone();
+                // The RCR owns the usage_doc_id it issues in the 307, so the
+                // adapter's /v1/usage/update must go to the hosted RCR — not the
+                // local router (loopback decision plane, stub OK handler). Take the
+                // RCR URL straight from the config's hosted-cloud endpoint so it
+                // matches exactly what the may-local turn forwards to (prod or dev).
+                req.usage_callback_url = crate::router_config::config_hosted_rcr_base_url(path);
+                if req.usage_callback_url.is_none() {
+                    // may-local is enabled (a route declares `local_models`), but no
+                    // hosted-RCR endpoint base_url resolved — so the adapter would
+                    // fall back to posting /v1/usage/update at the loopback router,
+                    // whose stub can't close the RCR's placeholder row. Surface it
+                    // rather than silently losing may-local usage accounting.
+                    eprintln!(
+                        "warning: may-local is enabled but no hosted-RCR endpoint \
+                         (api.rayline.ai / api-dev.rayline.ai) was found in the config; \
+                         on-device usage will not be reported to the router."
+                    );
+                }
+                req
             } else {
                 RouterStartRequest::defaults(request.root_env_explicit)
             };
@@ -1662,21 +1707,6 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             start_request.upstream_model = Some(may_local.model.clone());
             start_request.local_model_id = may_local.model;
             return finish_start_from_cli(&home, &start_request, &bin_path, codex_mode).await;
-        }
-        // may-local (Rcl-Rcl/Rcl-K) is not supported for Codex: the branch above is
-        // gated `!codex_mode`, so a Codex run with a may-local config falls
-        // through to plain cloud-RCR routing and `local_models` is ignored. Warn
-        // loudly instead of silently degrading, and point to Rc-L — an explicit
-        // `routes.subagent → local` config that *does* route Codex subagents
-        // on-device today. (Full Codex may-local is tracked separately.)
-        if codex_may_local_unsupported(codex_mode, path) {
-            eprintln!(
-                "rayline codex: your config's `local_models` setting (letting the cloud router \
-                 send some work to your local model) currently works only with Claude, not \
-                 Codex, so it will be ignored on this run. Any routes you point directly at a \
-                 local `endpoint` still run on-device as configured; to run part of a Codex \
-                 session locally, use one of those instead of `local_models`."
-            );
         }
         start_request.router_config_path = Some(if codex_subscription_auth {
             crate::router_config::materialize_codex_subscription_for_local_router(path, &home)?
@@ -2321,6 +2351,12 @@ fn spawn_router(
     ]);
     if let Some(path) = request.router_config_path.as_deref() {
         command.arg("--router-config-path").arg(path);
+    }
+    if request.may_local_advertise {
+        command.arg("--may-local-advertise");
+    }
+    if let Some(url) = request.usage_callback_url.as_deref() {
+        command.args(["--usage-callback-url", url]);
     }
     let ca_cert_path = proxy_ca_cert_path(home);
     let ca_key_path = proxy_ca_key_path(home);
@@ -4047,9 +4083,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_may_local_unsupported_predicate() {
+    fn config_may_local_detects_rcl_configs() {
         use serde_json::json;
-        let dir = unique_test_dir("codex-may-local-warn");
+        let dir = unique_test_dir("codex-may-local-detect");
         std::fs::create_dir_all(&dir).unwrap();
 
         // Rcl-Rcl-shape: a `rayline-cloud` route carrying `local_models` → may-local on.
@@ -4092,22 +4128,15 @@ mod tests {
         )
         .unwrap();
 
-        // Warns only for Codex + a may-local config.
+        // A `rayline-cloud` route carrying `local_models` → may-local on (drives
+        // the codex may-local branch in `start_from_cli`); no `local_models` → off.
         assert!(
-            codex_may_local_unsupported(true, &rcl_rcl),
-            "codex + Rcl-Rcl → warn"
+            crate::router_config::config_may_local(&rcl_rcl).is_some(),
+            "Rcl-Rcl config → may-local detected"
         );
         assert!(
-            !codex_may_local_unsupported(false, &rcl_rcl),
-            "claude + Rcl-Rcl → no warn (supported)"
-        );
-        assert!(
-            !codex_may_local_unsupported(true, &rc_rc),
-            "codex + Rc-Rc → no warn (no local_models)"
-        );
-        assert!(
-            !codex_may_local_unsupported(false, &rc_rc),
-            "claude + Rc-Rc → no warn"
+            crate::router_config::config_may_local(&rc_rc).is_none(),
+            "Rc-Rc config (no local_models) → may-local off"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
