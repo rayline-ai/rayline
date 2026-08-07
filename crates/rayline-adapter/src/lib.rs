@@ -318,8 +318,10 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     // `{}` (an empty schema = "any"), which llama-server accepts. Re-serialize
     // when we substituted the model or changed a schema; else forward untouched.
     let sanitized = sanitize_tool_schemas(&mut parsed);
+    let stripped_hosted = strip_local_unsupported_tools(&mut parsed);
     let forward_body = if substituted_model
         || sanitized > 0
+        || stripped_hosted > 0
         || mapped_thinking
         || added_llama_progress
     {
@@ -328,6 +330,11 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                 if sanitized > 0 {
                     info!(
                         "sanitized {sanitized} tool-schema constraint(s) (typeless→{{}}, stripped pattern/format/bounds) for local model"
+                    );
+                }
+                if stripped_hosted > 0 {
+                    info!(
+                        "stripped {stripped_hosted} local-unsupported hosted tool(s) (web_search) before local forward"
                     );
                 }
                 if mapped_thinking {
@@ -839,10 +846,10 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
         });
     }
 
-    // Model substitution only — the field is still top-level `.model` in a
-    // Responses body. Same rationale as handle_messages: custom endpoints reject
-    // a body whose `model` isn't one they serve; the bundled llama-server
-    // ignores it. No Anthropic thinking/tool-schema/llama-progress processing.
+    // Model substitution — the field is still top-level `.model` in a Responses
+    // body. Same rationale as handle_messages: custom endpoints reject a body
+    // whose `model` isn't one they serve; the bundled llama-server ignores it. No
+    // Anthropic thinking/tool-schema/llama-progress processing.
     let substituted_model = if let Some(obj) = parsed.as_object_mut() {
         if obj.get("model").and_then(Value::as_str) == Some(state.opts.upstream_model.as_str()) {
             false
@@ -856,7 +863,18 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
     } else {
         false
     };
-    let forward_body = if substituted_model {
+    // Drop hosted tools a local model can't run (web_search). See
+    // strip_local_unsupported_tools: llama-server skips it silently but LM Studio
+    // misroutes the model's search intent onto another tool, so make the drop
+    // explicit and backend-uniform here — the 307 lands eligible Codex subagent
+    // turns on this same handler, so it covers both may-local and pure-local.
+    let stripped_hosted = strip_local_unsupported_tools(&mut parsed);
+    if stripped_hosted > 0 {
+        info!(
+            "stripped {stripped_hosted} local-unsupported hosted tool(s) (web_search) before local forward"
+        );
+    }
+    let forward_body = if substituted_model || stripped_hosted > 0 {
         match serde_json::to_vec(&parsed) {
             Ok(b) => Bytes::from(b),
             Err(e) => {
@@ -1506,6 +1524,33 @@ fn map_thinking_to_template_kwargs(body: &mut Value) -> bool {
     changed
 }
 
+/// Remove hosted tools no local backend can execute from the top-level `tools`
+/// array, returning the number dropped. `web_search` is a server-side hosted tool
+/// the *cloud* provider fulfils; a local model has no way to run it. Left in the
+/// body it degrades silently and inconsistently per backend — llama-server logs
+/// `unsupported Responses tool type 'web_search' skipped` and drops it cleanly,
+/// but LM Studio misroutes the model's search intent onto whatever other tool is
+/// present (emitting e.g. a `function_call` to an unrelated tool with
+/// `{"queries":[…]}` args). Stripping it here — the single choke point before any
+/// local server, on both the Responses and Anthropic paths — makes the drop
+/// explicit and identical across backends. Matches both the Responses shape
+/// (`{"type":"web_search"}`) and the Anthropic server-tool shape
+/// (`{"type":"web_search_20250305",…}`) by `type` prefix, so it is model- and
+/// backend-agnostic.
+fn strip_local_unsupported_tools(body: &mut Value) -> usize {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|tool| {
+        !tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("web_search"))
+    });
+    before - tools.len()
+}
+
 /// Coerce every tool `input_schema` node that llama-server can't grammar-convert
 /// into an empty schema `{}`. Returns the number of nodes coerced.
 fn sanitize_tool_schemas(body: &mut Value) -> usize {
@@ -1808,6 +1853,57 @@ mod tests {
         let props = &v["tools"][0]["input_schema"]["properties"];
         assert_eq!(props["nested"]["properties"]["deep"], json!({}));
         assert_eq!(props["list"]["items"], json!({}));
+    }
+
+    #[test]
+    fn strip_removes_web_search_hosted_tool_keeps_the_rest() {
+        // Responses shape: the exact tool set a real Codex explorer subagent
+        // ships. web_search is dropped; exec_command/function tools survive.
+        let mut v = json!({
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "exec_command"},
+                {"type": "function", "name": "noop"}
+            ]
+        });
+        assert_eq!(strip_local_unsupported_tools(&mut v), 1);
+        let names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, ["exec_command", "noop"]);
+        assert!(
+            !v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["type"] == "web_search")
+        );
+    }
+
+    #[test]
+    fn strip_matches_anthropic_server_tool_shape_by_prefix() {
+        // Anthropic server-tool form carries a versioned type; match by prefix.
+        let mut v = json!({
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "Read", "input_schema": {"type": "object"}}
+            ]
+        });
+        assert_eq!(strip_local_unsupported_tools(&mut v), 1);
+        assert_eq!(v["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(v["tools"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn strip_is_noop_without_tools_or_web_search() {
+        let mut none = json!({"input": []});
+        assert_eq!(strip_local_unsupported_tools(&mut none), 0);
+        let mut only_fns = json!({"tools": [{"type": "function", "name": "exec_command"}]});
+        assert_eq!(strip_local_unsupported_tools(&mut only_fns), 0);
+        assert_eq!(only_fns["tools"].as_array().unwrap().len(), 1);
     }
 
     #[test]
