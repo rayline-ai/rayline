@@ -184,6 +184,12 @@ pub const ROUTER_RAYLINE_CLOUD: &str = "rayline-cloud";
 /// class per the static JSON and pins its `model`, rather than the hosted RCR.
 pub const ROUTER_RAYLINE_LOCAL: &str = "rayline-local";
 
+/// The virtual model that asks the hosted RCR to decide (its balanced tiering).
+/// A may-local `rayline-cloud` route may declare only `local_models` and omit
+/// `model`; the local router rejects a non-local route with an empty `model`, so
+/// materialization fills this sentinel before startup.
+const RAYLINE_ROUTER_MODEL: &str = "rayline-router";
+
 /// The local model the hosted cloud router may redirect a `rayline` class to
 /// ("may-local"), resolved from the config. Returns the advertised model id and
 /// the base URL of the local endpoint that serves it (the redirect target the
@@ -200,6 +206,76 @@ pub fn config_may_local(path: &Path) -> Option<MayLocal> {
     let raw = std::fs::read(path).ok()?;
     let cfg: Value = serde_json::from_slice(&raw).ok()?;
     config_value_may_local(&cfg)
+}
+
+/// The hosted-RCR ROOT URL of the config's cloud endpoint (prod `api.rayline.ai`
+/// or dev `api-dev.rayline.ai`), if any. This is the RCR that issues may-local's
+/// `usage_doc_id` in its 307, so it is where the on-device adapter must post its
+/// `/v1/usage/update` to close the placeholder row. Reads the config directly
+/// (not env resolution) so it reflects exactly which RCR the config points at.
+///
+/// The returned URL is normalized to the server ROOT — a trailing `/v1` is
+/// stripped — because the adapter appends `/v1/usage/update`. A hosted RCR
+/// endpoint may legitimately declare its base_url as `…/api.rayline.ai/v1`
+/// (valid for `openai_responses`, and the Codex-native materializer normalizes
+/// hosted endpoints to that shape via `ensure_rcr_base_url_has_v1`), which would
+/// otherwise produce `…/v1/v1/usage/update` and leave the row unclosed.
+pub fn config_hosted_rcr_base_url(path: &Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    config_value_hosted_rcr_base_url(&cfg)
+}
+
+fn config_value_hosted_rcr_base_url(cfg: &Value) -> Option<String> {
+    // Use the endpoint that the may-local route actually targets — a config may
+    // declare multiple hosted RCRs (e.g. prod + dev), and the callback must reach
+    // the one that received the turn (and thus owns the usage_doc_id), not merely
+    // the first hosted endpoint declared.
+    let endpoint_id = may_local_route_endpoint_id(cfg);
+    let endpoints = cfg.get("endpoints").and_then(Value::as_array)?;
+    let base_url = if let Some(id) = endpoint_id.as_deref() {
+        endpoints
+            .iter()
+            .find(|e| e.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|e| e.get("base_url").and_then(Value::as_str))
+            .filter(|b| endpoint_base_url_is_hosted_rcr(Some(b)))
+    } else {
+        None
+    }
+    // Fallback: no resolvable may-local endpoint id (e.g. an inherited cloud
+    // default) — use the first hosted RCR endpoint declared.
+    .or_else(|| {
+        endpoints
+            .iter()
+            .find(|e| endpoint_base_url_is_hosted_rcr(e.get("base_url").and_then(Value::as_str)))
+            .and_then(|e| e.get("base_url").and_then(Value::as_str))
+    })?;
+    Some(crate::local_model::normalize_base_url(base_url))
+}
+
+/// The `endpoint` id of the route that turns may-local on (a `router: rayline-cloud`
+/// route carrying a non-empty `local_models`). This is the RCR endpoint the
+/// may-local turn forwards to and that owns the `usage_doc_id`. `None` when the
+/// route names no explicit endpoint (it inherits the cloud default).
+fn may_local_route_endpoint_id(cfg: &Value) -> Option<String> {
+    let routes = cfg.get("routes")?;
+    let singletons = ["main", "subagent", "default"]
+        .into_iter()
+        .filter_map(|key| routes.get(key));
+    let maps = ["subagents", "model_routes"]
+        .into_iter()
+        .filter_map(|key| routes.get(key))
+        .filter_map(Value::as_object)
+        .flat_map(|map| map.values());
+    singletons
+        .chain(maps)
+        .filter(|route| route_advertised_local_model(route).is_some())
+        .find_map(|route| {
+            route
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn config_value_may_local(cfg: &Value) -> Option<MayLocal> {
@@ -236,6 +312,57 @@ fn config_advertised_local_model(cfg: &Value) -> Option<String> {
         .chain(maps)
         .filter_map(route_advertised_local_model)
         .next()
+}
+
+/// Fill a missing/empty `model` on any non-`rayline-local` route that declares
+/// `local_models`, using the `rayline-router` sentinel. `config_may_local` accepts
+/// a may-local `rayline-cloud` route that carries only `local_models` (no `model`),
+/// but the local router rejects a non-local route with an empty `model` at startup
+/// (`route to endpoint … must include a model`). Without this, such an accepted
+/// may-local config fails at daemon start instead of enabling may-local. Scans the
+/// same route set as `config_advertised_local_model`. Returns whether it changed.
+fn ensure_may_local_route_models(cfg: &mut Value) -> bool {
+    let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut fill = |route: &mut Value| {
+        // Only routes that advertise may-local (non-`rayline-local`, has
+        // `local_models`) and lack a usable `model`.
+        if route.get("router").and_then(Value::as_str) == Some(ROUTER_RAYLINE_LOCAL) {
+            return;
+        }
+        let has_local_models = route
+            .get("local_models")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|m| m.as_str().is_some_and(|s| !s.is_empty())));
+        let missing_model = route
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty);
+        if has_local_models && missing_model {
+            if let Some(obj) = route.as_object_mut() {
+                obj.insert(
+                    "model".to_owned(),
+                    Value::String(RAYLINE_ROUTER_MODEL.to_owned()),
+                );
+                changed = true;
+            }
+        }
+    };
+    for key in ["main", "subagent", "default"] {
+        if let Some(route) = routes.get_mut(key) {
+            fill(route);
+        }
+    }
+    for key in ["subagents", "model_routes"] {
+        if let Some(map) = routes.get_mut(key).and_then(Value::as_object_mut) {
+            for route in map.values_mut() {
+                fill(route);
+            }
+        }
+    }
+    changed
 }
 
 /// A single route's advertised local model, if it has may-local on.
@@ -342,6 +469,9 @@ pub fn materialize_codex_subscription_for_local_router(
     // A*-subagent-cloud case: a `rayline-cloud` subagent endpoint pointed at the
     // hosted RCR must also forward native Responses + carry `x-rayline-client`.
     changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
+    // …and if that may-local subagent route declares only `local_models`, fill the
+    // RCR sentinel model so the local router doesn't reject it at startup.
+    changed |= ensure_may_local_route_models(&mut cfg);
     // After the rewrite `routes.main` is the concrete codex-subscription endpoint,
     // so pinning the sentinel `--model` to it points Codex's MAIN turns there. The
     // local router skips this model_route on subagent turns (so `routes.subagent`
@@ -372,6 +502,10 @@ pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
     let mut changed = ensure_codex_config_model_routes(&mut cfg);
+    // A may-local `rayline-cloud` route may declare only `local_models` and omit
+    // `model` (accepted by config_may_local); fill the RCR sentinel so the local
+    // router's non-empty-model check doesn't reject it at startup.
+    changed |= ensure_may_local_route_models(&mut cfg);
     // Codex `R*` main → hosted RCR: forward native Responses (not the lossy
     // Anthropic bridge) and stamp `x-rayline-client: codex`. Host-guarded.
     changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
@@ -699,6 +833,74 @@ mod tests {
     #[test]
     fn default_config_does_not_need_local_router() {
         assert!(!config_value_needs_local_router(&default_config_json()));
+    }
+
+    #[test]
+    fn hosted_rcr_base_url_extracted_from_cloud_endpoint() {
+        // Dev RCR endpoint → its base_url is the usage-callback target.
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": "https://api-dev.rayline.ai", "models": ["rayline-router"] },
+                { "id": "local-bundled", "protocol": "openai_responses",
+                  "base_url": "http://127.0.0.1:8899", "models": ["m"] }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+        assert_eq!(
+            config_value_hosted_rcr_base_url(&cfg).as_deref(),
+            Some("https://api-dev.rayline.ai")
+        );
+        // A hosted endpoint declared with a trailing /v1 (valid for
+        // openai_responses; the Codex-native materializer normalizes to this)
+        // must be stripped to the ROOT so the adapter's {root}/v1/usage/update
+        // does not become …/v1/v1/usage/update.
+        let with_v1 = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "openai_responses",
+                  "base_url": "https://api.rayline.ai/v1", "models": ["rayline-router"] }
+            ],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+        });
+        assert_eq!(
+            config_value_hosted_rcr_base_url(&with_v1).as_deref(),
+            Some("https://api.rayline.ai")
+        );
+        // No hosted-RCR endpoint (all local/custom) → None.
+        let local_only = json!({
+            "endpoints": [
+                { "id": "ollama", "protocol": "openai_chat",
+                  "base_url": "http://127.0.0.1:11434/v1", "models": ["q"] }
+            ],
+            "routes": { "main": { "endpoint": "ollama", "model": "q" } }
+        });
+        assert_eq!(config_value_hosted_rcr_base_url(&local_only), None);
+    }
+
+    #[test]
+    fn hosted_rcr_base_url_uses_the_may_local_routes_endpoint() {
+        // Two hosted RCRs declared (prod + dev); the may-local subagent route
+        // targets the SECOND (dev). The callback must go to dev, not the first
+        // declared (prod).
+        let cfg = json!({
+            "endpoints": [
+                { "id": "rcr-prod", "protocol": "anthropic_messages",
+                  "base_url": "https://api.rayline.ai", "models": ["rayline-router"] },
+                { "id": "rcr-dev", "protocol": "anthropic_messages",
+                  "base_url": "https://api-dev.rayline.ai", "models": ["rayline-router"] },
+                { "id": "local-bundled", "protocol": "openai_responses",
+                  "base_url": "http://127.0.0.1:8899", "models": ["m"] }
+            ],
+            "routes": {
+                "main": { "endpoint": "rcr-prod", "model": "rayline-router" },
+                "subagent": { "endpoint": "rcr-dev", "model": "rayline-router",
+                              "router": "rayline-cloud", "local_models": ["m"] }
+            }
+        });
+        assert_eq!(
+            config_value_hosted_rcr_base_url(&cfg).as_deref(),
+            Some("https://api-dev.rayline.ai")
+        );
     }
 
     #[test]
@@ -1143,6 +1345,47 @@ mod tests {
         assert!(
             cfg["routes"].get("model_routes").is_none(),
             "no sentinel routes injected for a passthrough main"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn materialize_fills_missing_model_on_may_local_cloud_route() {
+        // Regression: a may-local `rayline-cloud` route may declare only
+        // `local_models` and omit `model` (accepted by config_may_local). The local
+        // router rejects a non-local route with an empty model at startup, so
+        // materialization must fill the `rayline-router` sentinel first.
+        let home = tmp_home();
+        let path = home.join("codex-maylocal-no-model.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "endpoints": [
+                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                      "base_url": "https://api-dev.rayline.ai",
+                      "api_key_env": "RAYLINE_ROUTER_API_KEY", "models": ["rayline-router"] },
+                    { "id": "local-bundled", "protocol": "openai_responses",
+                      "base_url": "http://127.0.0.1:8899", "models": ["qwen3.6-27b-iq3xxs"] }
+                ],
+                "routes": {
+                    // No `model` — only `local_models`.
+                    "subagent": { "endpoint": "rayline-cloud",
+                                  "local_models": ["qwen3.6-27b-iq3xxs"] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        // The RCR sentinel model is filled, so the local router's non-empty-model
+        // check accepts the route; local_models is preserved.
+        assert_eq!(cfg["routes"]["subagent"]["model"], "rayline-router");
+        assert_eq!(
+            cfg["routes"]["subagent"]["local_models"][0],
+            "qwen3.6-27b-iq3xxs"
         );
 
         let _ = std::fs::remove_dir_all(&home);
