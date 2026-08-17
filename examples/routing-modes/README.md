@@ -117,8 +117,9 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 The three support columns are the three entry points that drive a config:
 **Claude** (`rayline claude --config`), **Codex** (`rayline codex --config`),
 **Router** (`rayline router start --config`, then point an SDK client at the
-proxy). Per column: ✅ = works end-to-end · 🟡 = routes correctly, capability-limited
-by the local model (see ¹/⁴) · ❌ = not supported. See
+proxy). Per column: ✅ = works end-to-end · 🟡 = routes correctly, but the local main
+does not drive the tool loop (see ¹/⁴ — often the context window, not the model) ·
+❌ = not supported. See
 [What the columns mean](#what-the-columns-mean).
 
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Claude | Codex | Router | Config |
@@ -180,19 +181,47 @@ show what the mode *means*.
 
 **¹ 🟡 — routes correctly, main only (today) — `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`);
 applies to the Claude *and* Router columns.** These run the **main** agent on a
-local model, and it **works** for direct (non-subagent) work — but current small
-local models (e.g. qwen 7B/9B) cannot reliably drive the harness's tool-use
-protocol: they emit tool calls as plain text instead of invoking tools, so the main
-agent **does not spawn subagents** (and rarely uses `Read`/`Edit`/`Bash`). The
-subagent leg (cloud / pinned / Anthropic / local, per the mode) is therefore never
-reached. This is a property of the local **model**, not the entry point: it happens
-whether you launch via `rayline claude --config` **or** `rayline router start
---config` with an agent client attached (and equally with the existing
-`rayline claude --local` / `--local --route all`). The **routing** itself is
-verified for these configs (see [Tests](#tests)) — the router *would* route a
-subagent-tagged request correctly; nothing generates one. A more capable local main
-would spawn subagents and lift all four to ✅ on Claude/Router. The live e2e test
-(`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
+local model, and it **works** for direct (non-subagent) work — but the local main is
+observed to emit tool calls as plain text instead of invoking tools, so it **does not
+spawn subagents** (and rarely uses `Read`/`Edit`/`Bash`). The subagent leg (cloud /
+pinned / Anthropic / local, per the mode) is therefore never reached. This is not a
+property of the entry point: it happens whether you launch via `rayline claude
+--config` **or** `rayline router start --config` with an agent client attached (and
+equally with the existing `rayline claude --local` / `--local --route all`). The
+**routing** itself is verified for these configs (see [Tests](#tests)) — the router
+*would* route a subagent-tagged request correctly; nothing generates one. The live
+e2e test (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
+
+**Do not read the 🟡 as "the model is too small."** That was the earlier reading here,
+and on at least one host it was wrong. ollama sizes a model's context window at load
+time — `OLLAMA_CONTEXT_LENGTH`, *"default: 4k/32k/256k based on VRAM"* — so a
+VRAM-constrained host silently gets **4096 tokens** (confirm with `ollama ps`, CONTEXT
+column). An agent harness's system prompt plus its tool schemas does not fit in that:
+measured against Hermes, 23.6 KB of system prompt and 19 tools. The overflow truncates
+the **tool definitions**, and a model handed no tools does the only thing left — it
+narrates the call as prose. Measured on one VRAM-constrained host, 19 tools, holding
+everything else equal and varying only the system prompt: `tool_use` at 1/4/8 KB, plain
+text at 16/23 KB. `qwen3.6:35b-a3b` and `qwen3.5:9b` failed *identically*, which is the
+tell — capability limits do not produce a 36B and a 9B degrading the same way at the
+same threshold. Both emit a proper `tool_use` at `num_ctx` 32768.
+
+Rayline cannot inject this: ollama drops `options` on both of its compat routes
+(`/v1/chat/completions`, `/v1/messages`, checked on 0.32.9), so a per-endpoint body
+param would forward and do nothing. Bake it into the tag instead, which survives the
+shims —
+
+```
+FROM qwen3.6:35b-a3b
+PARAMETER num_ctx 32768
+```
+```
+ollama create qwen3.6:35b-a3b-32k -f Modelfile   # then name that tag in `models`
+```
+
+— or raise `OLLAMA_CONTEXT_LENGTH` on the ollama server. These stay 🟡 rather than ✅
+because a pinned window only demonstrates a well-formed first `tool_use`; whether a
+local main then drives the full multi-turn loop and spawns subagents is still
+unverified. Re-test with the window pinned before concluding anything about the model.
 
 **² ❌ N — may-local is inert (`Rcl-K`/`Rcl-L`).** may-local (`Rcl`) only ever redirects
 **cloud-routed `Explore` subagents** to local — never the main agent. In `Rcl-K`/`Rcl-L`
@@ -299,7 +328,7 @@ Each mode is scored against the **three entry points** that can drive its config
 
 The three share one routing engine, so they agree except where an entry point adds
 a constraint the engine can't lift (Codex's sentinel-model rule; Claude's
-local-main capability limit). Per-cell status:
+local-main tool-loop limit). Per-cell status:
 
 - **✅** — works end-to-end. Every shipped config's routing is exercised by the
   hermetic tests below, and where a *capable* main drives the run the agent loop
@@ -309,11 +338,13 @@ local-main capability limit). Per-cell status:
   Claude/Router: `router: rayline-local` is **static LSR routing** — the JSON is the
   decider, no ML policy needed. (`Rcl-Rcl` is ✅ for the client/advertisement contract;
   its actual local redirect is hosted-gated — see §.)
-- **🟡** — *routes correctly, capability-limited by the local model*. For **Claude
-  and Router** it's `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`): the local main runs and
-  the router routes every class correctly (hermetic tests), but small local models
-  can't drive the harness's `Task` tool, so **no subagents spawn** — regardless of
-  `rayline claude` vs `rayline router start` (the limit is the local *model*, see ¹).
+- **🟡** — *routes correctly, but the local main does not drive the tool loop*. For
+  **Claude and Router** it's `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`): the local main
+  runs and the router routes every class correctly (hermetic tests), but the local main
+  is observed not to drive the harness's `Task` tool, so **no subagents spawn** —
+  regardless of `rayline claude` vs `rayline router start`. Check ollama's context
+  window before blaming the model: a 4k default truncates the tool schemas out of the
+  prompt and the model narrates calls as text (see ¹).
   For **Codex** it's the *same four local-main modes*: the sentinel now routes to the
   on-device model (⁴), but whether it can drive Codex's agentic tool loop is likewise
   a model-capability question.
