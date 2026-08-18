@@ -117,9 +117,8 @@ The two sub-axes **nest** — `rayline` → `router` (`rayline-cloud`|`rayline-l
 The three support columns are the three entry points that drive a config:
 **Claude** (`rayline claude --config`), **Codex** (`rayline codex --config`),
 **Router** (`rayline router start --config`, then point an SDK client at the
-proxy). Per column: ✅ = works end-to-end · 🟡 = routes correctly, but the local main
-does not drive the tool loop (see ¹/⁴ — often the context window, not the model) ·
-❌ = not supported. See
+proxy). Per column: ✅ = works end-to-end · 🟡 = routes correctly, but the leg past the
+main agent is unverified end-to-end (see ¹/⁴) · ❌ = not supported. See
 [What the columns mean](#what-the-columns-mean).
 
 | Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Claude | Codex | Router | Config |
@@ -138,11 +137,11 @@ does not drive the tool loop (see ¹/⁴ — often the context window, not the m
 | **S-Rl** | `subscription` | `rayline` | rayline-local | N/A | subscription (Claude / ChatGPT) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`S-Rl.json`](./S-Rl.json) |
 | **S-L** | `subscription` | `local` | N/A | N/A | subscription (Claude / ChatGPT) | local model | subscription | ✅ | ✅ ⁵ | ✅ | [`S-L.json`](./S-L.json) |
 | **K-K** ⁶ | `keyed` | `keyed` | N/A | N/A | keyed provider (API key) | keyed provider (API key, distinct model) | provider API key | ✅ | ✅ ⁶ | ✅ | [`K-K.json`](./K-K.json) |
-| **L-Rc** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | 🟡 | 🟡 ⁴ | 🟡 | [`L-Rc.json`](./L-Rc.json) |
+| **L-Rc** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ | 🟡 ⁴ | 🟡 | [`L-Rc.json`](./L-Rc.json) |
 | **L-Rcl** ³ | `local` | `rayline` | rayline-cloud | on | local model | cloud model (RCR may send a subagent → local) | rayline | ❌ | ❌ | ❌ | — (may-local) |
 | **L-Rl** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | 🟡 | 🟡 ⁴ | 🟡 | [`L-Rl.json`](./L-Rl.json) |
 | **L-K** ¹ | `local` | `keyed` | N/A | N/A | local model | Anthropic (API key) | API key | 🟡 | 🟡 ⁴ | 🟡 | [`L-K.json`](./L-K.json) |
-| **L-L** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | 🟡 | 🟡 ⁴ | 🟡 | [`L-L.json`](./L-L.json) |
+| **L-L** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ | 🟡 ⁴ | ✅ | [`L-L.json`](./L-L.json) |
 
 Plus three granular **per-type** variants that split subagents by **type**
 instead of one blanket default:
@@ -179,36 +178,30 @@ subagent leg and only that leg breaks; use `-K` there instead. (`S` still works 
 the **main** leg, which passes through rather than being routed.) The intent columns
 show what the mode *means*.
 
-**¹ 🟡 — routes correctly, main only (today) — `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`);
-applies to the Claude *and* Router columns.** These run the **main** agent on a
-local model, and it **works** for direct (non-subagent) work — but the local main is
-observed to emit tool calls as plain text instead of invoking tools, so it **does not
-spawn subagents** (and rarely uses `Read`/`Edit`/`Bash`). The subagent leg (cloud /
-pinned / Anthropic / local, per the mode) is therefore never reached. This is not a
-property of the entry point: it happens whether you launch via `rayline claude
---config` **or** `rayline router start --config` with an agent client attached (and
-equally with the existing `rayline claude --local` / `--local --route all`). The
-**routing** itself is verified for these configs (see [Tests](#tests)) — the router
-*would* route a subagent-tagged request correctly; nothing generates one. The live
-e2e test (`it_local_main_e2e`, `#[ignore]`d) is the harness for that.
+**¹ `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`) — pin the local model's context window
+first.** These run the **main** agent on a local model. With the window pinned, the
+local main drives the full tool loop and spawns subagents; with ollama's VRAM-derived
+default it does not, and the failure looks like a capability limit but is not.
 
-**Do not read the 🟡 as "the model is too small."** That was the earlier reading here,
-and on at least one host it was wrong. ollama sizes a model's context window at load
-time — `OLLAMA_CONTEXT_LENGTH`, *"default: 4k/32k/256k based on VRAM"* — so a
-VRAM-constrained host silently gets **4096 tokens** (confirm with `ollama ps`, CONTEXT
-column). An agent harness's system prompt plus its tool schemas does not fit in that:
-measured against Hermes, 23.6 KB of system prompt and 19 tools. The overflow truncates
-the **tool definitions**, and a model handed no tools does the only thing left — it
-narrates the call as prose. Measured on one VRAM-constrained host, 19 tools, holding
-everything else equal and varying only the system prompt: `tool_use` at 1/4/8 KB, plain
-text at 16/23 KB. `qwen3.6:35b-a3b` and `qwen3.5:9b` failed *identically*, which is the
-tell — capability limits do not produce a 36B and a 9B degrading the same way at the
-same threshold. Both emit a proper `tool_use` at `num_ctx` 32768.
+**Pin the window.** ollama sizes a model's context at load time —
+`OLLAMA_CONTEXT_LENGTH`, *"default: 4k/32k/256k based on VRAM"* — so a VRAM-constrained
+host silently gets **4096 tokens** (confirm with `ollama ps`, CONTEXT column). An agent
+harness's system prompt plus its tool schemas does not fit in that: measured against
+Hermes, 23.6 KB of system prompt and 19 tools. The overflow truncates the **tool
+definitions**, and a model handed no tools does the only thing left — it narrates the
+call as prose. Measured on one VRAM-constrained host (GTX 1070, 8 GB), 19 tools of
+schema (5.4 KB), holding everything else equal and varying only the system prompt:
+`tool_use` at 1/4/8 KB, plain text at 12/16/23 KB — the cliff sits between 8 and 12 KB,
+which is where prompt + schemas cross 4096 tokens. `qwen3.6:35b-a3b` and `qwen3.5:9b`
+failed *identically*, which is the tell — capability limits do not produce a 36B and a
+9B degrading the same way at the same threshold. Both emit a proper `tool_use` at
+`num_ctx` 32768.
 
 Rayline cannot inject this: ollama drops `options` on both of its compat routes
-(`/v1/chat/completions`, `/v1/messages`, checked on 0.32.9), so a per-endpoint body
-param would forward and do nothing. Bake it into the tag instead, which survives the
-shims —
+(`/v1/chat/completions`, `/v1/messages`, checked on 0.32.9) — the same request against
+the native `/api/chat` honors `options.num_ctx` and loads at 32768, so the drop is
+specific to the compat shims Rayline's `openai_chat` endpoints speak. Bake it into the
+tag instead, which survives them —
 
 ```
 FROM qwen3.6:35b-a3b
@@ -218,10 +211,31 @@ PARAMETER num_ctx 32768
 ollama create qwen3.6:35b-a3b-32k -f Modelfile   # then name that tag in `models`
 ```
 
-— or raise `OLLAMA_CONTEXT_LENGTH` on the ollama server. These stay 🟡 rather than ✅
-because a pinned window only demonstrates a well-formed first `tool_use`; whether a
-local main then drives the full multi-turn loop and spawns subagents is still
-unverified. Re-test with the window pinned before concluding anything about the model.
+— or raise `OLLAMA_CONTEXT_LENGTH` on the ollama server.
+
+**What a pinned window buys, measured.** On the host above with
+`qwen3.5:9b` @ `num_ctx` 32768, one file-read task and one spawn-a-subagent task:
+
+| Mode | Entry point | Result |
+|---|---|---|
+| `L-L` | `rayline claude --config` | ✅ main tool loop → `policy=subagent` → local subagent → correct answer |
+| `L-L` | `rayline router start --config` + client at the proxy | ✅ same, on the second attempt (see flakiness below) |
+| `L-Rc` | `rayline claude --config` | ✅ subagent dispatched to `endpoint:rayline-cloud`, 10 turns, correct answer |
+| `L-Rl` | `rayline claude --config` | 🟡 subagent routed to `rayline-cloud:deepseek/deepseek-v4-pro` (4 turns), but its result never returned to the main, which answered from its own `Read` |
+| `L-K` | — | 🟡 not run — needs an `ANTHROPIC_API_KEY` the test host did not have |
+
+The local main also recovers from its own tool-schema mistakes: given a wrong
+parameter set it re-read the schema (`ToolSearch`) and retried correctly.
+
+**Flakiness is the remaining caveat.** Across four spawn attempts the local main
+invoked the subagent tool in three; in the fourth it narrated *"I'll spawn a
+general-purpose subagent…"* and stopped. A cloud main does not do this. Treat the ✅
+as "works", not "works every time" — and note the `Router` column needs the client
+pointed at the **proxy** (`:20810`), not the injector (`:20809`): attaching to the
+injector loses the subagent header and every request classifies as `task=main`.
+
+The live e2e test (`it_local_main_e2e`, `#[ignore]`d) is the harness for pinning this
+down across more hosts and models.
 
 **² ❌ N — may-local is inert (`Rcl-K`/`Rcl-L`).** may-local (`Rcl`) only ever redirects
 **cloud-routed `Explore` subagents** to local — never the main agent. In `Rcl-K`/`Rcl-L`
@@ -327,8 +341,8 @@ Each mode is scored against the **three entry points** that can drive its config
   SDK client at the proxy. Pure routing engine; no Claude Code agent driving it.
 
 The three share one routing engine, so they agree except where an entry point adds
-a constraint the engine can't lift (Codex's sentinel-model rule; Claude's
-local-main tool-loop limit). Per-cell status:
+a constraint the engine can't lift (Codex's sentinel-model rule; the local main's
+dependence on a pinned context window). Per-cell status:
 
 - **✅** — works end-to-end. Every shipped config's routing is exercised by the
   hermetic tests below, and where a *capable* main drives the run the agent loop
@@ -338,16 +352,17 @@ local-main tool-loop limit). Per-cell status:
   Claude/Router: `router: rayline-local` is **static LSR routing** — the JSON is the
   decider, no ML policy needed. (`Rcl-Rcl` is ✅ for the client/advertisement contract;
   its actual local redirect is hosted-gated — see §.)
-- **🟡** — *routes correctly, but the local main does not drive the tool loop*. For
-  **Claude and Router** it's `agent = local` (`L-Rc`/`L-Rl`/`L-K`/`L-L`): the local main
-  runs and the router routes every class correctly (hermetic tests), but the local main
-  is observed not to drive the harness's `Task` tool, so **no subagents spawn** —
-  regardless of `rayline claude` vs `rayline router start`. Check ollama's context
-  window before blaming the model: a 4k default truncates the tool schemas out of the
-  prompt and the model narrates calls as text (see ¹).
+- **🟡** — *routes correctly; the leg past the main agent is unverified end-to-end*.
+  For **Claude and Router** this is now only `L-Rl` and `L-K`: with the local model's
+  context window pinned, the local main does drive the tool loop and does spawn
+  subagents (`L-L` and `L-Rc` are ✅ on that basis), but `L-Rl`'s subagent result never
+  made it back to the main in testing and `L-K` needs an `ANTHROPIC_API_KEY` that the
+  test host lacked — see ¹ for the measured matrix. Routing for all four is exercised
+  by the hermetic tests regardless. If a local main narrates tool calls as text instead
+  of invoking them, check ollama's context window before blaming the model: a 4k default
+  truncates the tool schemas out of the prompt (see ¹).
   For **Codex** it's the *same four local-main modes*: the sentinel now routes to the
-  on-device model (⁴), but whether it can drive Codex's agentic tool loop is likewise
-  a model-capability question.
+  on-device model (⁴), but whether it can drive Codex's agentic tool loop is untested.
 - **❌** — not supported. For **Codex**, a mode that ships no config (the
   cloud-RCR-main (`Rc*`/`Rcl*`/`Rl*`) and subscription-main (`S-*`, ⁵) paths both route Codex). For
   **Claude/Router**, a `rayline`-only sub-axis isn't wired yet, for two reasons:
