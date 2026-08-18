@@ -140,8 +140,8 @@ main agent is unverified end-to-end (see ¹/⁴) · ❌ = not supported. See
 | **K-K** ⁶ | `keyed` | `keyed` | N/A | N/A | keyed provider (API key) | keyed provider (API key, distinct model) | provider API key | ✅ | ✅ ⁶ | ✅ | [`K-K.json`](./K-K.json) |
 | **L-Rc** ¹ | `local` | `rayline` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-Rc.json`](./L-Rc.json) |
 | **L-Rcl** ³ | `local` | `rayline` | rayline-cloud | on | local model | cloud model (RCR may send a subagent → local) | rayline | ❌ | ❌ | ❌ | — (may-local) |
-| **L-Rl** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | ✅ | 🟡 ⁴ | 🟡 ⁷ | [`L-Rl.json`](./L-Rl.json) |
-| **L-K** ¹ | `local` | `keyed` | N/A | N/A | local model | Anthropic (API key) | API key | 🟡 | 🟡 ⁴ | 🟡 | [`L-K.json`](./L-K.json) |
+| **L-Rl** ¹ | `local` | `rayline` | rayline-local | N/A | local model | cloud model (via local router) | rayline | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-Rl.json`](./L-Rl.json) |
+| **L-K** ¹ | `local` | `keyed` | N/A | N/A | local model | Anthropic (API key) | API key | ✅ | 🟡 ⁴ | ✅ | [`L-K.json`](./L-K.json) |
 | **L-L** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-L.json`](./L-L.json) |
 
 Plus three granular **per-type** variants that split subagents by **type**
@@ -238,10 +238,12 @@ codex-cli 0.145.0), same pin via a baked tag (`FROM qwen3.5:9b` + `PARAMETER num
 | `L-L` | `rayline claude --config` | ✅ both subagents spawned in parallel → `endpoint:ollama`, results returned, final answer |
 | `L-L` | `rayline router start --config` + client at the proxy | ✅ both subagents (`agent_type=Explore` + `general-purpose`) → `endpoint:ollama` — again on the **second** attempt; the first narrated the answer without spawning |
 | `L-Rc` | `rayline claude --config` | ✅ subagents → `endpoint:rayline-cloud`, no upstream errors |
-| `L-Rc` | `rayline router start --config` | ✅ same, **once `RAYLINE_ROUTER_API_KEY` was set** (⁷) |
+| `L-Rc` | `rayline router start --config` | ✅ same, **once `RAYLINE_ROUTER_API_KEY` held an `rlk-` router key** (⁷) |
 | `L-Rl` | `rayline claude --config` | ✅ subagents → `rayline-cloud:deepseek/deepseek-v4-pro`, results returned to the main, no upstream errors — this is the run that flips ¹'s earlier 🟡 |
-| `L-Rl` | `rayline router start --config` | 🟡 routing correct (subagent → pinned `deepseek/deepseek-v4-pro`), upstream **403** — the credential was not entitled to that pin, so the leg is unverified for credential reasons, not routing ones |
-| `L-K` | — | 🟡 still not run — this host also had no `ANTHROPIC_API_KEY` |
+| `L-Rl` | `rayline router start --config` | ✅ subagents → pinned `deepseek/deepseek-v4-pro`, no upstream errors (with an `rlk-` key — see ⁷; a session token 403s here) |
+| `L-K` | `rayline claude --config` | ✅ subagents → `endpoint:anthropic` → `claude-sonnet-4-6`, both returned; each subagent's **first** request 400s and succeeds on the client's retry |
+| `L-K` | `rayline router start --config` | ✅ same, on the second attempt (spawn flakiness, not routing) |
+| `L-K` | `rayline codex --config` | 🟡 main → ollama; Codex exposed no subagent tool to spawn with (⁴) |
 
 Two confounders showed up that are worth avoiding when reproducing: an **orphaned
 client** from a previous run keeps hitting the proxy and interleaves its routes into
@@ -367,21 +369,30 @@ start` does not. So any mode whose **subagent** leg is a cloud endpoint (`L-Rc`,
 `L-Rl`, and the `*-Rc*`/`*-Rl` family generally) will route correctly and then fail
 upstream with **HTTP 401** on that leg when driven from `router start` with no key —
 and because the main leg is local and still answers, the run can print a plausible
-final message and exit 0 while the subagent leg silently retried and gave up. Export a
-key first:
+final message and exit 0 while the subagent leg silently retried and gave up.
+
+**It must be an `rlk-` router key, and a session token is not one.** These are two
+different credentials against two different planes:
+
+| Credential | Looks like | Plane | Data-plane result |
+|---|---|---|---|
+| session token (`rayline auth token`) | `rls_…` | control plane | **403** `authentication_error` — *"Rayline session tokens cannot call the model data plane. Use an rlk- router key."* |
+| router key (`rayline key create`) | `rlk-…` | model data plane | ✅ |
+
+So `RAYLINE_ROUTER_API_KEY="$(rayline auth token)"` **does not work** — it clears the
+401 and earns a 403 instead, which is easy to misread as an entitlement problem with
+whatever model the route pins. It is not: the 403 is identical for an unpinned
+`rayline-router` route, so the model is irrelevant. Use a real router key:
 
 ```bash
-export RAYLINE_ROUTER_API_KEY="$(rayline auth token)"   # or an rlk- router key
+export RAYLINE_ROUTER_API_KEY="rlk-…"    # NOT $(rayline auth token)
 rayline router start --config examples/routing-modes/L-Rc.json
 ```
 
-With the key set, `L-Rc` and `L-L` are ✅ from this entry point. `L-Rl` stays 🟡 for a
-different reason: it pins `deepseek/deepseek-v4-pro`, and a credential that
-authenticates fine can still be **403**-refused for that specific model, which blocks
-the end-to-end without saying anything about the routing (the route line shows the pin
-applied correctly). Check the run's exit status *and* the router log for 401/403 on
-`task=subagent` before scoring a Router-column cell — a printed answer is not
-sufficient evidence the subagent leg worked.
+With an `rlk-` key, `L-L`, `L-Rc`, `L-Rl`, and `L-K` are all ✅ from this entry point.
+Check the run's exit status *and* the router log for 401/403 on `task=subagent` before
+scoring a Router-column cell — a printed answer is not sufficient evidence the subagent
+leg worked, and this is the specific way it lies.
 
 ### What the columns mean
 
@@ -410,13 +421,14 @@ dependence on a pinned context window). Per-cell status:
   decider, no ML policy needed. (`Rcl-Rcl` is ✅ for the client/advertisement contract;
   its actual local redirect is hosted-gated — see §.)
 - **🟡** — *routes correctly; the leg past the main agent is unverified end-to-end*.
-  For **Claude** this is now only `L-K`, which needs an `ANTHROPIC_API_KEY` no test
-  host has had: with the local model's context window pinned, the local main drives the
-  tool loop and spawns subagents, and `L-L`/`L-Rc`/`L-Rl` are all ✅ on that basis — a
-  re-run took `L-Rl` from 🟡 to ✅ (the subagent's result *did* return to the main). For
-  **Router** it's `L-Rl` and `L-K`, both blocked on credentials rather than routing: a
-  403 on `L-Rl`'s pinned model, and the missing key for `L-K` — see ⁷, and ¹ for the
-  measured matrix. Routing for all four is exercised by the hermetic tests regardless.
+  For **Claude and Router** there are now **no** 🟡 local-main cells: with the context
+  window pinned (¹) the local main drives the tool loop and spawns subagents, and with
+  the right credentials all four of `L-L`/`L-Rc`/`L-Rl`/`L-K` complete end-to-end on
+  both entry points. Every 🟡 those modes previously carried turned out to be a
+  credential or environment problem rather than a routing or capability one — an
+  `ANTHROPIC_API_KEY` for `L-K`, and an `rlk-` router key (not a session token) for the
+  cloud subagent legs; see ⁷, and ¹ for the measured matrix. Routing for all four is
+  exercised by the hermetic tests regardless.
   If a local main narrates tool calls as text instead of invoking them, check ollama's
   context window before blaming the model: a 4k default truncates the tool schemas out
   of the prompt (see ¹).
