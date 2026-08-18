@@ -47,7 +47,8 @@ S-Rcl S-L L-Rc L-Rl L-K L-L Rl-L S-Rl` (skip `Rcl-K Rcl-L L-Rcl`, see §5) — d
 ```bash
 # a) clean slate so `rayline top` reflects only this mode (each run restarts rld)
 pkill -9 -f "rld serve|rld proxy"; sleep 1
-# b) run the mode's demo headless, with a ~100s timeout (local-main modes hang — expected)
+# b) run the mode's demo headless, with a ~100s timeout (local-main modes are slow —
+#    a pinned-window 9B took ~6 min to reach the spawn; raise the bound for L-* modes)
 DEMO_HEADLESS=1 RAYLINE_BIN="$RB" ./examples/routing-modes/visual-test.sh "$MODE" "$PROMPT" >/tmp/v-$MODE.out 2>&1 &
 P=$!; for i in $(seq 1 20); do sleep 5; kill -0 $P 2>/dev/null || break; done; kill -9 $P 2>/dev/null
 # c) read what actually routed (do NOT trust the demo's own summary if it was killed):
@@ -90,10 +91,10 @@ move to the next mode. Don't batch them; one at a time.
 | **S-Rc** | **subscription** (passthrough) | cloud (RCR pick) | main `target=anthropic`/`selective_main_passthrough`; subagents remote | REVIEW (cloud pick) |
 | **S-Rcl** § | subscription | cloud + may-local | main passthrough; subagents remote or Explore→local | REVIEW |
 | **S-L** | subscription | **ollama** `qwen…` | main passthrough; subagents `qwen*` (local) | **PASS** (passthrough + local) |
-| **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (if spawned) | main `selected_model=qwen3.5:9b` | REVIEW (local main usually spawns no subagents) |
-| **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro` (if spawned) | main `qwen3.5:9b` | REVIEW (local main) |
-| **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key, if spawned) | main `qwen3.5:9b` | REVIEW (local main + needs key) |
-| **L-L** ‡ | ollama `qwen3.5:9b` | ollama (if spawned) | main `qwen3.5:9b` | REVIEW (local main) |
+| **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (RCR pick) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
+| **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro` | REVIEW (local main; the pin can 403) |
+| **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key) | main `qwen3.5:9b`; subagents `claude-sonnet-4-6` | REVIEW (local main + needs key) |
+| **L-L** ‡ | ollama `qwen3.5:9b` | **ollama** | main `qwen3.5:9b`; subagents `qwen3.5:9b` | REVIEW (local main) |
 | **Rl-L** | cloud **pinned `z-ai/glm-5.2`** | **ollama** `qwen2.5-coder:7b` | main `z-ai/glm-5.2`; subagents `qwen2.5-coder:7b` | **PASS (deterministic)** |
 | **S-Rl** | subscription | cloud **pinned `deepseek/deepseek-v4-pro`** | main passthrough; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic subagent)** |
 
@@ -102,10 +103,22 @@ decision; with local ON it usually sends `Explore` to local, but it's discretion
 Because the implicit account-local path also advertises, Rc-Rc/S-Rc behave the same —
 so Rcl-Rcl/S-Rcl are **not** distinguishable from Rc-Rc/S-Rc by routing alone. Mark REVIEW.
 
-**‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model that usually
-**cannot drive Claude Code's Task tool**, so subagents typically **do not spawn**.
-Verify the **main** routes to ollama; treat absent subagents as the known limitation,
-**not** a failure.
+**‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model. **Pin its
+context window first** — ollama's VRAM-derived default (often 4096; check `ollama ps`,
+CONTEXT column) truncates the tool schemas out of the prompt, and the model then
+narrates tool calls as prose instead of invoking them. Bake it into a tag (`FROM
+qwen3.5:9b` + `PARAMETER num_ctx 32768`, `ollama create …-32k -f Modelfile`, then name
+that tag in the config's `models` and `routes.*.model`) or raise
+`OLLAMA_CONTEXT_LENGTH`; ollama drops `options.num_ctx` on the compat routes Rayline
+speaks, so Rayline cannot inject it. See the README's footnote ¹.
+
+With the window pinned the local main **does** drive Claude Code's Task tool and
+spawns subagents — verify both the **main** route to ollama and the `task=subagent`
+lines. Spawning is still **flaky** (~1 in 4 attempts the main narrates the answer and
+stops), so a single no-spawn run is not a failure; re-run before scoring. For the
+**Router** entry point, `rayline router start` does **not** inject your session key —
+export `RAYLINE_ROUTER_API_KEY="$(rayline auth token)"` first, or cloud subagent legs
+401 while the local main still prints a plausible answer and exits 0.
 
 ---
 
