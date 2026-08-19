@@ -354,6 +354,7 @@ struct ProxyArgs {
 enum ProxyRoutingModeArg {
     All,
     SelectiveSubagents,
+    Passthrough,
 }
 
 impl From<ProxyRoutingModeArg> for rayline_proxy::ProxyRoutingMode {
@@ -361,6 +362,7 @@ impl From<ProxyRoutingModeArg> for rayline_proxy::ProxyRoutingMode {
         match value {
             ProxyRoutingModeArg::All => Self::All,
             ProxyRoutingModeArg::SelectiveSubagents => Self::SelectiveSubagents,
+            ProxyRoutingModeArg::Passthrough => Self::Passthrough,
         }
     }
 }
