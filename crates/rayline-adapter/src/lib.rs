@@ -246,6 +246,9 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             requested_model: Some(client_model.clone()),
             agent_id: None,
             agent_type: None,
+            // The adapter serves the local model behind the router, which
+            // already attributes the conversation on the inbound request.
+            session_id: None,
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: request_id.clone(),
@@ -258,6 +261,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             task_class: None,
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: request_id.clone(),
