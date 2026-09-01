@@ -87,7 +87,10 @@ fn config_value_needs_local_router(cfg: &Value) -> bool {
     if config_value_uses_local_decider(cfg) {
         return true;
     }
-    let cloud_ids = cloud_router_endpoint_ids(cfg);
+    // "Not a hosted RCR endpoint" is what pulls a route off the hosted path, so
+    // this must span prod AND dev: reading `api-dev.rayline.ai` as non-cloud
+    // engaged the on-device LSR for configs that are entirely cloud.
+    let cloud_ids = hosted_rcr_endpoint_ids(cfg);
     route_target_endpoints(cfg)
         .into_iter()
         .any(|endpoint| !cloud_ids.contains(&endpoint))
@@ -113,8 +116,19 @@ fn config_value_uses_local_decider(cfg: &Value) -> bool {
         .any(|route| route.get("router").and_then(Value::as_str) == Some(ROUTER_RAYLINE_LOCAL))
 }
 
-/// Whether any route targets the hosted cloud router (so its key should be
-/// resolved from `rayline auth login`).
+/// Whether any route targets the hosted cloud router — prod (`api.rayline.ai`)
+/// **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key should be resolved from
+/// `rayline auth login`.
+///
+/// Both hosts, deliberately. This used to match prod only, which made a
+/// dev-targeted config fail three ways at once: no `rlk-` key was injected (the
+/// endpoint answered 401), the on-device LSR was engaged for a config that is
+/// purely cloud, and may-local could therefore never fire (see
+/// [`config_needs_local_router`], which reads "not a cloud endpoint" as "needs
+/// the local router"). Every other hosted-RCR test in the workspace already
+/// spans both hosts — `endpoint_base_url_is_hosted_rcr` here, and
+/// `endpoint_is_hosted_rcr` in `rayline-local-router` — so prod-only was the
+/// lone holdout, not a policy.
 pub fn config_uses_cloud_router(path: &Path) -> bool {
     let Ok(raw) = std::fs::read(path) else {
         return false;
@@ -122,7 +136,7 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
     let Ok(cfg) = serde_json::from_slice::<Value>(&raw) else {
         return false;
     };
-    let cloud_ids = cloud_router_endpoint_ids(&cfg);
+    let cloud_ids = hosted_rcr_endpoint_ids(&cfg);
     route_target_endpoints(&cfg)
         .into_iter()
         .any(|endpoint| cloud_ids.contains(&endpoint))
@@ -132,21 +146,12 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
 /// (`api.rayline.ai`) **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key
 /// should be provisioned from `rayline auth login`.
 ///
-/// Broader than [`config_uses_cloud_router`] (prod host only): this matches the
-/// same hosts the Codex-native rewrite guards on
-/// ([`endpoint_base_url_is_hosted_rcr`]), so the Codex provisioning gate fires for
-/// a dev-targeted config too (`rayline --env dev codex --config …`).
+/// The Codex-side spelling of [`config_uses_cloud_router`], kept as its own name
+/// because `codex.rs` guards its native rewrite on this question. The two were
+/// separate predicates while the cloud-router gate was prod-only; they now ask
+/// exactly the same thing, so this delegates rather than drifting again.
 pub fn config_routes_to_hosted_rcr(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read(path) else {
-        return false;
-    };
-    let Ok(cfg) = serde_json::from_slice::<Value>(&raw) else {
-        return false;
-    };
-    let hosted_ids = hosted_rcr_endpoint_ids(&cfg);
-    route_target_endpoints(&cfg)
-        .into_iter()
-        .any(|endpoint| hosted_ids.contains(&endpoint))
+    config_uses_cloud_router(path)
 }
 
 /// Endpoint ids whose `base_url` host is a hosted RCR (prod or dev).
@@ -383,7 +388,10 @@ fn route_advertised_local_model(route: &Value) -> Option<String> {
 /// is the upstream the proxy's may-local redirect is fronted onto. The hosted
 /// cloud router is excluded — a local model is served by a local endpoint.
 fn endpoint_base_url_for_model(cfg: &Value, model: &str) -> Option<String> {
-    let cloud_ids = cloud_router_endpoint_ids(cfg);
+    // Spans prod AND dev: with prod-only matching, a dev-targeted config could
+    // resolve `api-dev.rayline.ai` as the *local* upstream for a may-local
+    // redirect — pointing the redirect back at the hosted RCR it came from.
+    let cloud_ids = hosted_rcr_endpoint_ids(cfg);
     cfg.get("endpoints")
         .and_then(Value::as_array)?
         .iter()
@@ -772,22 +780,6 @@ fn rewrite_subscription_route_for_codex(route: &mut Value) -> bool {
         );
     }
     true
-}
-
-/// Endpoint ids whose `base_url` host is the hosted cloud router.
-fn cloud_router_endpoint_ids(cfg: &Value) -> Vec<String> {
-    let cloud_host = host_of(crate::ROUTER_PROD_URL);
-    let Some(endpoints) = cfg.get("endpoints").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    endpoints
-        .iter()
-        .filter_map(|endpoint| {
-            let id = endpoint.get("id").and_then(Value::as_str)?;
-            let base_url = endpoint.get("base_url").and_then(Value::as_str)?;
-            (host_of(base_url) == cloud_host && cloud_host.is_some()).then(|| id.to_owned())
-        })
-        .collect()
 }
 
 /// Every endpoint id referenced by any route (`main`, `default`, `subagent`,
@@ -1492,6 +1484,43 @@ mod tests {
         assert!(!config_value_needs_local_router(&cfg));
     }
 
+    #[test]
+    fn dev_hosted_rcr_routes_behave_exactly_like_prod() {
+        // Same config twice, prod host vs dev host. Every routing answer must
+        // match: the dev RCR is the same hosted router on a different hostname.
+        let build = |base_url: &str| {
+            json!({
+                "endpoints": [
+                    { "id": "rayline", "protocol": "anthropic_messages",
+                      "base_url": base_url, "models": ["rayline-router"] },
+                    { "id": "ollama", "protocol": "openai_chat",
+                      "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
+                ],
+                "routes": {
+                    "main": { "endpoint": "rayline", "router": "rayline-cloud",
+                              "local_models": ["qwen2.5-coder:7b"] },
+                    "subagent": { "endpoint": "rayline", "router": "rayline-cloud",
+                                  "local_models": ["qwen2.5-coder:7b"] }
+                }
+            })
+        };
+        let prod = build(crate::ROUTER_PROD_URL);
+        let dev = build("https://api-dev.rayline.ai");
+
+        // An all-cloud config must not engage the on-device LSR — on either host.
+        assert!(!config_value_needs_local_router(&prod));
+        assert!(!config_value_needs_local_router(&dev));
+
+        // May-local must resolve to the *local* endpoint, never back to the
+        // hosted RCR the redirect came from.
+        let expected = Some(MayLocal {
+            model: "qwen2.5-coder:7b".to_owned(),
+            upstream_url: "http://127.0.0.1:11434".to_owned(),
+        });
+        assert_eq!(config_value_may_local(&prod), expected);
+        assert_eq!(config_value_may_local(&dev), expected);
+    }
+
     // ── Codex native-Responses forwarding to the hosted RCR (edge half of #36) ──
 
     #[test]
@@ -1654,11 +1683,21 @@ mod tests {
         )
         .unwrap();
         assert!(!config_routes_to_hosted_rcr(&local));
-        // Prod-only helper stays prod-only (dev is not "cloud router").
-        assert!(!config_uses_cloud_router(&write(
+        // `config_uses_cloud_router` agrees on every host. It used to answer
+        // prod-only, which is what left dev-targeted configs unprovisioned.
+        assert!(config_uses_cloud_router(&write(
             "dev2.json",
             "https://api-dev.rayline.ai"
         )));
+        assert!(config_uses_cloud_router(&write(
+            "prod2.json",
+            "https://api.rayline.ai"
+        )));
+        assert!(!config_uses_cloud_router(&write(
+            "custom2.json",
+            "https://not-the-rcr.example.com"
+        )));
+        assert!(!config_uses_cloud_router(&local));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
