@@ -239,8 +239,25 @@ Hosted Claude launches mint and store an `rlk-` router key separately from the
 CLI session. Logging out calls `/v1/auth/cli/revoke` best-effort, clears the
 local session, and drops the stored router key.
 
-Custom hosted environments can be configured in
-`~/.config/rayline/settings.json` for internal/dev routing.
+### Environments
+
+`--env <name>` selects the hosted router. Two names are built in:
+
+| Env | Router | Sign-in |
+| --- | --- | --- |
+| `prod` (default) | `https://api.rayline.ai` | `https://platform.rayline.ai` |
+| `dev` | `https://api-dev.rayline.ai` | `https://dev.platform.rayline.ai` |
+
+Run Claude Code against the staging router:
+
+```bash
+rayline --env dev auth login    # once: signs in and mints the dev rlk- key
+rayline --env dev claude
+```
+
+Further hosted environments can be configured in
+`~/.config/rayline/settings.json`. A `dev` entry there overrides the built-in
+one.
 
 ## Routing Specific Subagents (Override Config)
 

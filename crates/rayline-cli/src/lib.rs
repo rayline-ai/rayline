@@ -26,6 +26,9 @@ pub const DOT_CONFIG_DIR: &str = ".rayline";
 pub const ROUTER_STATE_DIR: &str = ".rayline/rld";
 pub const ROUTER_FILE_PREFIX: &str = "rl-rld";
 pub const ROUTER_PROD_URL: &str = "https://api.rayline.ai";
+/// Staging router. Built in beside prod so `rayline --env dev ...` works on a
+/// fresh machine; a `environments.dev` entry in settings.json still wins.
+pub const ROUTER_DEV_URL: &str = "https://api-dev.rayline.ai";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
 pub const UV_TOOL_NAME: &str = "rayline-cli";

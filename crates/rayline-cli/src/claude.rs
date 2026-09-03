@@ -578,6 +578,11 @@ async fn run_command_from_home(
         )
         .await?
     };
+    // Name the target whenever it is not the default. A session pointed at a
+    // staging router must never look like a production one.
+    if !crate::status::is_prod_env(&env_name) {
+        eprintln!("{} env {env_name} \u{2192} {router_url}", crate::CLI_BIN);
+    }
 
     // Single `/v1/settings` fetch per launch, feeding BOTH the pinned-main-model
     // auto-compact window and the account `enable_local_router` toggle. Skip it

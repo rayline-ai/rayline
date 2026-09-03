@@ -27,6 +27,9 @@ const IDENTITY_TOOLKIT_URL: &str =
 const IDENTITY_TOOLKIT_CUSTOM_TOKEN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
 const PROD_ENV: &str = "prod";
+const DEV_ENV: &str = "dev";
+const DEV_CLI_AUTH_URL: &str = "https://dev.platform.rayline.ai/cli-auth";
+const DEV_ACCOUNT_URL: &str = "https://dev.platform.rayline.ai";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusRequest {
@@ -293,6 +296,12 @@ impl ClaudeLogoutRequest {
     pub fn should_forward_for_invalid_envvar(&self) -> bool {
         should_forward_for_invalid_envvar(self.root_env_explicit)
     }
+}
+
+/// Whether `value` names the default production environment. Callers use it to
+/// stay quiet on prod and announce every other environment.
+pub(crate) fn is_prod_env(value: &str) -> bool {
+    value == PROD_ENV
 }
 
 pub fn is_valid_root_env(value: &str) -> bool {
@@ -1631,14 +1640,14 @@ pub(crate) fn resolve_hosted_environment(
         return Ok(prod_hosted_environment());
     }
     let Some(home) = home else {
-        return Err(HostedEnvironmentError::Unknown {
+        return builtin_hosted_environment(env_name).ok_or(HostedEnvironmentError::Unknown {
             env_name: env_name.to_owned(),
             settings_path: None,
         });
     };
     let settings_path = settings_file(home);
     let Some(settings) = read_settings(home) else {
-        return Err(HostedEnvironmentError::Unknown {
+        return builtin_hosted_environment(env_name).ok_or(HostedEnvironmentError::Unknown {
             env_name: env_name.to_owned(),
             settings_path: Some(settings_path),
         });
@@ -1649,13 +1658,33 @@ pub(crate) fn resolve_hosted_environment(
         .and_then(|envs| envs.get(env_name))
         .and_then(Value::as_object)
     else {
-        return Err(HostedEnvironmentError::Unknown {
+        return builtin_hosted_environment(env_name).ok_or(HostedEnvironmentError::Unknown {
             env_name: env_name.to_owned(),
             settings_path: Some(settings_path),
         });
     };
 
     configured_hosted_environment(env_name, &settings_path, entry)
+}
+
+/// The environments this build knows without a settings.json entry. `prod` is
+/// handled earlier; `dev` is here so a new user can reach the staging router
+/// with nothing but `rayline --env dev auth login`.
+fn builtin_hosted_environment(env_name: &str) -> Option<HostedEnvironment> {
+    if env_name != DEV_ENV {
+        return None;
+    }
+    Some(HostedEnvironment {
+        name: DEV_ENV.to_owned(),
+        credential_key: DEV_ENV.to_owned(),
+        router_url: crate::ROUTER_DEV_URL.to_owned(),
+        cli_auth_url: DEV_CLI_AUTH_URL.to_owned(),
+        account_url: Some(DEV_ACCOUNT_URL.to_owned()),
+        auth_kind: HostedAuthKind::RaylineSession,
+        firebase_api_key: None,
+        google_device_client_id: None,
+        google_device_client_secret: None,
+    })
 }
 
 fn prod_hosted_environment() -> HostedEnvironment {
@@ -3750,6 +3779,41 @@ mod tests {
             env_data.get("email").and_then(value_as_str),
             Some("one@example.com")
         );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+    #[test]
+    fn resolve_hosted_environment_reads_builtin_dev() {
+        let hosted = resolve_hosted_environment(DEV_ENV, None).expect("dev env");
+
+        assert_eq!(hosted.name, "dev");
+        assert_eq!(hosted.credential_key, "dev");
+        assert_eq!(hosted.router_url, crate::ROUTER_DEV_URL);
+        assert_eq!(hosted.cli_auth_url, DEV_CLI_AUTH_URL);
+        assert_eq!(hosted.auth_kind, HostedAuthKind::RaylineSession);
+    }
+
+    #[test]
+    fn configured_dev_environment_overrides_the_builtin() {
+        let home = temp_home("configured-dev-env");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+        write_settings(
+            &home,
+            &serde_json::json!({
+                "environments": {
+                    "dev": {
+                        "router_url": "https://router.example.test/",
+                        "cli_auth_url": "https://platform.example.test/cli-auth/"
+                    }
+                }
+            }),
+        )
+        .expect("write settings");
+
+        let hosted = resolve_hosted_environment(DEV_ENV, Some(&home)).expect("configured dev env");
+
+        assert_eq!(hosted.router_url, "https://router.example.test");
 
         let _ = fs::remove_dir_all(&home);
     }
