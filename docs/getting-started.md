@@ -255,6 +255,13 @@ rayline --env dev auth login    # once: signs in and mints the dev rlk- key
 rayline --env dev claude
 ```
 
+`--print-env` reports the resolved router and the exports that reach it, then
+exits without launching. The key is masked:
+
+```bash
+rayline --env dev claude --print-env
+```
+
 Further hosted environments can be configured in
 `~/.config/rayline/settings.json`. A `dev` entry there overrides the built-in
 one.

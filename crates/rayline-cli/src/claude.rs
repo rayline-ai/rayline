@@ -98,6 +98,9 @@ pub struct RunRequest {
     pub route_scope_explicit: bool,
     pub route_statusline_enabled: bool,
     pub diagnose: bool,
+    /// Report the router environment and the exports that reach it, then
+    /// exit. Launches nothing and starts no proxy; the key is masked.
+    pub print_env: bool,
     pub upstream_ca_path: Option<PathBuf>,
     pub router_config_path: Option<PathBuf>,
     /// v2: a `RouterConfig` file (`--config`) that drives BOTH the main agent and
@@ -1012,6 +1015,59 @@ async fn run_command_from_home(
         preserve_spawned_by_pid,
     });
     Ok(command)
+}
+
+/// Mask a router key for display: keep the scheme prefix (it names the key
+/// kind, not the secret) and the length, drop everything else.
+pub(crate) fn mask_router_key(key: &str) -> String {
+    if key.is_empty() {
+        return "(unset)".to_owned();
+    }
+    let scheme = key
+        .char_indices()
+        .take(5)
+        .find(|(_, ch)| matches!(ch, '-' | '_'))
+        .map(|(index, ch)| &key[..index + ch.len_utf8()])
+        .unwrap_or("");
+    format!("{scheme}\u{2026} ({} chars)", key.len())
+}
+
+/// The `--print-env` report: which router this environment resolves to, and the
+/// exports that point an Anthropic-shaped client at it. Pure so the masking is
+/// testable; the key never appears in full.
+pub(crate) fn render_env_report(
+    env_name: &str,
+    router_url: &str,
+    key: &str,
+    model: &str,
+) -> String {
+    format!(
+        "{} env {env_name} \u{2192} {router_url}\n\n  export ANTHROPIC_BASE_URL={router_url}\n  export ANTHROPIC_AUTH_TOKEN={}\n  export ANTHROPIC_MODEL={model}\n",
+        crate::CLI_BIN,
+        mask_router_key(key),
+    )
+}
+
+/// Resolve the environment, router URL and router key exactly as a launch
+/// would, and render the report. Starts no proxy and execs nothing.
+pub async fn env_report(request: &RunRequest) -> Result<String, RunError> {
+    let home = dirs::home_dir().ok_or(RunError::HomeNotFound)?;
+    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
+    let hosted = crate::status::resolve_hosted_environment(&env_name, Some(&home))
+        .map_err(|error| RunError::HostedEnvironment(error.to_string()))?;
+    let router_url = hosted.router_url.clone();
+    let key = ensure_router_key(
+        &env_name,
+        &home,
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await?;
+    let model = request
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for_routing_mode(request.routing_mode).to_owned());
+    Ok(render_env_report(&env_name, &router_url, &key, &model))
 }
 
 fn router_url_for_run(
@@ -2862,5 +2918,44 @@ mod implicit_local_routing_tests {
             effective_routing_mode(RoutingMode::ProxySubagents, true, false),
             RoutingMode::ProxySubagents
         );
+    }
+}
+
+#[cfg(test)]
+mod env_report_tests {
+    use super::*;
+
+    #[test]
+    fn env_report_names_the_environment_and_router() {
+        let report = render_env_report(
+            "dev",
+            "https://api-dev.rayline.ai",
+            "rlk-abcdef0123456789",
+            "rayline-router",
+        );
+
+        assert!(report.contains("env dev"));
+        assert!(report.contains("https://api-dev.rayline.ai"));
+        assert!(report.contains("export ANTHROPIC_BASE_URL=https://api-dev.rayline.ai"));
+        assert!(report.contains("export ANTHROPIC_AUTH_TOKEN="));
+        assert!(report.contains("export ANTHROPIC_MODEL=rayline-router"));
+    }
+
+    #[test]
+    fn env_report_masks_the_router_key() {
+        let key = "rlk-abcdef0123456789";
+        let report = render_env_report("dev", "https://api-dev.rayline.ai", key, "rayline-router");
+
+        assert!(!report.contains(key));
+        assert!(!report.contains("abcdef0123456789"));
+        assert!(report.contains("rlk-"));
+        assert!(report.contains(&format!("{} chars", key.len())));
+    }
+
+    #[test]
+    fn masked_key_keeps_only_the_scheme_prefix() {
+        assert_eq!(mask_router_key("rlk-abcdef0123"), "rlk-… (14 chars)");
+        assert_eq!(mask_router_key("short"), "… (5 chars)");
+        assert_eq!(mask_router_key(""), "(unset)");
     }
 }

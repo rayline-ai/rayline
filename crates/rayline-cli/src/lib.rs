@@ -131,6 +131,9 @@ Options:
   --local-injector-port <port>      Local injector port
   --statusline/--no-statusline      Show proxy picked model in status line
   --diagnose                        Print routing diagnostics before exec
+  --print-env                       Print the router environment and the
+                                    exports that reach it, then exit
+                                    (key masked; launches nothing)
   --upstream-ca-path <path>         CA bundle for upstream proxy mode
   --config <path>                   Routing config (endpoints + routes) driving
                                     BOTH the main agent and subagents. Scope is
@@ -1050,6 +1053,7 @@ where
     let mut route_scope: Option<RouteScope> = None;
     let mut route_statusline_enabled = true;
     let mut diagnose = false;
+    let mut print_env = false;
     let mut upstream_ca_path = None;
     let mut router_config_path = None;
     // v2: `--config <file>` drives BOTH main + subagents via a RouterConfig file,
@@ -1183,6 +1187,10 @@ where
                 diagnose = true;
                 continue;
             }
+            "--print-env" => {
+                print_env = true;
+                continue;
+            }
             "--local-injector-port" => {
                 local_injector_port = Some(args.next()?.to_str()?.parse().ok()?);
                 continue;
@@ -1250,6 +1258,7 @@ where
         route_scope_explicit: route_scope.is_some(),
         route_statusline_enabled,
         diagnose,
+        print_env,
         upstream_ca_path,
         router_config_path,
         config_path,
@@ -2046,6 +2055,18 @@ fn root_version_requested(original_argv: &[OsString]) -> bool {
 }
 
 async fn exec_claude(request: crate::claude::RunRequest) -> ExitCode {
+    if request.print_env {
+        return match crate::claude::env_report(&request).await {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let print_mode = crate::claude::print_mode_flag(&request.args).is_some();
     let mut command = match crate::claude::run_command(&request).await {
         Ok(command) => command,
@@ -2982,5 +3003,39 @@ mod tests {
             }
             other => panic!("expected CodexConfigure, got {other:?}"),
         }
+    }
+    // ── `--print-env`: report the exports, launch nothing ─────────────────
+
+    #[test]
+    fn print_env_flag_sets_the_request_and_is_not_forwarded() {
+        let request = claude_run(&["rayline", "--env", "dev", "claude", "--print-env"]);
+
+        assert!(request.print_env);
+        assert_eq!(request.env_name.as_deref(), Some("dev"));
+        assert!(request.args.is_empty());
+    }
+
+    #[test]
+    fn print_env_flag_keeps_the_remaining_claude_args() {
+        let request = claude_run(&[
+            "rayline",
+            "--env",
+            "dev",
+            "claude",
+            "--print-env",
+            "--",
+            "-p",
+            "hello",
+        ]);
+
+        assert!(request.print_env);
+        assert_eq!(request.args, argv(&["-p", "hello"]));
+    }
+
+    #[test]
+    fn claude_run_without_print_env_leaves_the_flag_off() {
+        let request = claude_run(&["rayline", "--env", "dev", "claude"]);
+
+        assert!(!request.print_env);
     }
 }
