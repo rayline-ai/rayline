@@ -161,6 +161,20 @@ fn default_model_for_routing_mode(mode: RoutingMode, hybrid_main_requested: bool
     }
 }
 
+/// The launch line naming the resolved routing mode and the model it exports, so
+/// a downgrade is visible instead of silent (decision 35(b)).
+fn render_routing_line(mode: RoutingMode, exported_model: Option<&str>) -> String {
+    let model = match exported_model {
+        Some(model) => format!("ANTHROPIC_MODEL={model}"),
+        None => "ANTHROPIC_MODEL unset (Claude Code's own model)".to_owned(),
+    };
+    format!(
+        "{} routing mode: {} \u{2192} {model}",
+        crate::CLI_BIN,
+        routing_mode_name(mode),
+    )
+}
+
 /// Whether *implicit* account-local routing (the hosted `enable_local_router`
 /// toggle + an on-device config) should engage for this run.
 ///
@@ -878,6 +892,13 @@ async fn run_command_from_home(
         } else {
             (model, set_model_env)
         };
+    eprintln!(
+        "{}",
+        render_routing_line(
+            request.routing_mode,
+            set_model_env.then_some(model.as_str())
+        )
+    );
     let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
@@ -3093,5 +3114,34 @@ mod main_thread_model_tests {
             false,
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod routing_line_tests {
+    use super::*;
+
+    #[test]
+    fn the_line_names_the_mode_and_the_model_it_exports() {
+        assert_eq!(
+            render_routing_line(RoutingMode::ProxySubagents, Some(DEFAULT_MODEL)),
+            "rayline routing mode: proxy-subagents \u{2192} ANTHROPIC_MODEL=rayline-router"
+        );
+        assert_eq!(
+            render_routing_line(RoutingMode::Proxy, Some(DEFAULT_MODEL)),
+            "rayline routing mode: proxy \u{2192} ANTHROPIC_MODEL=rayline-router"
+        );
+        assert_eq!(
+            render_routing_line(RoutingMode::Override, Some("z-ai/glm-5.2")),
+            "rayline routing mode: override \u{2192} ANTHROPIC_MODEL=z-ai/glm-5.2"
+        );
+    }
+
+    #[test]
+    fn an_unexported_model_is_named_as_such() {
+        assert_eq!(
+            render_routing_line(RoutingMode::ProxySubagents, None),
+            "rayline routing mode: proxy-subagents \u{2192} ANTHROPIC_MODEL unset (Claude Code's own model)"
+        );
     }
 }
