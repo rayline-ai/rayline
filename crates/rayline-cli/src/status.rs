@@ -12,6 +12,8 @@ use rand::Rng;
 use serde_json::{Map, Value};
 use url::{Host, Url};
 
+use crate::auth_callback_page;
+
 const AUTH_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const TOKEN_REFRESH_MARGIN_SECONDS: f64 = 300.0;
 const WEB_CALLBACK_TIMEOUT_SECONDS: u64 = 300;
@@ -1998,12 +2000,12 @@ fn handle_callback_connection(
     match request.method.as_str() {
         "GET" => match parse_callback_query(&request.target, expected_state) {
             Ok(Some(code)) => {
-                respond_html(stream, 200, "OK", &callback_success_html())
+                respond_html(stream, 200, "OK", &auth_callback_page::success_html())
                     .map_err(AuthLoginError::WriteFailed)?;
                 Ok(Some(code))
             }
             Ok(None) => {
-                respond_html(stream, 200, "OK", &callback_waiting_html())
+                respond_html(stream, 200, "OK", &auth_callback_page::waiting_html())
                     .map_err(AuthLoginError::WriteFailed)?;
                 Ok(None)
             }
@@ -2012,7 +2014,7 @@ fn handle_callback_connection(
                     stream,
                     400,
                     "Bad Request",
-                    &callback_error_html(
+                    &auth_callback_page::error_html(
                         "State mismatch: this sign-in does not match the terminal session.",
                     ),
                 )
@@ -2025,7 +2027,7 @@ fn handle_callback_connection(
                 stream,
                 405,
                 "Method Not Allowed",
-                &callback_error_html("Unsupported callback request."),
+                &auth_callback_page::error_html("Unsupported callback request."),
             )
             .map_err(AuthLoginError::WriteFailed)?;
             Ok(None)
@@ -2109,203 +2111,6 @@ fn respond_html(stream: &mut TcpStream, code: u16, reason: &str, html: &str) -> 
         "HTTP/1.1 {code} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
         html.len()
     )
-}
-
-/// A login-callback page rendered in the user's browser after the OAuth round
-/// trip. `body` is inserted as raw HTML, so callers must escape any untrusted
-/// content (e.g. error messages) before passing it in.
-struct CallbackPage<'a> {
-    /// Used for the document `<title>` (kept short).
-    doc_title: &'a str,
-    /// The on-page heading.
-    heading: &'a str,
-    /// The supporting paragraph (raw HTML; pre-escape untrusted input).
-    body: &'a str,
-    is_error: bool,
-}
-
-fn callback_success_html() -> String {
-    render_callback_page(&CallbackPage {
-        doc_title: "Logged in",
-        heading: "Logged in",
-        body: "You can close this tab and return to the terminal.",
-        is_error: false,
-    })
-}
-
-fn callback_waiting_html() -> String {
-    render_callback_page(&CallbackPage {
-        doc_title: "Waiting",
-        heading: "Waiting for sign-in",
-        body: "Complete sign-in in the browser tab opened by the CLI.",
-        is_error: false,
-    })
-}
-
-fn callback_error_html(message: &str) -> String {
-    render_callback_page(&CallbackPage {
-        doc_title: "Login failed",
-        heading: "Login failed",
-        body: &html_escape(message),
-        is_error: true,
-    })
-}
-
-fn render_callback_page(page: &CallbackPage) -> String {
-    rayline_callback_page(page)
-}
-
-/// Branded callback page mirroring the Rayline platform sign-in screen
-/// (`turbo/apps/rayline/src/routes/signin/+page.svelte`): a forest-green card on
-/// a near-black grid background, white brandmark, and Sora type.
-fn rayline_callback_page(page: &CallbackPage) -> String {
-    let heading_class = if page.is_error {
-        "title title--error"
-    } else {
-        "title"
-    };
-    format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{doc_title} - {brand}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600&display=swap" rel="stylesheet">
-<style>{styles}</style>
-</head>
-<body>
-<div class="grid" aria-hidden="true"></div>
-<main class="card">
-<div class="logo">{logo}</div>
-<h1 class="{heading_class}">{heading}</h1>
-<p class="subtitle">{body}</p>
-</main>
-</body>
-</html>"##,
-        doc_title = page.doc_title,
-        brand = crate::DISPLAY_NAME,
-        styles = RAYLINE_PAGE_STYLES,
-        logo = RAYLINE_BRANDMARK_WHITE_SVG,
-        heading_class = heading_class,
-        heading = page.heading,
-        body = page.body,
-    )
-}
-
-const RAYLINE_PAGE_STYLES: &str = r##"
-*{box-sizing:border-box}
-html,body{height:100%}
-body{
-  margin:0;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  padding:2.5rem 1rem;
-  background-color:#09090b;
-  color:#f6f4ef;
-  font-family:"Sora",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  -webkit-font-smoothing:antialiased;
-  overflow:hidden;
-}
-.grid{
-  position:fixed;
-  inset:0;
-  z-index:0;
-  pointer-events:none;
-  background-image:
-    linear-gradient(to right,rgba(246,244,239,0.022) 1px,transparent 1px),
-    linear-gradient(to bottom,rgba(246,244,239,0.022) 1px,transparent 1px);
-  background-size:100px 100px;
-}
-.grid::after{
-  content:"";
-  position:absolute;
-  inset:0;
-  background:radial-gradient(ellipse 60% 50% at 50% 40%,transparent 0%,#09090b 100%);
-}
-.card{
-  position:relative;
-  z-index:1;
-  width:100%;
-  max-width:24rem;
-  background:#0f1f1a;
-  border:1px solid rgba(127,166,138,0.12);
-  border-radius:1rem;
-  padding:2rem;
-  text-align:center;
-}
-.logo{
-  display:flex;
-  justify-content:center;
-  margin-bottom:1.25rem;
-}
-.logo svg{height:1.75rem;width:auto}
-.title{
-  font-size:1.5rem;
-  font-weight:500;
-  letter-spacing:-0.01em;
-  margin:0 0 0.5rem;
-}
-.title--error{color:#fca5a5}
-.subtitle{
-  font-size:0.875rem;
-  line-height:1.5;
-  color:#a1a1aa;
-  margin:0;
-}
-"##;
-
-const RAYLINE_BRANDMARK_WHITE_SVG: &str = r##"<svg width="50" height="38" viewBox="0 0 50 38" fill="none" xmlns="http://www.w3.org/2000/svg">
-<line y1="20.5" x2="19" y2="20.5" stroke="url(#paint0_linear_2_26)"/>
-<line y1="-0.5" x2="31.3618" y2="-0.5" transform="matrix(-0.910042 0.414517 -0.3225 -0.946569 46.5405 7)" stroke="url(#paint1_linear_2_26)"/>
-<line y1="-0.5" x2="31.3618" y2="-0.5" transform="matrix(-0.910042 -0.414517 0.3225 -0.946569 46.5405 33)" stroke="url(#paint2_linear_2_26)"/>
-<line y1="-0.5" x2="31.0691" y2="-0.5" transform="matrix(-0.974288 -0.225304 0.170442 -0.985368 48.2703 27)" stroke="url(#paint3_linear_2_26)"/>
-<line y1="-0.5" x2="31.0691" y2="-0.5" transform="matrix(-0.974288 0.225304 -0.170442 -0.985368 48.2703 13)" stroke="url(#paint4_linear_2_26)"/>
-<line x1="50" y1="20.5" x2="18" y2="20.5" stroke="url(#paint5_linear_2_26)"/>
-<path d="M43.2373 37H6.7627L25 1.10254L43.2373 37Z" stroke="#E0E9DA"/>
-<defs>
-<linearGradient id="paint0_linear_2_26" x1="0" y1="21.5" x2="19" y2="21.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0.15"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-<linearGradient id="paint1_linear_2_26" x1="0" y1="0.5" x2="31.3618" y2="0.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-<linearGradient id="paint2_linear_2_26" x1="0" y1="0.5" x2="31.3618" y2="0.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-<linearGradient id="paint3_linear_2_26" x1="0" y1="0.5" x2="31.0691" y2="0.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-<linearGradient id="paint4_linear_2_26" x1="0" y1="0.5" x2="31.0691" y2="0.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-<linearGradient id="paint5_linear_2_26" x1="50" y1="19.5" x2="18" y2="19.5" gradientUnits="userSpaceOnUse">
-<stop stop-color="white" stop-opacity="0"/>
-<stop offset="0.5" stop-color="white" stop-opacity="0.5"/>
-<stop offset="1" stop-color="white"/>
-</linearGradient>
-</defs>
-</svg>"##;
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn save_session_credentials_from_home(

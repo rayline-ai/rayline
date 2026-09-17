@@ -4,6 +4,7 @@ use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+pub(crate) mod auth_callback_page;
 pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
