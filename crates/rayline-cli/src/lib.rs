@@ -147,7 +147,7 @@ Usage: rayline codex [OPTIONS] [--] [CODEX_ARGS]...
 Start Rayline's local OpenAI Responses router and run Codex CLI against it.
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
                           router config decide (main/subagent routing).
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
@@ -171,7 +171,7 @@ CODEX_HOME (~/.rayline/codex-app-home) and launches the app there. If the app
 is already running on a different config, you'll be prompted to restart it.
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
                           router config decide (main/subagent routing).
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
@@ -188,7 +188,7 @@ Usage: rayline codex configure [OPTIONS]
 Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex).
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.5). Omit to let the
+  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
                           router config decide (main/subagent routing).
   --base-url <url>        Rayline OpenAI Responses base URL
                           (default: http://127.0.0.1:20811/v1)

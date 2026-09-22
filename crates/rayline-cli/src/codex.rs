@@ -9,13 +9,28 @@ use serde_json::json;
 const CODEX_SUBSCRIPTION_CONFIG_FILENAME: &str = "codex-subscription-router.json";
 pub const CODEX_SUBSCRIPTION_ENDPOINT_ID: &str = "codex-subscription";
 pub const CODEX_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-pub const CODEX_SUBSCRIPTION_DEFAULT_MODEL: &str = "gpt-5.4";
+/// Default model for the ChatGPT-subscription endpoint. Mirrors what plain
+/// `codex` picks on a ChatGPT account with no configured model: the
+/// top-priority entry of the backend's `/models`, which changes without notice.
+pub const CODEX_SUBSCRIPTION_DEFAULT_MODEL: &str = "gpt-6-astra";
+/// Models advertised on the subscription endpoint, default first. The router
+/// treats this as the allowlist for explicit `--model` values on this endpoint
+/// (an unlisted `--model` falls back to `routes.main`), so it must track the
+/// backend's listed models.
+pub const CODEX_SUBSCRIPTION_MODELS: [&str; 5] = [
+    CODEX_SUBSCRIPTION_DEFAULT_MODEL,
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+];
 /// The internal virtual-marker model Codex is pointed at when the user picks no
 /// `--model`. Codex must send *some* `model` on every Responses request, so this
 /// sentinel stands in for "no explicit model — let the router's config decide"
 /// (mirrors Claude Code's `rayline-router`). The local router recognizes it as a
 /// marker and applies main/subagent routing rather than treating it as a real
-/// model. Users select a real model (e.g. `gpt-5.5`) via `--model` instead.
+/// model. Users select a real model (e.g. one of CODEX_SUBSCRIPTION_DEFAULT_MODEL)
+/// via `--model` instead.
 pub const CODEX_DEFAULT_SENTINEL_MODEL: &str = "rayline-local";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,11 +390,7 @@ pub fn subscription_router_config_json(subagents_local: bool) -> serde_json::Val
             "protocol": "openai_responses",
             "base_url": CODEX_SUBSCRIPTION_BASE_URL,
             "auth": "client_bearer",
-            "models": [
-                CODEX_SUBSCRIPTION_DEFAULT_MODEL,
-                "gpt-5.4-mini",
-                "gpt-5.5"
-            ]
+            "models": CODEX_SUBSCRIPTION_MODELS
         }],
         "routes": {
             "main": subscription(),

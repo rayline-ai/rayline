@@ -283,7 +283,7 @@ Subagent turns skip that pin and follow `routes.subagent`/`routes.subagents`, so
 `S-Rc`/`S-Rcl`/`S-Rl`/`S-L` diverge on the subagent leg (main → your ChatGPT
 subscription, subagents per config). Verified on-device: `rayline codex --auth
 subscription --config S-L.json` (and `S-Rc.json`) → `codex route
-endpoint:codex-subscription requested=rayline-local selected=gpt-5.4` → reply
+endpoint:codex-subscription requested=rayline-local selected=gpt-6-astra` → reply
 returned. Run it exactly as written — the default model routes correctly.
 
 **⁶ K-K — one keyed endpoint, two models (main ≠ subagent).** `K-K` declares one
