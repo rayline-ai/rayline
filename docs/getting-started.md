@@ -389,13 +389,13 @@ Codex remote compaction turns.
       "protocol": "openai_responses",
       "base_url": "https://chatgpt.com/backend-api/codex",
       "auth": "client_bearer",
-      "models": ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
     }
   ],
   "routes": {
     "main": {
       "endpoint": "codex-subscription",
-      "model": "gpt-5.4"
+      "model": "gpt-6-astra"
     },
     "subagent": {
       "endpoint": "local",

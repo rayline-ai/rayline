@@ -708,11 +708,7 @@ fn ensure_codex_subscription_endpoint(cfg: &mut Value) -> bool {
         "protocol": "openai_responses",
         "base_url": crate::codex::CODEX_SUBSCRIPTION_BASE_URL,
         "auth": "client_bearer",
-        "models": [
-            crate::codex::CODEX_SUBSCRIPTION_DEFAULT_MODEL,
-            "gpt-5.4-mini",
-            "gpt-5.5"
-        ]
+        "models": crate::codex::CODEX_SUBSCRIPTION_MODELS
     }));
     true
 }
