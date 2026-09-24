@@ -421,14 +421,14 @@ local or API-key route for subagents/model overrides.
       "protocol": "anthropic_messages",
       "base_url": "https://anthropic-compatible.example.com",
       "api_key_env": "ANTHROPIC_COMPATIBLE_API_KEY",
-      "models": ["claude-sonnet-4-6"]
+      "models": ["claude-sonnet-5"]
     }
   ],
   "routes": {
     "subagents": {
       "Explore": {
         "endpoint": "anthropic-compatible",
-        "model": "claude-sonnet-4-6"
+        "model": "claude-sonnet-5"
       }
     }
   }
@@ -451,14 +451,14 @@ router appends `/v1/messages`) and `auth: "bearer"` so the key is sent as
       "base_url": "https://openrouter.ai/api",
       "api_key_env": "OPENROUTER_API_KEY",
       "auth": "bearer",
-      "models": ["anthropic/claude-sonnet-4.6"]
+      "models": ["anthropic/claude-sonnet-5"]
     }
   ],
   "routes": {
     "subagents": {
       "Explore": {
         "endpoint": "openrouter",
-        "model": "anthropic/claude-sonnet-4.6"
+        "model": "anthropic/claude-sonnet-5"
       }
     }
   }
@@ -478,14 +478,14 @@ SSE into Anthropic SSE in real time, so OpenAI also streams token by token:
       "protocol": "openai_chat",
       "base_url": "https://api.openai.com/v1",
       "api_key_env": "OPENAI_API_KEY",
-      "models": ["gpt-4o-mini"]
+      "models": ["gpt-6-astra"]
     }
   ],
   "routes": {
     "subagents": {
       "Explore": {
         "endpoint": "openai",
-        "model": "gpt-4o-mini"
+        "model": "gpt-6-astra"
       }
     }
   }

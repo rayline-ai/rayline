@@ -5773,7 +5773,7 @@ mod tests {
         }
         let cloud = || (ep("rayline-cloud"), "rayline-router".to_owned());
         let ollama_def = || (ep("ollama"), "qwen3.5:9b".to_owned());
-        let anthropic = || (ep("anthropic"), "claude-sonnet-4-6".to_owned());
+        let anthropic = || (ep("anthropic"), "claude-sonnet-5".to_owned());
 
         // main routed + subagent routed (the routes the local router executes):
         let st = load_state(include_str!("../../../examples/routing-modes/Rc-Rc.json"));

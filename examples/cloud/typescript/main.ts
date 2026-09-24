@@ -29,7 +29,7 @@ const client = new Anthropic({ baseURL: BASE_URL, authToken: API_KEY });
 
 const message = await client.messages.create({
   // "rayline-router" lets the router pick the concrete model. You can also pass
-  // a concrete id such as "claude-sonnet-4-6".
+  // a concrete id such as "claude-sonnet-5".
   model: "rayline-router",
   max_tokens: 512,
   messages: [{ role: "user", content: "In one sentence, what is Rayline?" }],

@@ -177,7 +177,7 @@ recovers from its own tool-schema mistakes — given a wrong parameter set it re
 the schema and retried correctly. Per-mode subagent destinations are exactly what the
 table says: `endpoint:ollama` for `L-L`, `endpoint:rayline-cloud` for `L-Rc`, the
 pinned `deepseek/deepseek-v4-pro` for `L-Rl`, and `endpoint:anthropic` →
-`claude-sonnet-4-6` for `L-K`.
+`claude-sonnet-5` for `L-K`.
 
 Three things to know when reading logs for these modes:
 
@@ -188,7 +188,7 @@ Three things to know when reading logs for these modes:
   to reach the spawn.
 - **On `L-K`, each subagent's first request returns HTTP 400** and succeeds on the
   client's retry. A 400 pair on that leg is not a failure.
-- **On a route-all local-main config, Claude Code's background `claude-sonnet-4-6`
+- **On a route-all local-main config, Claude Code's background `claude-sonnet-5`
   traffic** falls through to the built-in `anthropic` endpoint and logs
   `requires $ANTHROPIC_API_KEY`. Noisy, harmless, not the mode failing.
 

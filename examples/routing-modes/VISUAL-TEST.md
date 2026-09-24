@@ -71,7 +71,7 @@ move to the next mode. Don't batch them; one at a time.
   - `qwen3.5:9b` / `qwen2.5-coder:7b` → **local (ollama)** routed by the LSR.
   - `z-ai/glm-5.2`, `deepseek/deepseek-v4-pro` → **cloud, pinned by the JSON** (LSR rewrote the model).
   - `claude-*`, `deepseek/deepseek-v4-flash`, etc. with no pin → **cloud RCR's own pick** (non-deterministic).
-  - `claude-sonnet-4-6` on a **subagent** in Rc-K/Rl-K → the **anthropic API-key endpoint** (distinguish from an RCR pick by the mode's intent).
+  - `claude-sonnet-5` on a **subagent** in Rc-K/Rl-K → the **anthropic API-key endpoint** (distinguish from an RCR pick by the mode's intent).
 
 ---
 
@@ -83,18 +83,18 @@ move to the next mode. Don't batch them; one at a time.
 | Mode | Expected main → | Expected subagents → | PASS when | Class |
 |---|---|---|---|---|
 | **Rc-Rc** | cloud (RCR pick) | cloud (RCR pick); Explore may→local (local ON) | main `target=remote`; subagents remote, OR Explore local (may-local) | REVIEW (cloud pick + may-local) |
-| **Rc-K** | cloud (RCR pick) | anthropic (API key) | main remote; subagent `claude-sonnet-4-6` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
+| **Rc-K** | cloud (RCR pick) | anthropic (API key) | main remote; subagent `claude-sonnet-5` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
 | **Rc-L** | cloud (RCR pick) | **ollama** `qwen3.5:9b` | main remote; subagents `selected_model=qwen3.5:9b` | PASS (deterministic subagent) |
 | **Rcl-Rcl** § | cloud (RCR pick) | cloud + may-local | same as Rc-Rc; behaviorally ≡ Rc-Rc (may-local account-gated) | REVIEW |
 | **Rl-Rl** | cloud **pinned `z-ai/glm-5.2`** | cloud **pinned `deepseek/deepseek-v4-pro`** | main `selected_model=z-ai/glm-5.2`; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic, exact models)** |
-| **Rl-K** | cloud **pinned `z-ai/glm-5.2`** | anthropic (API key) | main `z-ai/glm-5.2`; subagent anthropic `claude-sonnet-4-6` | main PASS; subagent FAIL if no key |
+| **Rl-K** | cloud **pinned `z-ai/glm-5.2`** | anthropic (API key) | main `z-ai/glm-5.2`; subagent anthropic `claude-sonnet-5` | main PASS; subagent FAIL if no key |
 | **Rc-L-per-type** | cloud (RCR pick) | `Explore`→ollama `qwen2.5-coder:7b`, `Plan`→ollama `qwen3.5:9b`, other→cloud | Explore `qwen2.5-coder:7b`; general-purpose remote (cloud) | **PASS (deterministic per-type)** |
 | **S-Rc** | **subscription** (passthrough) | cloud (RCR pick) | main `target=anthropic`/`selective_main_passthrough`; subagents remote | REVIEW (cloud pick) |
 | **S-Rcl** § | subscription | cloud + may-local | main passthrough; subagents remote or Explore→local | REVIEW |
 | **S-L** | subscription | **ollama** `qwen…` | main passthrough; subagents `qwen*` (local) | **PASS** (passthrough + local) |
 | **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (RCR pick) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
 | **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro` | REVIEW (local main; the pin can 403) |
-| **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key) | main `qwen3.5:9b`; subagents `claude-sonnet-4-6` | REVIEW (local main + needs key) |
+| **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key) | main `qwen3.5:9b`; subagents `claude-sonnet-5` | REVIEW (local main + needs key) |
 | **L-L** ‡ | ollama `qwen3.5:9b` | **ollama** | main `qwen3.5:9b`; subagents `qwen3.5:9b` | REVIEW (local main) |
 | **Rl-L** | cloud **pinned `z-ai/glm-5.2`** | **ollama** `qwen2.5-coder:7b` | main `z-ai/glm-5.2`; subagents `qwen2.5-coder:7b` | **PASS (deterministic)** |
 | **S-Rl** | subscription | cloud **pinned `deepseek/deepseek-v4-pro`** | main passthrough; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic subagent)** |

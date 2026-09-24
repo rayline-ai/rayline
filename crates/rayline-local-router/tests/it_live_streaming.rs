@@ -175,11 +175,11 @@ async fn openai_chat_true_streaming_text() {
             "protocol": "openai_chat",
             "base_url": "https://api.openai.com/v1",
             "api_key_env": "OPENAI_API_KEY",
-            "models": ["gpt-4o-mini"]
+            "models": ["gpt-5.5"]
         }],
         "routes": {
-            "main": {"endpoint": "openai", "model": "gpt-4o-mini"},
-            "default": {"endpoint": "openai", "model": "gpt-4o-mini"}
+            "main": {"endpoint": "openai", "model": "gpt-5.5"},
+            "default": {"endpoint": "openai", "model": "gpt-5.5"}
         }
     });
     let path = write_config("openai-stream", &config);
@@ -232,11 +232,11 @@ async fn openai_chat_tool_use_streaming() {
             "protocol": "openai_chat",
             "base_url": "https://api.openai.com/v1",
             "api_key_env": "OPENAI_API_KEY",
-            "models": ["gpt-4o-mini"]
+            "models": ["gpt-5.5"]
         }],
         "routes": {
-            "main": {"endpoint": "openai", "model": "gpt-4o-mini"},
-            "default": {"endpoint": "openai", "model": "gpt-4o-mini"}
+            "main": {"endpoint": "openai", "model": "gpt-5.5"},
+            "default": {"endpoint": "openai", "model": "gpt-5.5"}
         }
     });
     let path = write_config("openai-tool", &config);
@@ -299,11 +299,11 @@ async fn openai_chat_image_shape_detection() {
             "protocol": "openai_chat",
             "base_url": "https://api.openai.com/v1",
             "api_key_env": "OPENAI_API_KEY",
-            "models": ["gpt-4o-mini"]
+            "models": ["gpt-5.5"]
         }],
         "routes": {
-            "main": {"endpoint": "openai", "model": "gpt-4o-mini"},
-            "default": {"endpoint": "openai", "model": "gpt-4o-mini"}
+            "main": {"endpoint": "openai", "model": "gpt-5.5"},
+            "default": {"endpoint": "openai", "model": "gpt-5.5"}
         }
     });
     let path = write_config("openai-image", &config);
@@ -372,11 +372,11 @@ async fn openrouter_anthropic_streaming() {
             "base_url": "https://openrouter.ai/api",
             "api_key_env": "OPENROUTER_API_KEY",
             "auth": "bearer",
-            "models": ["anthropic/claude-sonnet-4.6"]
+            "models": ["anthropic/claude-sonnet-5"]
         }],
         "routes": {
-            "main": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
-            "default": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
+            "main": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-5"},
+            "default": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-5"}
         }
     });
     let path = write_config("openrouter-stream", &config);
@@ -447,11 +447,11 @@ async fn openrouter_anthropic_image_shape_detection() {
             "base_url": "https://openrouter.ai/api",
             "api_key_env": "OPENROUTER_API_KEY",
             "auth": "bearer",
-            "models": ["anthropic/claude-sonnet-4.6"]
+            "models": ["anthropic/claude-sonnet-5"]
         }],
         "routes": {
-            "main": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
-            "default": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
+            "main": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-5"},
+            "default": {"endpoint": "openrouter", "model": "anthropic/claude-sonnet-5"}
         }
     });
     let path = write_config("openrouter-image", &config);
@@ -526,12 +526,12 @@ async fn openrouter_anthropic_default_xapikey_auth() {
             "protocol": "anthropic_messages",
             "base_url": "https://openrouter.ai/api",
             "api_key_env": "OPENROUTER_API_KEY",
-            "models": ["anthropic/claude-sonnet-4.6"]
+            "models": ["anthropic/claude-sonnet-5"]
             // No "auth" field => default x-api-key for anthropic_messages.
         }],
         "routes": {
-            "main": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-4.6"},
-            "default": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-4.6"}
+            "main": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-5"},
+            "default": {"endpoint": "anthropic-compatible", "model": "anthropic/claude-sonnet-5"}
         }
     });
     let path = write_config("openrouter-xapikey", &config);

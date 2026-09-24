@@ -30,7 +30,7 @@ client = Anthropic(base_url=BASE_URL, auth_token=API_KEY)
 
 message = client.messages.create(
     # "rayline-router" lets the router pick the concrete model. You can also pass
-    # a concrete id such as "claude-sonnet-4-6".
+    # a concrete id such as "claude-sonnet-5".
     model="rayline-router",
     max_tokens=512,
     messages=[

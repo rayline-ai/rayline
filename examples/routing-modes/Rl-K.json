@@ -18,7 +18,7 @@
       "api_key_env": "ANTHROPIC_API_KEY",
       "auth": "api_key",
       "models": [
-        "claude-sonnet-4-6"
+        "claude-sonnet-5"
       ]
     }
   ],
@@ -30,7 +30,7 @@
     },
     "subagent": {
       "endpoint": "anthropic",
-      "model": "claude-sonnet-4-6"
+      "model": "claude-sonnet-5"
     }
   }
 }
