@@ -19,6 +19,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
+
 use crate::codex::{
     CodexAuthMode, EffectiveCodexAuthMode, default_rayline_base_url, rayline_provider_config_toml,
 };
@@ -168,15 +170,34 @@ fn isolated_home_path() -> io::Result<PathBuf> {
     Ok(base.join(crate::DOT_CONFIG_DIR).join(CODEX_APP_HOME_DIR))
 }
 
-/// True when our freshly-generated Rayline block is not the prefix of the
-/// existing `config.toml`. Codex appends its own sections (marketplaces,
-/// mcp_servers, …) *after* our block, so an unchanged block is still a prefix;
-/// any change to `--model`/`--auth`/base-url makes it no longer match.
+/// Root keys the generated Rayline snippet owns. Together with the
+/// `[model_providers.rayline]` table these are the only parts of the isolated
+/// `config.toml` Rayline ever writes; everything else in the file belongs to the
+/// Codex desktop app or the user.
+const RAYLINE_ROOT_KEYS: [&str; 3] = ["model", "model_provider", "forced_login_method"];
+const MODEL_PROVIDERS_TABLE: &str = "model_providers";
+const RAYLINE_PROVIDER: &str = "rayline";
+
+/// True when the existing `config.toml` does not already carry the Rayline
+/// settings of the `generated` snippet (a changed `--model`/`--auth`/base-url,
+/// a missing table, …). Compared on content, not text: the desktop app
+/// re-serialises this file (line endings, trailing newline, spacing, key order)
+/// and none of that is a setting. An unparsable file also differs — rewriting
+/// is the only way to repair it.
 fn generated_config_differs(existing: &str, generated: &str) -> bool {
-    !existing.starts_with(generated)
+    let (Ok(doc), Ok(generated)) = (
+        parse_isolated_config(existing),
+        generated.parse::<DocumentMut>(),
+    ) else {
+        return true;
+    };
+    RAYLINE_ROOT_KEYS
+        .iter()
+        .any(|key| !root_key_current(&doc, &generated, key))
+        || !provider_table_current(&doc, &generated)
 }
 
-/// Render the Rayline `config.toml` block for the desktop app from the run
+/// Render the Rayline `config.toml` snippet for the desktop app from the run
 /// flags. Pure — no filesystem effects, so it can be compared against a running
 /// app-server's config before deciding whether to write/restart.
 fn generate_config(request: &AppRunRequest, subscription_auth: bool) -> String {
@@ -188,9 +209,10 @@ fn generate_config(request: &AppRunRequest, subscription_auth: bool) -> String {
     rayline_provider_config_toml(model, &base_url, subscription_auth)
 }
 
-/// Write the isolated `CODEX_HOME`: `config.toml` (our generated block over a
-/// preserved suffix) plus an `auth.json` link. Called only after we're committed
-/// to launching, so a declined restart never mutates the home.
+/// Write the isolated `CODEX_HOME`: `config.toml` (the Rayline settings merged
+/// into whatever the file already holds) plus an `auth.json` link. Called only
+/// after we're committed to launching, so a declined restart never mutates the
+/// home.
 ///
 /// `auth.json` is linked only when auth resolves to subscription — a `--auth
 /// none` / local-only run must not run the desktop app with the user's Codex
@@ -198,82 +220,140 @@ fn generate_config(request: &AppRunRequest, subscription_auth: bool) -> String {
 fn write_isolated_home(home: &Path, config: &str, subscription_auth: bool) -> io::Result<()> {
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
-    // Determine the suffix to preserve beneath our Rayline block:
-    //  - isolated config.toml already exists → keep everything after our block
-    //    (the Codex desktop app persists settings there: [desktop], [projects], …),
-    //  - first creation → seed from the user's main Codex config.toml if present,
-    //  - otherwise → no suffix.
-    let suffix = match fs::read_to_string(&config_path) {
-        Ok(existing) => suffix_below_rayline_block(&existing),
+    // The document to merge into:
+    //  - the isolated config.toml when it exists (the Codex desktop app persists
+    //    its own settings there: [desktop], [projects], …),
+    //  - on first creation, the tables of the user's main Codex config.toml,
+    //  - otherwise nothing.
+    let existing = match fs::read_to_string(&config_path) {
+        Ok(read_value) => read_value,
         Err(_) => user_codex_home()
             .ok()
             .and_then(|h| fs::read_to_string(h.join("config.toml")).ok())
-            .map(|seed| preservable_suffix(&seed))
+            .map(|seed| seed_tables(&seed))
             .unwrap_or_default(),
     };
-    fs::write(&config_path, compose_config(config, &suffix))?;
+    let merged = apply_rayline_settings(&existing, config).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {error}", config_path.display()),
+        )
+    })?;
+    fs::write(&config_path, merged)?;
     link_auth_json(home, subscription_auth)
 }
 
-/// Join our generated Rayline block with a preserved suffix, separated by a blank
-/// line when both are non-empty.
-fn compose_config(generated: &str, suffix: &str) -> String {
-    if suffix.is_empty() {
-        return generated.to_owned();
-    }
-    let sep = if generated.ends_with('\n') {
-        "\n"
-    } else {
-        "\n\n"
-    };
-    format!("{generated}{sep}{suffix}")
-}
-
-/// Extract the portion of an existing isolated `config.toml` that must be
-/// preserved beneath a freshly-generated Rayline block.
+/// Merge the Rayline-owned settings of the `generated` snippet into `existing`
+/// in place: each owned root key is set (or removed when the snippet omits it)
+/// and `[model_providers.rayline]` is replaced wherever it sits in the file.
+/// Everything else — the app's tables, root keys, comments and ordering — is
+/// preserved byte-for-byte; only items whose content differs are touched.
 ///
-/// Our generated block ends inside `[model_providers.rayline]`, so the cut point
-/// is the first TOML table header that is NOT our own `[model_providers.rayline]`
-/// — everything from there on is app-managed / user content, preserved verbatim.
-/// (Cutting at the *first* header would wrongly grab our own table.) If there's
-/// no such header, the file is only ever our block and there's nothing to keep.
-fn suffix_below_rayline_block(existing: &str) -> String {
-    match first_foreign_table_header_offset(existing) {
-        Some(offset) => existing[offset..].to_owned(),
-        None => String::new(),
-    }
-}
-
-/// The part of a seed config (the user's main `config.toml`) that can be safely
-/// preserved beneath our generated block on first creation.
-///
-/// Our block ends inside `[model_providers.rayline]`, so anything placed after it
-/// must start with a table header — bare keys would be captured by that table.
-/// A user's main config typically opens with bare keys (`model = …`), which we
-/// override anyway, so we keep only from its first table header onward
-/// (`[mcp_servers]`, `[projects]`, …). A seed that is empty or all
-/// blank/comments preserves nothing.
-///
-/// Any `[model_providers.rayline]` table the seed already defines is stripped —
-/// we always emit our own, and a second definition is a TOML duplicate-table
-/// error that would make the isolated config fail to load.
-fn preservable_suffix(seed: &str) -> String {
-    let kept = if starts_with_table_header_or_blank(seed) {
-        // Already opens with a header (or is blank): safe to keep whole.
-        seed
-    } else {
-        // Opens with bare keys: drop them, keep from the first table header on.
-        match first_foreign_table_header_offset(seed) {
-            Some(offset) => &seed[offset..],
-            None => return String::new(),
+/// The desktop app rewrites this file freely (it reorders tables and adds its
+/// own), so the Rayline settings cannot be assumed to be a prefix or to be
+/// anywhere in particular.
+fn apply_rayline_settings(existing: &str, generated: &str) -> Result<String, TomlError> {
+    let mut doc = parse_isolated_config(existing)?;
+    let generated: DocumentMut = generated.parse()?;
+    for key in RAYLINE_ROOT_KEYS {
+        if root_key_current(&doc, &generated, key) {
+            continue;
         }
-    };
-    strip_rayline_provider_table(kept)
+        match generated.get(key).and_then(Item::as_str) {
+            Some(wanted) => doc[key] = toml_edit::value(wanted),
+            None => {
+                doc.remove(key);
+            }
+        }
+    }
+    if !provider_table_current(&doc, &generated) {
+        let mut table = rayline_provider_table(&generated)
+            .expect("generated snippet always defines [model_providers.rayline]")
+            .clone();
+        // An existing table keeps its place; a new one goes ahead of every parsed
+        // table (positions start at 1) so a first-run file reads Rayline-first.
+        let position = rayline_provider_table(&doc).and_then(Table::position);
+        table.set_position(position.or(Some(0)));
+        let providers = doc
+            .entry(MODEL_PROVIDERS_TABLE)
+            .or_insert_with(toml_edit::table);
+        if let Some(providers) = providers.as_table_mut() {
+            // Render as `[model_providers.rayline]`, not an empty `[model_providers]`.
+            providers.set_implicit(true);
+        }
+        providers[RAYLINE_PROVIDER] = Item::Table(table);
+    }
+    Ok(doc.to_string())
 }
 
-/// Remove any `[model_providers.rayline]` table (its header through the line
-/// before the next table header / EOF) from `text`. Prevents a duplicate of the
-/// table our generated block always emits.
+/// Whether `doc` already holds the generated snippet's value for an owned root
+/// key — including "absent in both" (e.g. `forced_login_method` on `--auth none`).
+fn root_key_current(doc: &DocumentMut, generated: &DocumentMut, key: &str) -> bool {
+    doc.get(key).and_then(Item::as_str) == generated.get(key).and_then(Item::as_str)
+}
+
+/// Whether `doc`'s `[model_providers.rayline]` matches the generated one on content.
+fn provider_table_current(doc: &DocumentMut, generated: &DocumentMut) -> bool {
+    match (
+        rayline_provider_table(doc),
+        rayline_provider_table(generated),
+    ) {
+        (Some(current), Some(wanted)) => canonical(current) == canonical(wanted),
+        _ => false,
+    }
+}
+
+fn rayline_provider_table(doc: &DocumentMut) -> Option<&Table> {
+    doc.get(MODEL_PROVIDERS_TABLE)
+        .and_then(|providers| providers.get(RAYLINE_PROVIDER))
+        .and_then(Item::as_table)
+}
+
+/// Parse an isolated `config.toml`. A file left with two
+/// `[model_providers.rayline]` tables by an earlier Rayline release fails to
+/// parse; drop every copy textually and retry, since the merge re-emits the
+/// table anyway. Any other error is the caller's to surface.
+fn parse_isolated_config(existing: &str) -> Result<DocumentMut, TomlError> {
+    existing.parse().or_else(|error| {
+        strip_rayline_provider_table(existing)
+            .parse()
+            .map_err(|_| error)
+    })
+}
+
+/// A table's key/value pairs rendered with formatting reset and keys sorted, so
+/// two tables compare equal on content even if the desktop app re-serialised
+/// one of them with different spacing or key order.
+fn canonical(table: &Table) -> String {
+    let mut table = table.clone();
+    table.sort_values();
+    table.fmt();
+    for (_, item) in table.iter_mut() {
+        if let Some(inline) = item.as_value_mut().and_then(Value::as_inline_table_mut) {
+            inline.sort_values();
+            inline.fmt();
+        }
+    }
+    table.to_string()
+}
+
+/// The tables of the user's main `config.toml`, used to seed the isolated
+/// config on first creation (`[mcp_servers]`, `[projects]`, …). Root keys are
+/// dropped: the ones we own are overridden anyway, and the rest (`profile`,
+/// `notify`, …) can change routing or run commands and are not carried over
+/// silently. An unparsable or empty seed contributes nothing.
+fn seed_tables(seed: &str) -> String {
+    let Ok(mut doc) = seed.parse::<DocumentMut>() else {
+        return String::new();
+    };
+    doc.retain(|_, item| {
+        item.is_array_of_tables() || item.as_table().is_some_and(|table| !table.is_dotted())
+    });
+    doc.to_string()
+}
+
+/// Remove every `[model_providers.rayline]` table (its header through the line
+/// before the next table header / EOF) from `text`.
 fn strip_rayline_provider_table(text: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;
@@ -281,50 +361,13 @@ fn strip_rayline_provider_table(text: &str) -> String {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             // A new table header ends any table we were skipping.
-            skipping = is_rayline_provider_header(trimmed);
+            skipping = trimmed.trim_end() == "[model_providers.rayline]";
         }
         if !skipping {
             out.push_str(line);
         }
     }
     out
-}
-
-/// Byte offset of the first TOML table / array-of-tables header line that is not
-/// our own `[model_providers.rayline]`. This is the boundary between our block
-/// and the preserved app/user suffix. `None` if no such header exists.
-fn first_foreign_table_header_offset(text: &str) -> Option<usize> {
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && !is_rayline_provider_header(trimmed) {
-            return Some(offset);
-        }
-        offset += line.len();
-    }
-    None
-}
-
-/// Whether a header line opens our own `[model_providers.rayline]` table (the
-/// only table our generated block emits).
-fn is_rayline_provider_header(header_line: &str) -> bool {
-    let header = header_line.trim();
-    header == "[model_providers.rayline]"
-}
-
-/// Whether `text`, after skipping leading blank lines and `#` comments, is empty
-/// or begins with a TOML table header. Used to decide if seeded content can be
-/// safely prepended below our block.
-fn starts_with_table_header_or_blank(text: &str) -> bool {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        return trimmed.starts_with('[');
-    }
-    // All blank/comments (or empty) — safe to prepend.
-    true
 }
 
 /// Reconcile the isolated `<home>/auth.json` for the effective auth mode.
@@ -438,8 +481,8 @@ fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
     ReconcileOutcome::Proceed
 }
 
-/// Whether the running app-server's loaded config already starts with our
-/// generated Rayline block. Reads the `config.toml` in the app's own
+/// Whether the running app-server's loaded config already carries our Rayline
+/// settings. Reads the `config.toml` in the app's own
 /// `CODEX_HOME` — what it actually loaded at startup. Unreadable ⇒ treat as a
 /// mismatch (safer to restart than to leave it stale).
 fn running_app_config_matches(app: &RunningApp, config: &str) -> bool {
@@ -674,19 +717,22 @@ mod tests {
     }
 
     #[test]
-    fn config_unchanged_when_block_is_prefix_even_with_app_sections() {
-        let generated = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\n";
-        // Codex appends its own sections after our block on a prior launch.
-        let existing = format!("{generated}\n[marketplaces.openai-bundled]\nx = 1\n");
-        assert!(!generated_config_differs(&existing, generated));
+    fn config_unchanged_when_settings_present_whatever_the_app_layout() {
+        // Same settings, but the app moved [tools] above our table, added its own
+        // root key and re-serialised our table (order, spacing): still "unchanged".
+        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Rayline Local\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
+        assert!(!generated_config_differs(
+            existing,
+            &snippet("rayline-local", false)
+        ));
     }
 
     #[test]
     fn running_app_config_matches_reads_the_apps_own_home() {
         // The comparison basis is the running app-server's CODEX_HOME/config.toml
-        // (what it loaded), with the app's appended sections tolerated.
+        // (what it loaded), with the app's own sections tolerated.
         let dir = unique_tmp_dir("running-match");
-        let generated = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\n";
+        let generated = snippet("rayline-local", false);
         fs::write(
             dir.join("config.toml"),
             format!("{generated}\n[desktop]\nx = 1\n"),
@@ -696,12 +742,12 @@ mod tests {
             pid: 1,
             codex_home: Some(dir.to_string_lossy().into_owned()),
         };
-        assert!(running_app_config_matches(&app, generated));
+        assert!(running_app_config_matches(&app, &generated));
 
-        // A changed generated block no longer matches.
+        // A changed model no longer matches.
         assert!(!running_app_config_matches(
             &app,
-            "model = \"gpt-5.5\"\nmodel_provider = \"rayline\"\n"
+            &snippet("gpt-5.5", false)
         ));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -727,11 +773,18 @@ mod tests {
 
     #[test]
     fn config_changed_when_model_or_auth_differs() {
-        let old = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\n";
-        let existing = format!("{old}\n[mcp_servers.x]\ny = 1\n");
-        // Rerun with a different --model regenerates a different block.
-        let new = "model = \"gpt-5.5\"\nmodel_provider = \"rayline\"\n";
-        assert!(generated_config_differs(&existing, new));
+        let existing = format!(
+            "{}\n[mcp_servers.x]\ny = 1\n",
+            snippet("rayline-local", false)
+        );
+        assert!(generated_config_differs(
+            &existing,
+            &snippet("gpt-5.5", false)
+        ));
+        assert!(generated_config_differs(
+            &existing,
+            &snippet("rayline-local", true)
+        ));
     }
 
     #[test]
@@ -831,67 +884,128 @@ mod tests {
         dir
     }
 
-    // A representative Rayline generated block (ends inside [model_providers.rayline]).
-    const RAYLINE_BLOCK: &str = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n";
+    /// The snippet `generate_config` renders for a run: subscription on/off.
+    fn snippet(model: &str, subscription: bool) -> String {
+        rayline_provider_config_toml(model, &default_rayline_base_url(), subscription)
+    }
+
+    // An isolated config.toml as the Codex desktop app leaves it: it adds root
+    // keys and tables of its own and has moved [tools] above our table.
+    fn app_shaped_config(rayline_model: &str) -> String {
+        format!(
+            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+        )
+    }
 
     #[test]
-    fn suffix_preserves_app_sections_below_our_block() {
-        // Existing isolated config = our block + app-appended sections.
+    fn rayline_table_replaced_in_place_below_app_table() {
+        // A rerun with new settings must update our table where it is — one
+        // copy, still below [tools] — and keep the app's root key and tables.
+        let existing = app_shaped_config("rayline-local");
+        let merged = apply_rayline_settings(&existing, &snippet("gpt-5.5", true)).unwrap();
+        assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
+        assert!(merged.find("[tools]") < merged.find("[model_providers.rayline]"));
+        assert!(merged.starts_with("model = \"gpt-5.5\"\nmodel_provider = \"rayline\"\n"));
+        assert!(merged.contains("forced_login_method = \"chatgpt\""));
+        assert!(merged.contains("requires_openai_auth = true"));
+        assert!(merged.contains("personality = \"pragmatic\""));
+        assert!(merged.contains("[tools]\nweb_search = true"));
+        assert!(merged.contains("[desktop]\nfollowUpQueueMode = \"queue\""));
+    }
+
+    #[test]
+    fn missing_rayline_table_is_inserted_ahead_of_other_tables() {
+        let existing = "[desktop]\nx = 1\n";
+        let merged = apply_rayline_settings(existing, &snippet("rayline-local", false)).unwrap();
+        assert!(merged.starts_with("model = \"rayline-local\"\nmodel_provider = \"rayline\"\n"));
+        assert!(merged.find("[model_providers.rayline]") < merged.find("[desktop]"));
+        assert!(!merged.contains("[model_providers]\n"));
+    }
+
+    #[test]
+    fn auth_none_rerun_removes_subscription_keys() {
+        let existing = snippet("rayline-local", true);
+        let merged = apply_rayline_settings(&existing, &snippet("rayline-local", false)).unwrap();
+        assert!(!merged.contains("forced_login_method"));
+        assert!(!merged.contains("requires_openai_auth"));
+        assert!(merged.contains("model_provider = \"rayline\""));
+    }
+
+    #[test]
+    fn unchanged_file_is_returned_byte_for_byte() {
         let existing = format!(
-            "{RAYLINE_BLOCK}\n[desktop]\nx = 1\n\n[projects.\"/w\"]\ntrust = \"trusted\"\n"
+            "# user comment\n{}\n[desktop] # trailing\nx = 1\n",
+            snippet("rayline-local", true)
         );
-        let suffix = suffix_below_rayline_block(&existing);
-        assert!(suffix.starts_with("[desktop]"));
-        assert!(suffix.contains("[projects.\"/w\"]"));
-        // Our own table must NOT be in the suffix (else it would duplicate).
-        assert!(!suffix.contains("[model_providers.rayline]"));
+        let merged = apply_rayline_settings(&existing, &snippet("rayline-local", true)).unwrap();
+        assert_eq!(merged, existing);
     }
 
     #[test]
-    fn rayline_block_replaced_not_duplicated_on_rerun() {
-        // Prior isolated file has an OLD block + app section. Regenerate with a
-        // different model; compose must yield exactly one rayline block.
-        let old = "model = \"OLD\"\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n";
-        let suffix = suffix_below_rayline_block(old);
-        let composed = compose_config(RAYLINE_BLOCK, &suffix);
-        assert_eq!(composed.matches("[model_providers.rayline]").count(), 1);
-        assert!(composed.contains("model = \"rayline-local\""));
-        assert!(!composed.contains("model = \"OLD\""));
-        assert!(composed.contains("[desktop]"));
+    fn app_reserialisation_is_not_a_change() {
+        // The app rewrites the file with its own root keys, CRLF or no trailing
+        // newline; none of that touches a Rayline setting.
+        let generated = snippet("rayline-local", true);
+        let with_app_key = format!("notify = [\"x\"]\n{generated}\n[desktop]\nx = 1");
+        assert!(!generated_config_differs(&with_app_key, &generated));
+        let crlf = with_app_key.replace('\n', "\r\n");
+        assert!(!generated_config_differs(&crlf, &generated));
     }
 
     #[test]
-    fn seed_from_main_config_keeps_tables_drops_bare_keys() {
-        // User's main config.toml: bare keys we override + tables to preserve.
-        let main = "model = \"gpt-5\"\nmodel_provider = \"openai\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
-        let suffix = preservable_suffix(main);
-        // Bare keys dropped (we override them); tables kept.
-        assert!(!suffix.contains("model = \"gpt-5\""));
-        assert!(suffix.starts_with("[mcp_servers.foo]"));
-    }
-
-    #[test]
-    fn seed_that_is_only_bare_keys_preserves_nothing() {
-        let main = "model = \"gpt-5\"\nmodel_provider = \"openai\"\n";
-        assert_eq!(preservable_suffix(main), "");
-    }
-
-    #[test]
-    fn seed_with_existing_rayline_table_is_not_duplicated() {
-        // A user who already configured Rayline in their main config: the seed's
-        // own [model_providers.rayline] must be stripped so composing with our
-        // generated block doesn't produce a duplicate table (invalid TOML).
-        let main = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"User Rayline\"\nbase_url = \"http://127.0.0.1:20811/v1\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
-        let suffix = preservable_suffix(main);
-        assert!(
-            !suffix.contains("[model_providers.rayline]"),
-            "seed's rayline table must be stripped: {suffix}"
+    fn duplicate_rayline_tables_from_older_release_are_healed() {
+        // An earlier release composed a fresh block over a suffix that still held
+        // the previous table — invalid TOML the app refuses to load.
+        let existing = format!(
+            "{}\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n",
+            snippet("rayline-local", false)
         );
-        assert!(suffix.contains("[mcp_servers.foo]"), "other tables kept");
+        let generated = snippet("rayline-local", false);
+        assert!(generated_config_differs(&existing, &generated));
+        let merged = apply_rayline_settings(&existing, &generated).unwrap();
+        assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
+        assert!(merged.contains("[tools]"));
+        assert!(merged.contains("[desktop]"));
+        assert!(merged.parse::<DocumentMut>().is_ok());
+    }
 
-        // The composed file has exactly one rayline table.
-        let composed = compose_config(RAYLINE_BLOCK, &suffix);
-        assert_eq!(composed.matches("[model_providers.rayline]").count(), 1);
+    #[test]
+    fn unrelated_parse_error_is_surfaced_not_clobbered() {
+        let dir = unique_tmp_dir("broken");
+        fs::write(dir.join("config.toml"), "[desktop\nx = 1\n").unwrap();
+        let error = write_isolated_home(&dir, &snippet("rayline-local", false), false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(dir.join("config.toml")).unwrap(),
+            "[desktop\nx = 1\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_keeps_tables_and_drops_root_keys() {
+        // User's main config.toml: root keys (incl. a dotted one) are dropped,
+        // tables and arrays of tables kept.
+        let main = "model = \"gpt-5\"\nprofile = \"work\"\nfeatures.x = true\n\n[mcp_servers.foo]\ncommand = \"x\"\n\n[[hooks]]\nname = \"h\"\n";
+        let seeded = seed_tables(main);
+        assert!(!seeded.contains("model = "));
+        assert!(!seeded.contains("profile"));
+        assert!(!seeded.contains("features"));
+        assert!(seeded.contains("[mcp_servers.foo]\ncommand = \"x\""));
+        assert!(seeded.contains("[[hooks]]"));
+        assert_eq!(seed_tables("model = \"gpt-5\"\n"), "");
+        assert_eq!(seed_tables("not toml ="), "");
+    }
+
+    #[test]
+    fn seed_with_existing_rayline_table_is_replaced_not_duplicated() {
+        // A user who already configured Rayline in their main config.
+        let main = "model = \"rayline-local\"\n\n[model_providers.rayline]\nname = \"User Rayline\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
+        let merged =
+            apply_rayline_settings(&seed_tables(main), &snippet("rayline-local", false)).unwrap();
+        assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
+        assert!(!merged.contains("User Rayline"));
+        assert!(merged.contains("[mcp_servers.foo]"));
     }
 
     #[test]
@@ -905,29 +1019,17 @@ mod tests {
     }
 
     #[test]
-    fn seed_starting_with_table_is_kept_whole() {
-        let main = "[mcp_servers.foo]\ncommand = \"x\"\n";
-        assert_eq!(preservable_suffix(main), main);
-    }
-
-    #[test]
-    fn compose_no_suffix_is_just_the_block() {
-        assert_eq!(compose_config(RAYLINE_BLOCK, ""), RAYLINE_BLOCK);
-    }
-
-    #[test]
-    fn write_isolated_home_first_run_seeds_from_main_then_preserves_on_rerun() {
-        // End-to-end over the filesystem: first write with no existing isolated
-        // config seeds the app suffix; the app then appends a section; a second
-        // write with a changed block replaces the block but keeps both suffixes.
+    fn write_isolated_home_preserves_app_changes_across_reruns() {
+        // Over the filesystem: first write, the app appends its own section, a
+        // rerun with new settings updates ours and keeps the app's.
         let dir = unique_tmp_dir("merge-e2e");
         let iso = dir.join("config.toml");
-
-        // First write (no existing file). Simulate the seed by writing the file
-        // as if seeded, then have the "app" append its own section.
         fs::write(
             &iso,
-            format!("{RAYLINE_BLOCK}\n[mcp_servers.foo]\ncommand = \"x\"\n"),
+            format!(
+                "{}\n[mcp_servers.foo]\ncommand = \"x\"\n",
+                snippet("rayline-local", false)
+            ),
         )
         .unwrap();
         // App persists a setting afterwards.
@@ -940,15 +1042,12 @@ mod tests {
         )
         .unwrap();
 
-        // Rerun: regenerate with a different block; preserve everything below.
-        let existing = fs::read_to_string(&iso).unwrap();
-        let new_block = "model = \"gpt-5.5\"\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n";
-        let composed = compose_config(new_block, &suffix_below_rayline_block(&existing));
-
-        assert_eq!(composed.matches("[model_providers.rayline]").count(), 1);
-        assert!(composed.contains("model = \"gpt-5.5\""));
-        assert!(composed.contains("[mcp_servers.foo]")); // seeded suffix kept
-        assert!(composed.contains("[desktop]")); // app-persisted suffix kept
+        write_isolated_home(&dir, &snippet("gpt-5.5", false), false).unwrap();
+        let written = fs::read_to_string(&iso).unwrap();
+        assert_eq!(written.matches("[model_providers.rayline]").count(), 1);
+        assert!(written.contains("model = \"gpt-5.5\""));
+        assert!(written.contains("[mcp_servers.foo]"));
+        assert!(written.contains("[desktop]\nqueue = true"));
         let _ = fs::remove_dir_all(&dir);
     }
 
