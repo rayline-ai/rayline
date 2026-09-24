@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
 const DEFAULT_MODEL: &str = "rayline-router";
-const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
 const DEFAULT_AUTO_COMPACT_WINDOW: &str = "180000";
 const DEFAULT_AUTO_COMPACT_WINDOW_1M: &str = "950000";

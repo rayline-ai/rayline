@@ -469,7 +469,7 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 protocol: EndpointProtocol::AnthropicMessages,
                 base_url: "https://api.anthropic.com".to_owned(),
                 api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
-                models: vec!["claude-sonnet-4-6".to_owned(), "claude-opus-4-7".to_owned()],
+                models: vec!["claude-sonnet-5".to_owned(), "claude-opus-5".to_owned()],
                 headers: HashMap::new(),
                 auth: None,
             },
@@ -479,7 +479,13 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 protocol: EndpointProtocol::OpenAIChat,
                 base_url: "https://api.openai.com/v1".to_owned(),
                 api_key_env: Some("OPENAI_API_KEY".to_owned()),
-                models: vec!["gpt-5.2".to_owned(), "gpt-5.2-codex".to_owned()],
+                models: vec![
+                    "gpt-5.5".to_owned(),
+                    "gpt-5.6-sol".to_owned(),
+                    "gpt-5.6-terra".to_owned(),
+                    "gpt-5.6-luna".to_owned(),
+                    "gpt-6-astra".to_owned(),
+                ],
                 headers: HashMap::new(),
                 auth: None,
             },
@@ -492,23 +498,15 @@ fn default_config(local_model_id: &str) -> RouterConfig {
                 protocol: EndpointProtocol::AnthropicMessages,
                 base_url: "https://openrouter.ai/api".to_owned(),
                 api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
-                models: vec!["anthropic/claude-sonnet-4.6".to_owned()],
+                models: vec!["anthropic/claude-sonnet-5".to_owned()],
                 headers: HashMap::new(),
                 auth: Some(AuthMode::Bearer),
             },
         ],
         routes: RoutesConfig {
-            main: Some(RouteTarget {
-                endpoint: "anthropic".to_owned(),
-                model: "claude-sonnet-4-6".to_owned(),
-                ..Default::default()
-            }),
+            main: Some(default_main_route()),
             subagent: Some(RouteTarget::local(local_model_id)),
-            default: Some(RouteTarget {
-                endpoint: "anthropic".to_owned(),
-                model: "claude-sonnet-4-6".to_owned(),
-                ..Default::default()
-            }),
+            default: Some(default_main_route()),
             model_routes: HashMap::from([
                 (
                     DEFAULT_SUBAGENT_MODEL.to_owned(),
@@ -1972,7 +1970,7 @@ fn subagent_route<'a>(
 fn default_main_route() -> RouteTarget {
     RouteTarget {
         endpoint: "anthropic".to_owned(),
-        model: "claude-sonnet-4-6".to_owned(),
+        model: "claude-sonnet-5".to_owned(),
         ..Default::default()
     }
 }
@@ -2531,6 +2529,7 @@ async fn forward_anthropic_endpoint(
 ) -> Result<Response<BoxBody>> {
     let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     rewrite_body_model(&mut parsed, &decision.selected_model);
+    adapt_anthropic_body_for_model(&mut parsed, &decision.selected_model);
     let outbound_body = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
     let mut outbound = state
@@ -2563,6 +2562,87 @@ async fn forward_anthropic_endpoint(
         Some(estimated_input_tokens),
     )
     .await
+}
+
+/// Anthropic families verified to reject `thinking: {type: "enabled",
+/// budget_tokens: N}` with a 400 pointing at `thinking.type.adaptive` +
+/// `output_config.effort`, and to reject `temperature`, `top_p` and `top_k` as
+/// deprecated. Each entry covers its dated variants (`claude-sonnet-5-2026…`).
+/// Older families still accept only the legacy shape (Haiku 4.5) or both
+/// (Sonnet 4.6, Opus 4.6), so their bodies are forwarded untouched; a newer
+/// family must be added here once verified.
+const ANTHROPIC_ADAPTIVE_THINKING_FAMILIES: [&str; 5] = [
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-sonnet-5",
+];
+
+/// Matches on the bare id so provider-prefixed forms such as OpenRouter's
+/// `anthropic/claude-sonnet-5` are covered, and only at a `-` (dated variant)
+/// or `:` (provider modifier such as `:batch`) boundary so a family never
+/// claims a longer version (`claude-sonnet-50`).
+fn model_requires_adaptive_thinking(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    ANTHROPIC_ADAPTIVE_THINKING_FAMILIES
+        .iter()
+        .any(|family| match bare.strip_prefix(family) {
+            Some(rest) => rest.is_empty() || rest.starts_with(['-', ':']),
+            None => false,
+        })
+}
+
+/// Same budget → effort mapping the hosted router applies.
+fn budget_to_effort(budget: u64) -> &'static str {
+    match budget {
+        0..=2000 => "low",
+        2001..=4000 => "medium",
+        4001..=8000 => "high",
+        _ => "max",
+    }
+}
+
+/// Rewrite a Claude Code Messages body for the model the router selected. The
+/// client shaped the request for the model it was told about (a sentinel such
+/// as `rayline-router`, or an older Sonnet), so when the selected model is a
+/// family that only accepts adaptive thinking, translate the legacy enabled
+/// shape and drop the deprecated sampling params instead of leaking the
+/// upstream 400 back to the client. A caller-supplied `output_config.effort`
+/// wins over the budget mapping.
+fn adapt_anthropic_body_for_model(body: &mut Value, model: &str) {
+    if !model_requires_adaptive_thinking(model) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for key in ["temperature", "top_p", "top_k"] {
+        obj.remove(key);
+    }
+    let enabled = obj
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("enabled");
+    if !enabled {
+        return;
+    }
+    let budget = obj
+        .get("thinking")
+        .and_then(|thinking| thinking.get("budget_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    obj.insert("thinking".to_owned(), json!({"type": "adaptive"}));
+    let output_config = obj.entry("output_config").or_insert_with(|| json!({}));
+    if !output_config.is_object() {
+        *output_config = json!({});
+    }
+    if let Some(config) = output_config.as_object_mut() {
+        if !config.get("effort").is_some_and(Value::is_string) {
+            config.insert("effort".to_owned(), json!(budget_to_effort(budget)));
+        }
+    }
 }
 
 async fn forward_openai_chat_endpoint(
@@ -5599,7 +5679,7 @@ mod tests {
         );
         let main = config.routes.main.as_ref().unwrap();
         assert_eq!(main.endpoint, "anthropic");
-        assert_eq!(main.model, "claude-sonnet-4-6");
+        assert_eq!(main.model, "claude-sonnet-5");
         let explore = config.routes.subagents.get("Explore").unwrap();
         assert_eq!(explore.endpoint, "local");
         assert_eq!(explore.model, "local-model");
@@ -6768,7 +6848,7 @@ mod tests {
     fn direct_model_routes_to_declaring_endpoint() {
         let state = state(default_config("local-model"));
         let headers = HeaderMap::new();
-        let body = json!({"model": "gpt-5.2", "messages": []});
+        let body = json!({"model": "gpt-5.5", "messages": []});
 
         let decision = select_route(&state, &headers, &body, ApiSurface::Anthropic);
 
@@ -6776,7 +6856,7 @@ mod tests {
             decision.target,
             RouteSelection::Endpoint("openai".to_owned())
         );
-        assert_eq!(decision.selected_model, "gpt-5.2");
+        assert_eq!(decision.selected_model, "gpt-5.5");
     }
 
     #[test]
@@ -7763,6 +7843,72 @@ mod tests {
             pretty_model("anthropic/claude-3-5-sonnet-20241022"),
             "claude-3-5-sonnet-20241022"
         );
+    }
+
+    #[test]
+    fn adapt_anthropic_body_translates_legacy_thinking_for_claude_5() {
+        let mut body = json!({
+            "model": "claude-sonnet-5",
+            "temperature": 1,
+            "top_p": 0.9,
+            "top_k": 5,
+            "thinking": {"type": "enabled", "budget_tokens": 3000},
+            "messages": []
+        });
+
+        adapt_anthropic_body_for_model(&mut body, "claude-sonnet-5");
+
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "medium");
+        for key in ["temperature", "top_p", "top_k"] {
+            assert!(body.get(key).is_none(), "{key} should be dropped");
+        }
+    }
+
+    #[test]
+    fn adapt_anthropic_body_keeps_caller_effort_and_disabled_thinking() {
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 20000},
+            "output_config": {"effort": "low"},
+            "messages": []
+        });
+        adapt_anthropic_body_for_model(&mut body, "claude-opus-5");
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], "low");
+
+        let mut disabled = json!({"thinking": {"type": "disabled"}, "messages": []});
+        adapt_anthropic_body_for_model(&mut disabled, "claude-sonnet-5");
+        assert_eq!(disabled["thinking"], json!({"type": "disabled"}));
+        assert!(disabled.get("output_config").is_none());
+    }
+
+    #[test]
+    fn adapt_anthropic_body_leaves_older_families_untouched() {
+        let original = json!({
+            "temperature": 0.5,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": []
+        });
+        let mut body = original.clone();
+        adapt_anthropic_body_for_model(&mut body, "claude-sonnet-4-6");
+        assert_eq!(body, original);
+        let mut body = original.clone();
+        adapt_anthropic_body_for_model(&mut body, "claude-haiku-4-5-20251001");
+        assert_eq!(body, original);
+        assert!(model_requires_adaptive_thinking(
+            "anthropic/claude-sonnet-5"
+        ));
+        assert!(model_requires_adaptive_thinking("claude-sonnet-5-20260901"));
+        assert!(model_requires_adaptive_thinking(
+            "anthropic/claude-sonnet-5:batch"
+        ));
+        assert!(!model_requires_adaptive_thinking(
+            "anthropic/claude-sonnet-4.6"
+        ));
+        assert!(!model_requires_adaptive_thinking("claude-sonnet-50"));
+        assert!(!model_requires_adaptive_thinking("claude-opus-4-70"));
+        assert_eq!(budget_to_effort(0), "low");
+        assert_eq!(budget_to_effort(8001), "max");
     }
 
     #[test]

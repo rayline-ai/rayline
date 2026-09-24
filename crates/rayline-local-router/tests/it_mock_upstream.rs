@@ -914,3 +914,133 @@ async fn mcp_style_tool_names_are_provider_safe_upstream_and_restored_downstream
     let _ = std::fs::remove_file(path);
     println!("PASS MCP tool name rewritten upstream as {sent_name:?} and restored downstream");
 }
+
+/// Claude Code shapes its body for the sentinel it was told about; when the
+/// selected model is a Claude 5 family the router must translate the legacy
+/// thinking block and drop the deprecated sampling params BEFORE the bytes go
+/// upstream. Streaming path, with the provider-prefixed OpenRouter id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_adapts_body_for_claude_5_upstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(upstream, anthropic_sse("ok"), tx));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "openrouter-mock",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["anthropic/claude-sonnet-5"]
+        }],
+        "routes": {
+            "main": {"endpoint": "openrouter-mock", "model": "anthropic/claude-sonnet-5"},
+            "default": {"endpoint": "openrouter-mock", "model": "anthropic/claude-sonnet-5"}
+        }
+    });
+    let path = write_config("anthropic-adapt-claude-5", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "rayline-router",
+            "stream": true,
+            "max_tokens": 2048,
+            "temperature": 1,
+            "top_p": 0.95,
+            "top_k": 5,
+            "thinking": {"type": "enabled", "budget_tokens": 5000},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    let events = collect_sse(resp).await;
+    assert_eq!(sse_text(&events), "ok");
+
+    let captured = rx.await.expect("captured upstream request");
+    let body = captured
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+    let sent = serde_json::from_str::<Value>(body).expect("upstream request body");
+    assert_eq!(sent["model"], "anthropic/claude-sonnet-5");
+    assert_eq!(sent["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(sent["output_config"]["effort"], "high");
+    for key in ["temperature", "top_p", "top_k"] {
+        assert!(
+            sent.get(key).is_none(),
+            "{key} must not reach a Claude 5 upstream"
+        );
+    }
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS Claude 5 body adapted upstream: {sent}");
+}
+
+/// The same body routed to a legacy family is forwarded byte-for-byte: the
+/// adaptation is gated on the selected model, not applied blindly. Non-streaming
+/// path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_leaves_legacy_family_body_untouched() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    let reply = json!({
+        "id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    tokio::spawn(serve_once_capture(upstream, http_json(&reply), tx));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "anthropic-mock",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["claude-haiku-4-5"]
+        }],
+        "routes": {
+            "main": {"endpoint": "anthropic-mock", "model": "claude-haiku-4-5"},
+            "default": {"endpoint": "anthropic-mock", "model": "claude-haiku-4-5"}
+        }
+    });
+    let path = write_config("anthropic-legacy-untouched", &config);
+    start_router(port, path.clone()).await;
+
+    let request = json!({
+        "model": "rayline-router",
+        "max_tokens": 2048,
+        "temperature": 1,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&request)
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    let reply_seen = resp.json::<Value>().await.expect("json reply");
+    assert_eq!(reply_seen["content"][0]["text"], "ok");
+
+    let captured = rx.await.expect("captured upstream request");
+    let body = captured
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+    let sent = serde_json::from_str::<Value>(body).expect("upstream request body");
+    let mut expected = request.clone();
+    expected["model"] = json!("claude-haiku-4-5");
+    assert_eq!(sent, expected);
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS legacy family body forwarded untouched: {sent}");
+}
