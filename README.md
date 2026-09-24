@@ -7,8 +7,9 @@ main agent on a frontier cloud model while quietly sending cheaper, high-volume
 work — like background subagent tasks — to a fast model running locally.
 
 It ships as two binaries: the `rayline` CLI and the `rld` daemon. Using it
-locally through `rayline claude --local` needs no account and never connects to a
-hosted service — everything runs with your own machine and credentials.
+locally through `rayline claude --local` needs no account and never connects to
+Rayline's hosted service — routing decisions are made on your machine, and any
+cloud model traffic uses your own credentials.
 
 ## Demo
 
@@ -108,12 +109,15 @@ only ever need `--local`** — the other two are advanced overrides.
 | `--via` | How does Claude Code connect? | `proxy`, `env` | `proxy` |
 | `--route` | What flows through the router? | `all`, `subagents` | depends on router |
 
-- `--local` runs the on-device static router: no login, nothing leaves your
-  machine. Without it, the hosted cloud router at `api.rayline.ai` makes the
-  decisions (needs `rayline auth login`).
+- `--local` runs the on-device static router: no login, and routing decisions
+  never leave your machine. Without it, the hosted cloud router at
+  `api.rayline.ai` makes the decisions (needs `rayline auth login`).
 - By default, local sessions are **hybrid**: your main agent stays on cloud
-  Claude and only subagent traffic is routed. Pass `--route all` for a
-  fully-local session.
+  Claude and only subagent traffic goes through the router. Pass `--route all`
+  to send the main agent through the router too. Where it lands is then up to
+  the router config: the built-in default keeps main on cloud Claude, so a
+  fully-local session also needs a config with `routes.main.endpoint: local`
+  (see `--router-config-path`).
 
 The [Getting Started guide](docs/getting-started.md#choosing-where-requests-go)
 has the full matrix and every valid combination.

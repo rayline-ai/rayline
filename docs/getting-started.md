@@ -7,8 +7,9 @@ then into the configuration you'll reach for as you go deeper.
 Two ways to run it:
 
 - **`rayline claude --local`** — the local static router. No hosted account, no
-  network calls for routing decisions; everything stays on your machine.
-  (`--local-router` is a deprecated alias.)
+  network calls for routing decisions. Out of the box it sends read-only
+  subagents such as Explore to your local model and keeps everything else,
+  including the main agent, on cloud Claude.
 - **`rayline claude`** — adds hosted Rayline routing on top of Claude Code. This
   signs you in with a Rayline-scoped CLI session (an opaque `rls_`/`rlr_` token)
   and mints a separate `rlk-` router key for hosted requests.
@@ -167,9 +168,9 @@ reach past `--local`; the other two are advanced overrides.
 
 - **Absent:** the **hosted cloud router** at `api.rayline.ai` makes routing and
   model decisions (requires `rayline auth login`).
-- **Present:** the **on-device static router** decides locally. No login, nothing
-  leaves your machine. `--local` forces the proxy, since local inference is only
-  reachable through it.
+- **Present:** the **on-device static router** decides locally. No login, and no
+  routing decision leaves your machine. `--local` forces the proxy, since local
+  inference is only reachable through it.
 
 ### `--via` — how it connects
 
@@ -197,7 +198,9 @@ The default depends on the router, because the two are used differently:
 - **Cloud router → `all`.** The hosted router does model selection, so applying
   it everywhere is the intended behavior.
 - **Local router → `subagents`.** Local sessions are hybrid by default; pass
-  `--route all` for a fully-local session.
+  `--route all` to route the main agent as well. The default local config still
+  sends main to cloud Claude; set `routes.main.endpoint` to `local` in a router
+  config for a fully-local session.
 
 ### Common combinations
 
