@@ -198,6 +198,8 @@ router's to handle, so Rayline turns off Claude Code's own refusal recovery:
 it sets `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` (no resend to another Claude
 model) and `CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1` (no same-model resend). A value
 you set yourself is kept. `--route subagents` leaves Claude Code's defaults.
+A running Claude Code daemon is reused only if it holds the same values (its
+background agents inherit its env); otherwise Rayline treats it as a conflict.
 
 The default depends on the router, because the two are used differently:
 
