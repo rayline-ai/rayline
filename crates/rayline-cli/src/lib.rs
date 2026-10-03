@@ -11,6 +11,7 @@ pub(crate) mod claude_daemon;
 pub mod codex;
 pub mod codex_app;
 pub mod discover;
+pub mod harness;
 pub mod local_model;
 pub mod onboarding;
 pub mod providers;
@@ -55,6 +56,11 @@ Commands:
   status     Show current CLI auth status
   claude     Run Claude Code through Rayline routing
   codex      Run Codex CLI through Rayline local Responses routing
+  opencode   Run opencode against the Rayline router
+  pi         Run pi against the Rayline router
+  omp        Run oh-my-pi (omp) against the Rayline router
+  hermes     Run Hermes Agent against the Rayline router
+  openclaw   Run OpenClaw against the Rayline router
   router     Start, inspect, or stop the local Rayline router runtime
   top        Show live router request metrics
   local      Configure local model routing
@@ -464,6 +470,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
         RaylineDispatch::CodexRun(request) => codex::run(request).await,
         RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
+        RaylineDispatch::Harness(request) => harness::run(request).await,
         RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
             Ok(message) => {
                 print!("{message}");
@@ -711,6 +718,7 @@ pub enum RaylineDispatch {
     CodexRun(codex::RunRequest),
     CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
+    Harness(harness::RunRequest),
     RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
     RouterLogs(router::RouterLogsRequest),
@@ -847,11 +855,81 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             "update" => parse_update_request(args)
                 .map(RaylineDispatch::Update)
                 .unwrap_or(RaylineDispatch::Unavailable),
-            _ => RaylineDispatch::Unavailable,
+            command => match harness::Harness::from_command(command) {
+                Some(harness) => parse_harness_request(
+                    harness,
+                    args,
+                    root_env,
+                    root_auth_token,
+                    root_env_explicit,
+                )
+                .map(RaylineDispatch::Harness)
+                .unwrap_or(RaylineDispatch::Unavailable),
+                None => RaylineDispatch::Unavailable,
+            },
         };
     }
 
     RaylineDispatch::Unavailable
+}
+
+/// `rayline [--env E] <harness> [--env E] [--auth-token T] [--] [ARGS]...`.
+/// Rayline options are read only before the first other arg; everything from
+/// there (or after `--`) passes through to the harness, including `--help`.
+fn parse_harness_request<'a, I>(
+    harness: harness::Harness,
+    mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
+    root_env_explicit: bool,
+) -> Option<harness::RunRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut env_name = root_env;
+    let mut auth_token = root_auth_token;
+    let mut root_env_explicit = root_env_explicit;
+    let mut harness_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        let Some(arg_str) = arg.to_str() else {
+            harness_args.push(arg.clone());
+            break;
+        };
+        if arg_str == "--" {
+            break;
+        }
+        let (option, inline_value) = match arg_str.split_once('=') {
+            Some((option, value)) => (option, Some(value)),
+            None => (arg_str, None),
+        };
+        if !matches!(option, "--env" | "--auth-token") {
+            harness_args.push(arg.clone());
+            break;
+        }
+        let value = match inline_value {
+            Some(value) => value,
+            None => args.next()?.to_str()?,
+        };
+        if option == "--env" {
+            if !status::is_valid_root_env(value) {
+                return None;
+            }
+            env_name = Some(value.to_owned());
+            root_env_explicit = true;
+        } else {
+            auth_token = Some(value.to_owned());
+        }
+    }
+    harness_args.extend(args.cloned());
+
+    Some(harness::RunRequest {
+        harness,
+        env_name,
+        auth_token,
+        root_env_explicit,
+        args: harness_args,
+    })
 }
 
 fn parse_auth_dispatch<'a, I>(
@@ -2980,5 +3058,59 @@ mod tests {
             }
             other => panic!("expected CodexConfigure, got {other:?}"),
         }
+    }
+
+    fn harness_run(args: &[&str]) -> crate::harness::RunRequest {
+        match rayline_dispatch_for_argv(&argv(args)) {
+            RaylineDispatch::Harness(request) => request,
+            other => panic!("expected Harness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn harness_commands_dispatch_and_pass_args_through() {
+        use crate::harness::Harness;
+        for harness in Harness::ALL {
+            let request = harness_run(&["rayline", harness.name()]);
+            assert_eq!(request.harness, harness);
+            assert_eq!(request.env_name, None);
+            assert!(request.args.is_empty());
+        }
+
+        let request = harness_run(&["rayline", "--env", "dev", "pi", "-p", "--env", "x"]);
+        assert_eq!(request.harness, Harness::Pi);
+        assert_eq!(request.env_name.as_deref(), Some("dev"));
+        assert!(request.root_env_explicit);
+        assert_eq!(request.args, argv(&["-p", "--env", "x"]));
+
+        let request = harness_run(&[
+            "rayline",
+            "opencode",
+            "--env=dev",
+            "--auth-token",
+            "t",
+            "run",
+            "hi",
+        ]);
+        assert_eq!(request.env_name.as_deref(), Some("dev"));
+        assert_eq!(request.auth_token.as_deref(), Some("t"));
+        assert_eq!(request.args, argv(&["run", "hi"]));
+
+        let request = harness_run(&["rayline", "omp", "--", "--env", "dev"]);
+        assert_eq!(request.env_name, None);
+        assert_eq!(request.args, argv(&["--env", "dev"]));
+
+        let request = harness_run(&["rayline", "hermes", "--help"]);
+        assert_eq!(request.args, argv(&["--help"]));
+        assert!(rayline_help_for_argv(&argv(&["rayline", "hermes", "--help"])).is_none());
+
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "openclaw", "--env", "bad/env"])),
+            RaylineDispatch::Unavailable
+        );
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["rayline", "openclaw", "--env"])),
+            RaylineDispatch::Unavailable
+        );
     }
 }
