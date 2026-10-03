@@ -30,6 +30,17 @@ const ROUTING_MODE_OVERRIDE: &str = "override";
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
+/// Claude Code's own refusal recovery, switched off for a session whose main
+/// conversation the router serves: refusals are the router's to handle. The
+/// fallback resends a refused turn to another Claude model (it fires for models
+/// with the `refusal_fallback` capability, e.g. a Claude id, not for a router
+/// alias); the retry (2.1.282+, on by default) resends it once to the same
+/// model with a nudge that stays in the history, so every refused turn hits the
+/// router twice.
+const CLAUDE_REFUSAL_RECOVERY_OFF_ENV: [&str; 2] = [
+    "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
+    "CLAUDE_CODE_DISABLE_REFUSAL_RETRY",
+];
 pub(crate) const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
 const DIAG_PROBE_TIMEOUT_SECONDS: u64 = 8;
 const LEGACY_STATUSLINE_MARKERS: [&str; 2] = ["wksp-route-statusline", "rl-route-statusline"];
@@ -990,6 +1001,10 @@ async fn run_command_from_home(
             configure_route_statusline(home, isolated, request.route_statusline_enabled);
         }
     }
+    for (key, value) in refusal_recovery_env(request.routing_mode, |key| env::var_os(key).is_some())
+    {
+        command.env(key, value);
+    }
     if request.diagnose {
         diag_print_postamble_for_mode(request.routing_mode, &router_url, isolated, home).await;
     }
@@ -1292,6 +1307,23 @@ fn should_set_model_env(
     routing_mode != RoutingMode::ProxySubagents
         || request_model_explicit
         || inherited_anthropic_model
+}
+
+/// The refusal-recovery switches to set for this launch: only when the router
+/// serves the main conversation (not `--route subagents`, where it goes straight
+/// to Anthropic), and never over a value the user already set.
+fn refusal_recovery_env(
+    routing_mode: RoutingMode,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, &'static str)> {
+    if routing_mode == RoutingMode::ProxySubagents {
+        return Vec::new();
+    }
+    CLAUDE_REFUSAL_RECOVERY_OFF_ENV
+        .into_iter()
+        .filter(|key| !is_set(key))
+        .map(|key| (key, "1"))
+        .collect()
 }
 
 fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
@@ -2584,6 +2616,37 @@ fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
         return home.map_or(path.clone(), |home| home.join(rest));
     }
     path
+}
+
+#[cfg(test)]
+mod refusal_recovery_env_tests {
+    use super::*;
+
+    const BOTH_OFF: [(&str, &str); 2] = [
+        ("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1"),
+        ("CLAUDE_CODE_DISABLE_REFUSAL_RETRY", "1"),
+    ];
+
+    #[test]
+    fn routed_main_conversation_turns_both_off() {
+        for mode in [RoutingMode::Override, RoutingMode::Proxy] {
+            assert_eq!(refusal_recovery_env(mode, |_| false), BOTH_OFF.to_vec());
+        }
+    }
+
+    #[test]
+    fn subagent_only_routing_leaves_claude_code_defaults() {
+        assert!(refusal_recovery_env(RoutingMode::ProxySubagents, |_| false).is_empty());
+    }
+
+    #[test]
+    fn a_value_the_user_set_is_left_alone() {
+        let set = |key: &str| key == "CLAUDE_CODE_DISABLE_REFUSAL_RETRY";
+        assert_eq!(
+            refusal_recovery_env(RoutingMode::Override, set),
+            vec![("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1")]
+        );
+    }
 }
 
 #[cfg(test)]

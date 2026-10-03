@@ -193,6 +193,12 @@ What goes through the router versus straight to Anthropic:
 - **`subagents`**: route only subagent traffic; the main agent stays on cloud
   Claude. This is the hybrid path — quality main agent, offloaded subagents.
 
+When the router serves the main agent (`--route all`), refusals are the
+router's to handle, so Rayline turns off Claude Code's own refusal recovery:
+it sets `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` (no resend to another Claude
+model) and `CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1` (no same-model resend). A value
+you set yourself is kept. `--route subagents` leaves Claude Code's defaults.
+
 The default depends on the router, because the two are used differently:
 
 - **Cloud router → `all`.** The hosted router does model selection, so applying
