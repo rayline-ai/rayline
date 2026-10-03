@@ -159,6 +159,13 @@ pub(crate) async fn resolve_cloud_router_key(
 /// materialization ([`crate::router_config::materialize_codex_config_for_local_router`])
 /// are shared, not re-implemented.
 ///
+/// The default config follows `--env`: its cloud endpoint is the selected
+/// environment's router (the same `resolve_env` + `resolve_hosted_environment`
+/// resolution `rayline claude` uses), and each environment has its own file, so
+/// the router URL always matches the environment whose `rlk-` key
+/// [`resolve_cloud_router_key`] provisions. An unknown environment is an error
+/// rather than a silent fallback to prod.
+///
 /// Only the default `--auth auto` opts in. Explicit `--auth subscription` keeps
 /// the ChatGPT-subscription default, and `--auth none` keeps the local default —
 /// both resolve their own zero-config shapes downstream in `start_from_cli`.
@@ -166,11 +173,19 @@ pub(crate) fn resolve_codex_config_path(
     home: &Path,
     config_path: Option<PathBuf>,
     auth_mode: CodexAuthMode,
+    env_name: Option<&str>,
 ) -> io::Result<Option<PathBuf>> {
     if config_path.is_some() || auth_mode != CodexAuthMode::Auto {
         return Ok(config_path);
     }
-    Ok(Some(crate::router_config::ensure_default_config(home)?))
+    let env = crate::status::resolve_env(env_name, Some(home));
+    let hosted = crate::status::resolve_hosted_environment(&env, Some(home))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(Some(crate::router_config::ensure_default_config(
+        home,
+        &env,
+        &hosted.router_url,
+    )?))
 }
 
 /// Resolve the real home used for the Rayline router config + key (not the Codex
@@ -178,14 +193,19 @@ pub(crate) fn resolve_codex_config_path(
 pub(crate) fn resolve_codex_config_path_from_home(
     config_path: Option<PathBuf>,
     auth_mode: CodexAuthMode,
+    env_name: Option<&str>,
 ) -> io::Result<Option<PathBuf>> {
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    resolve_codex_config_path(&home, config_path, auth_mode)
+    resolve_codex_config_path(&home, config_path, auth_mode, env_name)
 }
 
 pub async fn run(mut request: RunRequest) -> ExitCode {
-    match resolve_codex_config_path_from_home(request.config_path.take(), request.auth_mode) {
+    match resolve_codex_config_path_from_home(
+        request.config_path.take(),
+        request.auth_mode,
+        request.env_name.as_deref(),
+    ) {
         Ok(path) => request.config_path = path,
         Err(error) => {
             eprintln!("Error: failed to prepare the default Rayline codex config: {error}");
@@ -446,7 +466,8 @@ mod tests {
         EffectiveCodexAuthMode, parse_codex_version_text, resolve_cloud_router_key,
         resolve_codex_config_path, subscription_router_config_json,
     };
-    use std::path::PathBuf;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
 
     fn temp_home() -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -540,7 +561,7 @@ mod tests {
     #[test]
     fn default_auto_no_config_resolves_to_rrc() {
         let home = temp_home();
-        let resolved = resolve_codex_config_path(&home, None, CodexAuthMode::Auto).unwrap();
+        let resolved = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, None).unwrap();
         let path = resolved.expect("auto + no --config should synthesize a default config");
         // It's the shared default config, and it routes to the hosted cloud RCR
         // (Rc-Rc), not a subscription passthrough.
@@ -554,7 +575,8 @@ mod tests {
         let home = temp_home();
         let user = write_config("user-cfg", r#"{"endpoints":[],"routes":{}}"#);
         let resolved =
-            resolve_codex_config_path(&home, Some(user.clone()), CodexAuthMode::Auto).unwrap();
+            resolve_codex_config_path(&home, Some(user.clone()), CodexAuthMode::Auto, None)
+                .unwrap();
         assert_eq!(resolved, Some(user.clone()));
         let _ = std::fs::remove_file(&user);
         let _ = std::fs::remove_dir_all(&home);
@@ -566,13 +588,128 @@ mod tests {
         // `none` (local) keep `None` here and resolve their shapes downstream.
         let home = temp_home();
         assert_eq!(
-            resolve_codex_config_path(&home, None, CodexAuthMode::Subscription).unwrap(),
+            resolve_codex_config_path(&home, None, CodexAuthMode::Subscription, None).unwrap(),
             None
         );
         assert_eq!(
-            resolve_codex_config_path(&home, None, CodexAuthMode::None).unwrap(),
+            resolve_codex_config_path(&home, None, CodexAuthMode::None, None).unwrap(),
             None
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // `--env` scopes the default config: the generated file's cloud endpoint is
+    // the selected environment's router, never prod for a non-prod key.
+
+    const DEV_ROUTER_URL: &str = "https://api-dev.rayline.ai";
+
+    fn write_dev_environment(home: &Path) {
+        let dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "environments": {
+                    "dev": {
+                        "router_url": DEV_ROUTER_URL,
+                        "cli_auth_url": "https://dev.platform.rayline.ai/cli-auth"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn cloud_base_url(path: &Path) -> String {
+        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        cfg["endpoints"][0]["base_url"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn default_config_uses_the_selected_env_router_url() {
+        let home = temp_home();
+        write_dev_environment(&home);
+
+        let path = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"))
+            .unwrap()
+            .expect("auto + no --config should synthesize a default config");
+
+        assert_eq!(
+            path,
+            crate::router_config::default_config_path_for_env(&home, "dev")
+        );
+        assert_ne!(path, crate::router_config::default_config_path(&home));
+        assert_eq!(cloud_base_url(&path), DEV_ROUTER_URL);
+        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn existing_prod_default_is_not_reused_for_another_env() {
+        // The R0 bug: a prod `router.json` from an earlier run was reused by
+        // `--env dev`, sending the dev key to the prod router.
+        let home = temp_home();
+        write_dev_environment(&home);
+        let prod = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, None)
+            .unwrap()
+            .unwrap();
+        let prod_before = std::fs::read(&prod).unwrap();
+        assert_eq!(cloud_base_url(&prod), crate::ROUTER_PROD_URL);
+
+        let dev = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(dev, prod);
+        assert_eq!(cloud_base_url(&dev), DEV_ROUTER_URL);
+        // Switching back to prod finds its own file, untouched.
+        let prod_again = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("prod"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prod_again, prod);
+        assert_eq!(std::fs::read(&prod).unwrap(), prod_before);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn env_default_config_keeps_user_edits() {
+        let home = temp_home();
+        write_dev_environment(&home);
+        let dev = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"))
+            .unwrap()
+            .unwrap();
+        let edited = r#"{"endpoints":[],"routes":{}}"#;
+        std::fs::write(&dev, edited).unwrap();
+
+        let again = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, dev);
+        assert_eq!(std::fs::read_to_string(&dev).unwrap(), edited);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unknown_env_is_an_error_not_a_prod_default() {
+        let home = temp_home();
+        let error = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("staging"))
+            .unwrap_err();
+        assert!(error.to_string().contains("staging"), "{error}");
+        assert!(!crate::router_config::default_config_path(&home).exists());
+        assert!(!crate::router_config::default_config_path_for_env(&home, "staging").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_config_is_used_verbatim_under_another_env() {
+        let home = temp_home();
+        let user = write_config("user-cfg-env", r#"{"endpoints":[],"routes":{}}"#);
+        let resolved =
+            resolve_codex_config_path(&home, Some(user.clone()), CodexAuthMode::Auto, Some("dev"))
+                .unwrap();
+        assert_eq!(resolved, Some(user.clone()));
+        assert!(!crate::router_config::default_config_path_for_env(&home, "dev").exists());
+        let _ = std::fs::remove_file(&user);
         let _ = std::fs::remove_dir_all(&home);
     }
 
