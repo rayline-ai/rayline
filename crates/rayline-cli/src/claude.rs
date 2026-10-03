@@ -1001,8 +1001,9 @@ async fn run_command_from_home(
             configure_route_statusline(home, isolated, request.route_statusline_enabled);
         }
     }
-    for (key, value) in refusal_recovery_env(request.routing_mode, |key| env::var_os(key).is_some())
-    {
+    for (key, value) in refusal_recovery_env(request.routing_mode, |key| {
+        user_set_value(env::var_os(key).as_deref())
+    }) {
         command.env(key, value);
     }
     if request.diagnose {
@@ -1309,9 +1310,15 @@ fn should_set_model_env(
         || inherited_anthropic_model
 }
 
+/// Whether an inherited env value counts as set by the user. An empty value
+/// does not, as for the compact window: Claude Code reads it as "not disabled".
+fn user_set_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
 /// The refusal-recovery switches to set for this launch: only when the router
 /// serves the main conversation (not `--route subagents`, where it goes straight
-/// to Anthropic), and never over a value the user already set.
+/// to Anthropic), and never over a non-empty value the user already set.
 fn refusal_recovery_env(
     routing_mode: RoutingMode,
     is_set: impl Fn(&str) -> bool,
@@ -2637,6 +2644,13 @@ mod refusal_recovery_env_tests {
     #[test]
     fn subagent_only_routing_leaves_claude_code_defaults() {
         assert!(refusal_recovery_env(RoutingMode::ProxySubagents, |_| false).is_empty());
+    }
+
+    #[test]
+    fn an_empty_inherited_value_is_not_user_set() {
+        assert!(!user_set_value(None));
+        assert!(!user_set_value(Some(std::ffi::OsStr::new(""))));
+        assert!(user_set_value(Some(std::ffi::OsStr::new("0"))));
     }
 
     #[test]
