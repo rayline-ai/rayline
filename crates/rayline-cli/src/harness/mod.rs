@@ -20,8 +20,9 @@
 //! and OpenClaw's `prompt_cache_key` keys the session. A harness session is
 //! one episode, so `--resume` / `-c` in a later launch keeps the episode.
 //!
-//! The per-launch conversation id ([`conversation_id_fallback`]) is the
-//! fallback for a gateway that does not read native ids (prod today): every
+//! The per-launch conversation id ([`ConversationIdFallback`]) is the
+//! fallback for a gateway that does not read native ids (prod today), and for
+//! a wire that sends no native id (OpenClaw on Messages): every
 //! launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as `x-conversation-id`,
 //! so one launch is one episode and a resume in a new launch starts a new one.
 //! The native compat flags stay on either way; the gateway ranks
@@ -52,7 +53,7 @@ pub const CONV_HEADER: &str = "x-conversation-id";
 pub const ROUTER_MODEL: &str = "rayline-router";
 pub const CONTEXT_WINDOW: u64 = 200_000;
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
-/// Runtime override for [`conversation_id_fallback`]: `1` or `0`.
+/// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
 pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
 /// Envs whose gateway keys episodes on native harness session ids
 /// (`RAYLINE_HARNESS_SESSION_KEYS`, router-infra#87); the per-launch
@@ -61,15 +62,36 @@ pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
 /// `RAYLINE_HARNESS_SESSION_KEYS` ships to the prod gateway.
 const NATIVE_SESSION_KEY_ENVS: &[&str] = &["dev"];
 
-/// Whether to send the per-launch `x-conversation-id` fallback for `env_name`.
-/// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
-/// `0`/`false`/`off`); anything else falls back to the env default: off where
-/// the gateway reads native session ids, on everywhere else (prod).
-pub(crate) fn conversation_id_fallback(env_name: &str, override_value: Option<&str>) -> bool {
-    match override_value.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if matches!(value.as_str(), "1" | "true" | "on") => true,
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off") => false,
-        _ => !NATIVE_SESSION_KEY_ENVS.contains(&env_name),
+/// When a config sends the per-launch `x-conversation-id`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationIdFallback {
+    /// [`CONV_ID_FALLBACK_ENV`]: `Some(true)` always, `Some(false)` never.
+    pub forced: Option<bool>,
+    /// The env's gateway does not key on native session ids (prod today).
+    pub env_needs_it: bool,
+}
+
+impl ConversationIdFallback {
+    /// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
+    /// `0`/`false`/`off`; anything else is ignored).
+    pub(crate) fn new(env_name: &str, override_value: Option<&str>) -> Self {
+        let forced = match override_value.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) if matches!(value.as_str(), "1" | "true" | "on") => Some(true),
+            Some(value) if matches!(value.as_str(), "0" | "false" | "off") => Some(false),
+            _ => None,
+        };
+        Self {
+            forced,
+            env_needs_it: !NATIVE_SESSION_KEY_ENVS.contains(&env_name),
+        }
+    }
+
+    /// Whether a config sends the header. `native_session_id` is false for a
+    /// wire on which the harness sends no session id the gateway can key on;
+    /// the header is then on unless forced off.
+    pub(crate) fn enabled(self, native_session_id: bool) -> bool {
+        self.forced
+            .unwrap_or(self.env_needs_it || !native_session_id)
     }
 }
 
@@ -152,9 +174,8 @@ pub(crate) struct RenderContext<'a> {
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
-    /// Whether configs carry the per-launch `x-conversation-id` header
-    /// ([`conversation_id_fallback`]).
-    pub per_launch_conversation_id: bool,
+    /// When configs carry the per-launch `x-conversation-id` header.
+    pub conversation_id: ConversationIdFallback,
 }
 
 impl RenderContext<'_> {
@@ -168,10 +189,17 @@ impl RenderContext<'_> {
         format!("{}/v1", self.router_url)
     }
 
-    /// Conversation-id headers whose value is `value` (the harness's reference
-    /// to [`CONV_ID_ENV`]), or `{}` when the per-launch id is off.
+    /// Conversation-id headers for a wire on which the harness sends its
+    /// native session id: `{CONV_HEADER: value}` (`value` is the harness's
+    /// reference to [`CONV_ID_ENV`]) when the fallback is on, else `{}`.
     pub fn conversation_headers(&self, value: &str) -> Value {
-        if self.per_launch_conversation_id {
+        self.conversation_headers_for(value, true)
+    }
+
+    /// As [`Self::conversation_headers`], for a wire with or without a native
+    /// session id.
+    pub fn conversation_headers_for(&self, value: &str, native_session_id: bool) -> Value {
+        if self.conversation_id.enabled(native_session_id) {
             serde_json::json!({ CONV_HEADER: value })
         } else {
             serde_json::json!({})
@@ -248,7 +276,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         env_name: &env_name,
         router_url: &router_url,
         config_dir: &config_dir,
-        per_launch_conversation_id: conversation_id_fallback(
+        conversation_id: ConversationIdFallback::new(
             &env_name,
             std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
         ),
@@ -262,7 +290,12 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    let conv_id = ctx.per_launch_conversation_id.then(new_conversation_id);
+    // Set the id only when a rendered config references it.
+    let conv_id = plan
+        .files
+        .iter()
+        .any(|file| file.contents.contains(CONV_ID_ENV))
+        .then(new_conversation_id);
     let episode = match &conv_id {
         Some(id) => format!("conversation {id}"),
         None => "episode keyed on the harness session".to_owned(),
@@ -351,7 +384,7 @@ pub(crate) fn build_command(
     command
 }
 
-/// A random (v4) UUID. One per launch; see [`conversation_id_fallback`].
+/// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
 pub(crate) fn new_conversation_id() -> String {
     let mut bytes: [u8; 16] = rand::random();
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -530,21 +563,24 @@ pub(crate) mod tests {
         dir
     }
 
-    /// Render `harness` for dev (native session keys, no fallback) into a
-    /// temp dir and return (dir, plan).
+    /// Render `harness` for dev with no override into a temp dir and return
+    /// (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
-        render_with(harness, conversation_id_fallback("dev", None))
+        render_with(harness, ConversationIdFallback::new("dev", None))
     }
 
-    /// Render `harness` with the per-launch conversation id on or off.
-    pub(crate) fn render_with(harness: Harness, per_launch: bool) -> (PathBuf, Plan) {
+    /// Render `harness` with the given fallback policy.
+    pub(crate) fn render_with(
+        harness: Harness,
+        conversation_id: ConversationIdFallback,
+    ) -> (PathBuf, Plan) {
         let home = temp_dir(harness.name());
         let dir = config_dir(&home, harness, "dev");
         let ctx = RenderContext {
             env_name: "dev",
             router_url: TEST_URL,
             config_dir: &dir,
-            per_launch_conversation_id: per_launch,
+            conversation_id,
         };
         let plan = harness.plan(&ctx);
         write_files(&dir, &plan.files).unwrap();
@@ -666,23 +702,32 @@ pub(crate) mod tests {
 
     #[test]
     fn conversation_id_fallback_defaults_by_env() {
-        assert!(!conversation_id_fallback("dev", None));
-        assert!(conversation_id_fallback("prod", None));
-        // An env without native keys (staging, a custom one) keeps the fallback.
-        assert!(conversation_id_fallback("staging", None));
+        let dev = ConversationIdFallback::new("dev", None);
+        assert!(!dev.enabled(true));
+        // A wire with no native id (OpenClaw Messages) keeps it even on dev.
+        assert!(dev.enabled(false));
+        for env in ["prod", "staging"] {
+            let fallback = ConversationIdFallback::new(env, None);
+            assert!(fallback.enabled(true) && fallback.enabled(false), "{env}");
+        }
     }
 
     #[test]
     fn conversation_id_fallback_override() {
         for on in ["1", "true", "ON", " on "] {
-            assert!(conversation_id_fallback("dev", Some(on)), "{on:?}");
+            let fallback = ConversationIdFallback::new("dev", Some(on));
+            assert!(fallback.enabled(true), "{on:?}");
         }
         for off in ["0", "false", "Off"] {
-            assert!(!conversation_id_fallback("prod", Some(off)), "{off:?}");
+            let fallback = ConversationIdFallback::new("prod", Some(off));
+            assert!(
+                !fallback.enabled(true) && !fallback.enabled(false),
+                "{off:?}"
+            );
         }
         // Unrecognized or empty values keep the env default.
-        assert!(conversation_id_fallback("prod", Some("")));
-        assert!(!conversation_id_fallback("dev", Some("maybe")));
+        assert!(ConversationIdFallback::new("prod", Some("")).enabled(true));
+        assert!(!ConversationIdFallback::new("dev", Some("maybe")).enabled(true));
     }
 
     #[test]
@@ -698,7 +743,11 @@ pub(crate) mod tests {
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
         assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
-        for harness in Harness::ALL {
+        // OpenClaw is the exception: it sends no native id on Messages.
+        for harness in Harness::ALL
+            .into_iter()
+            .filter(|harness| *harness != Harness::OpenClaw)
+        {
             let (dir, plan) = render(harness);
             for file in &plan.files {
                 let text = fs::read_to_string(dir.join(file.name)).unwrap();
@@ -715,7 +764,7 @@ pub(crate) mod tests {
     #[test]
     fn per_launch_fallback_sends_the_conversation_header() {
         for harness in Harness::ALL {
-            let (dir, plan) = render_with(harness, true);
+            let (dir, plan) = render_with(harness, ConversationIdFallback::new("prod", None));
             let sends = plan.files.iter().any(|file| {
                 let text = fs::read_to_string(dir.join(file.name)).unwrap();
                 text.contains(CONV_HEADER) && text.contains(CONV_ID_ENV)

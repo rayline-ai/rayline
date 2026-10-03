@@ -26,7 +26,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "api_mode": "codex_responses",
         "models": models
     });
-    if ctx.per_launch_conversation_id {
+    if ctx.conversation_id.enabled(true) {
         responses["extra_headers"] = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
     }
     let config = json!({
