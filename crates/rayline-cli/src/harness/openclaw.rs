@@ -16,14 +16,19 @@
 //!   / `createAnthropicTransportClient` in `dist/worker/worker.mjs`), which
 //!   adds no `x-session-affinity`; only the Anthropic SDK path
 //!   (`@openclaw/ai/dist/anthropic-DZQ_7gD1.mjs:309`) honours
-//!   `compat.sendSessionAffinityHeaders`, so that flag is not set. One launch
-//!   is one episode; a resume in a new launch starts a new one.
+//!   `compat.sendSessionAffinityHeaders`, so that flag is not set. With
+//!   `--session-id <id>` in the args the conversation id is stable
+//!   (`oc-` + 32 hex of sha256(id)), so relaunching that session keeps its
+//!   episode; otherwise each launch is its own episode.
 //! - The `rayline-resp` provider (model `rayline-resp/rayline-router`) speaks
 //!   Responses, where `compat.supportsPromptCacheKey` sends the session as
 //!   `prompt_cache_key`; without it OpenClaw sends no key on a custom
 //!   endpoint. It takes the per-launch header only where the env needs it.
 
+use std::ffi::OsString;
+
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::{
     CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
@@ -33,6 +38,31 @@ use super::{
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
 pub(crate) const RESPONSES_PROVIDER_ID: &str = "rayline-resp";
+
+/// The value of `--session-id <v>` / `--session-id=<v>` in OpenClaw's args
+/// (the last one wins; an empty value counts as none).
+pub(crate) fn session_id_arg(args: &[OsString]) -> Option<String> {
+    let mut found = None;
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--session-id" {
+            found = args.next().map(|value| value.into_owned());
+        } else if let Some(value) = arg.strip_prefix("--session-id=") {
+            found = Some(value.to_owned());
+        }
+    }
+    found.filter(|value| !value.is_empty())
+}
+
+/// `oc-` + the first 32 hex characters of sha256(session id).
+pub(crate) fn stable_conversation_id(session_id: &str) -> String {
+    let digest = Sha256::digest(session_id.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("oc-{}", &hex[..32])
+}
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let api_key = format!("${{{KEY_ENV}}}");
@@ -166,5 +196,47 @@ mod tests {
             headers(ConversationIdFallback::new("prod", Some("0"))),
             (none.clone(), none)
         );
+    }
+
+    #[test]
+    fn session_id_arg_forms() {
+        use super::session_id_arg;
+        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
+            list.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert_eq!(
+            session_id_arg(&args(&["agent", "--session-id", "abc", "-m", "hi"])),
+            Some("abc".into())
+        );
+        assert_eq!(
+            session_id_arg(&args(&["agent", "--session-id=abc"])),
+            Some("abc".into())
+        );
+        assert_eq!(session_id_arg(&args(&["agent", "-m", "hi"])), None);
+        assert_eq!(session_id_arg(&args(&["agent", "--session-id"])), None);
+        assert_eq!(session_id_arg(&args(&["agent", "--session-id="])), None);
+        assert_eq!(
+            session_id_arg(&args(&["agent", "--", "--session-id", "x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn session_id_gives_a_stable_conversation_id() {
+        use super::super::conversation_id_for;
+        use super::stable_conversation_id;
+        let id = stable_conversation_id("hc-launcher-oc-1");
+        // `printf hc-launcher-oc-1 | shasum -a 256 | cut -c1-32`
+        assert_eq!(id, "oc-fd54be9c6897de49f2fe715ad462412a");
+        assert_ne!(id, stable_conversation_id("hc-launcher-oc-2"));
+        let args: Vec<std::ffi::OsString> = ["agent", "--session-id", "hc-launcher-oc-1"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(conversation_id_for(Harness::OpenClaw, &args), id);
+        assert_eq!(conversation_id_for(Harness::OpenClaw, &args), id);
+        // No session id: a fresh UUID per launch. Other harnesses ignore it.
+        assert_eq!(conversation_id_for(Harness::OpenClaw, &[]).len(), 36);
+        assert_eq!(conversation_id_for(Harness::Pi, &args).len(), 36);
     }
 }

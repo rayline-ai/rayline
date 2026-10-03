@@ -295,7 +295,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         .files
         .iter()
         .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(new_conversation_id);
+        .then(|| conversation_id_for(harness, &request.args));
     let episode = match &conv_id {
         Some(id) => format!("conversation {id}"),
         None => "episode keyed on the harness session".to_owned(),
@@ -382,6 +382,18 @@ pub(crate) fn build_command(
         None => command.env_remove(CONV_ID_ENV),
     };
     command
+}
+
+/// The conversation id for this launch: stable for a harness session the
+/// args name (OpenClaw `--session-id`), so relaunching it keeps the episode;
+/// otherwise a fresh UUID.
+pub(crate) fn conversation_id_for(harness: Harness, args: &[OsString]) -> String {
+    match harness {
+        Harness::OpenClaw => openclaw::session_id_arg(args)
+            .map(|session| openclaw::stable_conversation_id(&session))
+            .unwrap_or_else(new_conversation_id),
+        _ => new_conversation_id(),
+    }
 }
 
 /// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
