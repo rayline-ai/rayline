@@ -2,13 +2,13 @@
 //! state: sessions, memories, skills). `key_env` names the key's env var and
 //! `${VAR}` is expanded in config values.
 //!
-//! Limitation: on `anthropic_messages` Hermes sends no custom headers
-//! (`extra_headers` is ignored there, verified at v2026.8.27), so the default
-//! Messages provider cannot carry `x-conversation-id` and every turn is a new
-//! episode until the gateway derives one from content (router-infra#58). The
-//! `rayline-resp` provider (`--provider rayline-resp`) does send the header,
-//! but `/v1/responses` is routed by rules, not VSR. Each entry has its own
-//! base_url because Hermes looks up `extra_headers` by base_url.
+//! Episode keying: Hermes sends its session id as `x-session-affinity`, which
+//! the gateway keys the episode on, and `-c` / `--resume` keeps it. Upstream
+//! Hermes (v2026.8.27) sends no custom headers on `anthropic_messages`; the
+//! atlasfutures fork (`rayline/session-headers`, router-infra#94) adds the
+//! header on both wires. The `rayline-resp` provider (`--provider
+//! rayline-resp`) speaks Responses. Each entry has its own base_url because
+//! Hermes looks up `extra_headers` by base_url.
 
 use serde_json::json;
 
@@ -26,7 +26,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "api_mode": "codex_responses",
         "models": models
     });
-    if super::PER_LAUNCH_CONVERSATION_ID {
+    if ctx.per_launch_conversation_id {
         responses["extra_headers"] = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
     }
     let config = json!({
@@ -60,7 +60,7 @@ mod tests {
     use super::CONFIG_FILE;
 
     #[test]
-    fn renders_messages_default_and_responses_with_header() {
+    fn renders_messages_default_and_responses_provider() {
         let (dir, plan) = render(Harness::Hermes);
         assert_eq!(
             env_value(&plan, "HERMES_HOME"),
@@ -85,8 +85,6 @@ providers:
   rayline-resp:
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
-    extra_headers:
-      x-conversation-id: \"${RAYLINE_CONV_ID}\"
     key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:

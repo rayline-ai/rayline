@@ -5,18 +5,39 @@
 //! at the gateway. Memory search is off because its default embeddings
 //! provider sends side calls to OpenAI; heartbeat and the compaction memory
 //! flush are off so no background turns hit the router.
+//!
+//! Episode keying (OpenClaw 2026.9.6; `compat` is a model field there, the
+//! provider schema has none): on Messages, `compat.sendSessionAffinityHeaders`
+//! sends the session id as `x-session-affinity`. The `rayline-resp` provider
+//! (model `rayline-resp/rayline-router`) speaks Responses, where
+//! `compat.supportsPromptCacheKey` sends the session as `prompt_cache_key`;
+//! without it OpenClaw sends no key on a custom endpoint.
 
 use serde_json::json;
 
 use super::{
     CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    conversation_headers, json_file,
+    json_file,
 };
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
+pub(crate) const RESPONSES_PROVIDER_ID: &str = "rayline-resp";
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
+    let api_key = format!("${{{KEY_ENV}}}");
+    let headers = ctx.conversation_headers(&format!("${{{CONV_ID_ENV}}}"));
+    let model = |compat: serde_json::Value| {
+        json!({
+            "id": ROUTER_MODEL,
+            "name": format!("Rayline router ({})", ctx.env_name),
+            "reasoning": true,
+            "input": ["text", "image"],
+            "contextWindow": CONTEXT_WINDOW,
+            "maxTokens": MAX_OUTPUT_TOKENS,
+            "compat": compat
+        })
+    };
     let config = json!({
         "memory": { "search": { "provider": "none" } },
         "agents": {
@@ -31,17 +52,17 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             "providers": {
                 PROVIDER_ID: {
                     "baseUrl": ctx.messages_base(),
-                    "apiKey": format!("${{{KEY_ENV}}}"),
+                    "apiKey": api_key,
                     "api": "anthropic-messages",
-                    "headers": conversation_headers(&format!("${{{CONV_ID_ENV}}}")),
-                    "models": [{
-                        "id": ROUTER_MODEL,
-                        "name": format!("Rayline router ({})", ctx.env_name),
-                        "reasoning": true,
-                        "input": ["text", "image"],
-                        "contextWindow": CONTEXT_WINDOW,
-                        "maxTokens": MAX_OUTPUT_TOKENS
-                    }]
+                    "headers": headers,
+                    "models": [model(json!({ "sendSessionAffinityHeaders": true }))]
+                },
+                RESPONSES_PROVIDER_ID: {
+                    "baseUrl": ctx.v1_base(),
+                    "apiKey": api_key,
+                    "api": "openai-responses",
+                    "headers": headers,
+                    "models": [model(json!({ "supportsPromptCacheKey": true }))]
                 }
             }
         }
@@ -82,11 +103,19 @@ mod tests {
         assert_eq!(provider["baseUrl"], TEST_URL);
         assert_eq!(provider["api"], "anthropic-messages");
         assert_eq!(provider["apiKey"], "${RAYLINE_KEY}");
+        assert_eq!(provider["headers"], serde_json::json!({}));
+        let model = &provider["models"][0];
+        assert_eq!(model["contextWindow"], 200000);
+        assert_eq!(model["maxTokens"], 32000);
+        assert_eq!(model["compat"]["sendSessionAffinityHeaders"], true);
+        let responses = &config["models"]["providers"]["rayline-resp"];
+        assert_eq!(responses["baseUrl"], format!("{TEST_URL}/v1"));
+        assert_eq!(responses["api"], "openai-responses");
+        assert_eq!(responses["apiKey"], "${RAYLINE_KEY}");
+        assert_eq!(responses["models"][0]["id"], "rayline-router");
         assert_eq!(
-            provider["headers"]["x-conversation-id"],
-            "${RAYLINE_CONV_ID}"
+            responses["models"][0]["compat"]["supportsPromptCacheKey"],
+            true
         );
-        assert_eq!(provider["models"][0]["contextWindow"], 200000);
-        assert_eq!(provider["models"][0]["maxTokens"], 32000);
     }
 }

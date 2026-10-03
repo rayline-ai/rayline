@@ -1,12 +1,15 @@
 //! opencode: `OPENCODE_CONFIG=<dir>/opencode.json`. opencode merges this file
 //! over the user's global config (project configs still win). `{env:VAR}` is
 //! opencode's config substitution.
+//!
+//! opencode sends its session id as `x-session-affinity` on its own, which
+//! the gateway keys the episode on; `opencode -c` / `--session` keeps it.
 
 use serde_json::json;
 
 use super::{
     CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    conversation_headers, json_file,
+    json_file,
 };
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
@@ -19,8 +22,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "model": model_ref,
         // The session-title side call otherwise goes to the user's global
         // `small_model` (another provider) or a guessed small model. Keep it on
-        // Rayline. It still carries the conversation header and opens the
-        // episode as turn 0 until the gateway branches side calls (router-infra#87).
+        // Rayline. The gateway branches it off the session's episode as a
+        // one-turn side call (router-infra#87).
         "small_model": model_ref,
         "provider": {
             PROVIDER_ID: {
@@ -31,7 +34,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "options": {
                     "baseURL": ctx.v1_base(),
                     "apiKey": format!("{{env:{KEY_ENV}}}"),
-                    "headers": conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
+                    "headers": ctx.conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
                 },
                 "models": {
                     ROUTER_MODEL: {
@@ -78,10 +81,7 @@ mod tests {
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
         assert_eq!(provider["options"]["apiKey"], "{env:RAYLINE_KEY}");
-        assert_eq!(
-            provider["options"]["headers"]["x-conversation-id"],
-            "{env:RAYLINE_CONV_ID}"
-        );
+        assert_eq!(provider["options"]["headers"], serde_json::json!({}));
         let model = &provider["models"]["rayline-router"];
         assert_eq!(model["limit"]["context"], 200000);
         assert_eq!(model["limit"]["output"], 32000);

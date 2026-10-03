@@ -12,14 +12,18 @@
 //! dev (router-infra #80): Anthropic Messages, model `rayline-router`,
 //! `contextWindow` 200000 / `maxTokens` 32000.
 //!
-//! Episode keying: every launch gets a fresh `RAYLINE_CONV_ID` (a UUID), and
-//! each config sends it as `x-conversation-id`, so one launch is one ARC
-//! episode. Resuming a harness session in a new launch therefore starts a new
-//! episode.
-//! TODO(router-infra#87): once the gateway keys episodes on the harnesses' own
-//! session ids (`metadata.user_id` session id, `x-session-affinity`,
-//! `prompt_cache_key`), drop the per-launch header so resume keeps the episode.
-//! [`PER_LAUNCH_CONVERSATION_ID`] is the switch.
+//! Episode keying: the gateway keys an ARC episode on each harness's own
+//! session id (`RAYLINE_HARNESS_SESSION_KEYS`, router-infra#87): opencode and
+//! Hermes send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
+//! mode from omp 18.1.10), and pi and OpenClaw send `x-session-affinity` once
+//! their config sets `compat.sendSessionAffinityHeaders`. On Responses, pi's
+//! and OpenClaw's `prompt_cache_key` keys the session. A harness session is
+//! one episode, so `--resume` / `-c` in a later launch keeps the episode.
+//!
+//! [`PER_LAUNCH_CONVERSATION_ID`] is the fallback for a gateway that does not
+//! read native ids: every launch then gets a fresh `RAYLINE_CONV_ID` (a UUID)
+//! sent as `x-conversation-id`, so one launch is one episode and a resume in a
+//! new launch starts a new one.
 
 mod hermes;
 mod omp;
@@ -38,7 +42,7 @@ use serde_json::Value;
 /// Env var that carries the router key to the harness. Configs reference it by
 /// name; the value is never written to disk.
 pub const KEY_ENV: &str = "RAYLINE_KEY";
-/// Env var that carries the per-launch conversation id.
+/// Env var that carries the per-launch conversation id (fallback only).
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
 /// Header the gateway reads as the conversation (episode) key.
 pub const CONV_HEADER: &str = "x-conversation-id";
@@ -46,9 +50,10 @@ pub const CONV_HEADER: &str = "x-conversation-id";
 pub const ROUTER_MODEL: &str = "rayline-router";
 pub const CONTEXT_WINDOW: u64 = 200_000;
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
-/// Send a per-launch `x-conversation-id`. Turn off once router-infra#87 lands
-/// and the gateway keys on each harness's native session id.
-pub const PER_LAUNCH_CONVERSATION_ID: bool = true;
+/// Fallback: send a per-launch `x-conversation-id` instead of relying on the
+/// harness's native session id. Off since the gateway reads native ids
+/// (router-infra#87); with it off, a resumed session keeps its episode.
+pub const PER_LAUNCH_CONVERSATION_ID: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Harness {
@@ -129,6 +134,9 @@ pub(crate) struct RenderContext<'a> {
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
+    /// Whether configs carry the per-launch `x-conversation-id` header
+    /// ([`PER_LAUNCH_CONVERSATION_ID`]).
+    pub per_launch_conversation_id: bool,
 }
 
 impl RenderContext<'_> {
@@ -140,6 +148,16 @@ impl RenderContext<'_> {
     /// Base URL for clients that expect the `/v1` prefix in the base.
     pub fn v1_base(&self) -> String {
         format!("{}/v1", self.router_url)
+    }
+
+    /// Conversation-id headers whose value is `value` (the harness's reference
+    /// to [`CONV_ID_ENV`]), or `{}` when the per-launch id is off.
+    pub fn conversation_headers(&self, value: &str) -> Value {
+        if self.per_launch_conversation_id {
+            serde_json::json!({ CONV_HEADER: value })
+        } else {
+            serde_json::json!({})
+        }
     }
 }
 
@@ -203,11 +221,16 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         .map_err(|error| error.to_string())?,
     };
 
+    if harness == Harness::Omp {
+        omp::warn_if_old(&binary);
+    }
+
     let config_dir = config_dir(&home, harness, &env_name);
     let ctx = RenderContext {
         env_name: &env_name,
         router_url: &router_url,
         config_dir: &config_dir,
+        per_launch_conversation_id: PER_LAUNCH_CONVERSATION_ID,
     };
     let plan = harness.plan(&ctx);
     write_files(&config_dir, &plan.files).map_err(|error| {
@@ -218,14 +241,24 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    let conv_id = new_conversation_id();
+    let conv_id = ctx.per_launch_conversation_id.then(new_conversation_id);
+    let episode = match &conv_id {
+        Some(id) => format!("conversation {id}"),
+        None => "episode keyed on the harness session".to_owned(),
+    };
     eprintln!(
-        "{}: {} -> {router_url} (env {env_name}, conversation {conv_id})\n  config: {}",
+        "{}: {} -> {router_url} (env {env_name}, {episode})\n  config: {}",
         crate::DISPLAY_NAME,
         harness.name(),
         config_dir.display()
     );
-    Ok(build_command(&binary, &plan, &key, &conv_id, &request.args))
+    Ok(build_command(
+        &binary,
+        &plan,
+        &key,
+        conv_id.as_deref(),
+        &request.args,
+    ))
 }
 
 fn explicit_router_key() -> Option<String> {
@@ -277,7 +310,7 @@ pub(crate) fn build_command(
     binary: &Path,
     plan: &Plan,
     key: &str,
-    conv_id: &str,
+    conv_id: Option<&str>,
     args: &[OsString],
 ) -> Command {
     let mut command = Command::new(binary);
@@ -289,7 +322,11 @@ pub(crate) fn build_command(
         command.env(name, value);
     }
     command.env(KEY_ENV, key);
-    command.env(CONV_ID_ENV, conv_id);
+    match conv_id {
+        Some(conv_id) => command.env(CONV_ID_ENV, conv_id),
+        // An inherited id (e.g. from a parent launch) must not leak in.
+        None => command.env_remove(CONV_ID_ENV),
+    };
     command
 }
 
@@ -307,15 +344,6 @@ pub(crate) fn new_conversation_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-/// Conversation-id headers for configs, empty when the per-launch id is off.
-pub(crate) fn conversation_headers(value: &str) -> Value {
-    if PER_LAUNCH_CONVERSATION_ID {
-        serde_json::json!({ CONV_HEADER: value })
-    } else {
-        serde_json::json!({})
-    }
 }
 
 pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> ConfigFile {
@@ -481,14 +509,21 @@ pub(crate) mod tests {
         dir
     }
 
-    /// Render `harness` into a temp dir and return (dir, plan).
+    /// Render `harness` with the default settings into a temp dir and return
+    /// (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
+        render_with(harness, PER_LAUNCH_CONVERSATION_ID)
+    }
+
+    /// Render `harness` with the per-launch conversation id on or off.
+    pub(crate) fn render_with(harness: Harness, per_launch: bool) -> (PathBuf, Plan) {
         let home = temp_dir(harness.name());
         let dir = config_dir(&home, harness, "dev");
         let ctx = RenderContext {
             env_name: "dev",
             router_url: TEST_URL,
             config_dir: &dir,
+            per_launch_conversation_id: per_launch,
         };
         let plan = harness.plan(&ctx);
         write_files(&dir, &plan.files).unwrap();
@@ -588,7 +623,7 @@ pub(crate) mod tests {
             Path::new("/bin/true"),
             &plan,
             "rlk-test",
-            "conv-1",
+            Some("conv-1"),
             &[OsString::from("run"), OsString::from("hi")],
         );
         let envs: Vec<(String, Option<String>)> = command
@@ -606,6 +641,45 @@ pub(crate) mod tests {
         assert!(envs.contains(&("CLAUDE_CONFIG_DIR".into(), None)));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["run", "hi"]);
+    }
+
+    #[test]
+    fn native_session_keys_are_the_default() {
+        let command = build_command(
+            Path::new("/bin/true"),
+            &Plan::default(),
+            "rlk-test",
+            None,
+            &[],
+        );
+        let conv = command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
+        assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
+        for harness in Harness::ALL {
+            let (dir, plan) = render(harness);
+            for file in &plan.files {
+                let text = fs::read_to_string(dir.join(file.name)).unwrap();
+                assert!(
+                    !text.contains(CONV_HEADER) && !text.contains(CONV_ID_ENV),
+                    "{}: {} still sends the per-launch id",
+                    harness.name(),
+                    file.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_launch_fallback_sends_the_conversation_header() {
+        for harness in Harness::ALL {
+            let (dir, plan) = render_with(harness, true);
+            let sends = plan.files.iter().any(|file| {
+                let text = fs::read_to_string(dir.join(file.name)).unwrap();
+                text.contains(CONV_HEADER) && text.contains(CONV_ID_ENV)
+            });
+            assert!(sends, "{} must send {CONV_HEADER}", harness.name());
+        }
     }
 
     #[test]

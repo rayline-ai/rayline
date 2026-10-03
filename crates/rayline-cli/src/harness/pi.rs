@@ -1,11 +1,16 @@
 //! pi: `PI_CODING_AGENT_DIR=<dir>`, which holds `models.json`, `settings.json`,
 //! `auth.json` and `sessions/`. pi resolves `$VAR` in `apiKey` and header values.
+//!
+//! `compat.sendSessionAffinityHeaders` makes pi send its session id as
+//! `x-session-affinity` on Messages (pi 0.87.1 and 1.0.0; off by default for
+//! non-OpenRouter endpoints), which the gateway keys the episode on. `-c` and
+//! `--resume` reuse the session id, so a resumed session keeps its episode.
 
 use serde_json::json;
 
 use super::{
     CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    conversation_headers, json_file,
+    json_file,
 };
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -17,7 +22,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "baseUrl": ctx.messages_base(),
                 "api": "anthropic-messages",
                 "apiKey": format!("${KEY_ENV}"),
-                "headers": conversation_headers(&format!("${CONV_ID_ENV}")),
+                "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
+                "compat": { "sendSessionAffinityHeaders": true },
                 "models": [{
                     "id": ROUTER_MODEL,
                     "name": format!("Rayline router ({})", ctx.env_name),
@@ -63,7 +69,8 @@ mod tests {
         assert_eq!(provider["baseUrl"], TEST_URL);
         assert_eq!(provider["api"], "anthropic-messages");
         assert_eq!(provider["apiKey"], "$RAYLINE_KEY");
-        assert_eq!(provider["headers"]["x-conversation-id"], "$RAYLINE_CONV_ID");
+        assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
+        assert_eq!(provider["headers"], serde_json::json!({}));
         let model = &provider["models"][0];
         assert_eq!(model["id"], "rayline-router");
         assert_eq!(model["contextWindow"], 200000);
