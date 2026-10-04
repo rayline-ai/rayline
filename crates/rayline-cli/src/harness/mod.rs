@@ -306,7 +306,19 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     );
     let args = match harness {
         Harness::OpenClaw => {
-            let args = openclaw::launch_args(&request.args);
+            let env_container =
+                std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
+            if env_container || openclaw::uses_container(&request.args) {
+                eprintln!(
+                    "  warning: OpenClaw container mode runs inside the container, which does \
+                     not see the Rayline config or key"
+                );
+            }
+            let args = if env_container {
+                request.args.clone()
+            } else {
+                openclaw::launch_args(&request.args)
+            };
             if args.len() != request.args.len() {
                 eprintln!(
                     "  added --local so this agent turn uses the Rayline config; with a \

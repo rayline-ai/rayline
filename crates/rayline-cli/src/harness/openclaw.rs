@@ -97,6 +97,9 @@ pub(crate) fn launch_args(args: &[OsString]) -> Vec<OsString> {
     let Some(command) = command_index(&args) else {
         return args;
     };
+    if uses_container(&args[..command]) {
+        return args;
+    }
     let is_agent_turn =
         args[command] == "agent" && args.get(command + 1).is_none_or(|arg| arg != "exec");
     let has_local = args
@@ -107,6 +110,15 @@ pub(crate) fn launch_args(args: &[OsString]) -> Vec<OsString> {
         args.insert(command + 1, OsString::from("--local"));
     }
     args
+}
+
+/// Whether the root options select container mode, which re-execs OpenClaw
+/// inside a container that sees none of this launch's config or env.
+pub(crate) fn uses_container(root_args: &[OsString]) -> bool {
+    root_args.iter().any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--container" || arg.starts_with("--container="))
+    })
 }
 
 /// Index of the command word, after any leading root options.
@@ -331,6 +343,10 @@ mod tests {
             &["agent", "--local", "-m", "hi"][..],
             &["--profile", "agent"],
             &["--dev", "agent", "exec", "do it"],
+            // Container mode re-execs inside the container, which sees none
+            // of this launch's config or env; --local would not help there.
+            &["--container", "box", "agent", "-m", "hi"],
+            &["--container=box", "agent", "-m", "hi"],
             &["agent", "-m", "hi", "--local"],
             &["agent", "exec", "do it"],
             &["tui"],
