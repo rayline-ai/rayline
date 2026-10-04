@@ -305,7 +305,16 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         config_dir.display()
     );
     let args = match harness {
-        Harness::OpenClaw => openclaw::launch_args(&request.args),
+        Harness::OpenClaw => {
+            let args = openclaw::launch_args(&request.args);
+            if args.len() != request.args.len() {
+                eprintln!(
+                    "  added --local so this agent turn uses the Rayline config; with a \
+                     Gateway running, stop it (openclaw gateway stop) or use `openclaw agent exec`"
+                );
+            }
+            args
+        }
         _ => request.args,
     };
     Ok(build_command(

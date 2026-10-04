@@ -71,14 +71,22 @@ fn option_value(args: &[OsString], name: &str) -> Option<String> {
 }
 
 /// The conversation id for a launch that names a session: OpenClaw scopes a
-/// `--session-id` to the `--agent` when one is given, so the id does too.
+/// `--session-id` to the `--agent` when one is given (agent ids are
+/// case-insensitive), so the id does too.
 pub(crate) fn session_conversation_id(args: &[OsString]) -> Option<String> {
     let session = session_id_arg(args)?;
     Some(match agent_arg(args) {
-        Some(agent) => stable_conversation_id(&format!("agent:{agent}:{session}")),
+        Some(agent) => {
+            stable_conversation_id(&format!("agent:{}:{session}", agent.to_ascii_lowercase()))
+        }
         None => stable_conversation_id(&session),
     })
 }
+
+/// OpenClaw root options that take a value; they may precede the command.
+const ROOT_VALUE_OPTIONS: &[&str] = &["--profile", "--log-level", "--container"];
+/// OpenClaw boolean root options.
+const ROOT_FLAGS: &[&str] = &["--dev", "--no-color"];
 
 /// The args OpenClaw runs with. `openclaw agent` sends its turn through a
 /// running Gateway, which uses its own config and environment, not this
@@ -86,16 +94,39 @@ pub(crate) fn session_conversation_id(args: &[OsString]) -> Option<String> {
 /// applies. `agent exec` is already embedded.
 pub(crate) fn launch_args(args: &[OsString]) -> Vec<OsString> {
     let mut args = args.to_vec();
-    let is_agent_turn = args.first().is_some_and(|arg| arg == "agent")
-        && args.get(1).is_none_or(|arg| arg != "exec");
+    let Some(command) = command_index(&args) else {
+        return args;
+    };
+    let is_agent_turn =
+        args[command] == "agent" && args.get(command + 1).is_none_or(|arg| arg != "exec");
     let has_local = args
         .iter()
         .take_while(|arg| *arg != "--")
         .any(|arg| arg == "--local");
     if is_agent_turn && !has_local {
-        args.insert(1, OsString::from("--local"));
+        args.insert(command + 1, OsString::from("--local"));
     }
     args
+}
+
+/// Index of the command word, after any leading root options.
+fn command_index(args: &[OsString]) -> Option<usize> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).and_then(|arg| arg.to_str()) {
+        if ROOT_VALUE_OPTIONS.contains(&arg) {
+            index += 2;
+        } else if ROOT_FLAGS.contains(&arg)
+            || ROOT_VALUE_OPTIONS.iter().any(|option| {
+                arg.strip_prefix(option)
+                    .is_some_and(|rest| rest.starts_with('='))
+            })
+        {
+            index += 1;
+        } else {
+            return (index < args.len()).then_some(index);
+        }
+    }
+    None
 }
 
 /// `oc-` + the first 32 hex characters of sha256(session id).
@@ -272,8 +303,34 @@ mod tests {
             launch_args(&args(&["agent", "-m", "hi"])),
             args(&["agent", "--local", "-m", "hi"])
         );
+        // OpenClaw root options may come before the command.
+        assert_eq!(
+            launch_args(&args(&[
+                "--log-level",
+                "debug",
+                "--dev",
+                "agent",
+                "-m",
+                "hi"
+            ])),
+            args(&[
+                "--log-level",
+                "debug",
+                "--dev",
+                "agent",
+                "--local",
+                "-m",
+                "hi"
+            ])
+        );
+        assert_eq!(
+            launch_args(&args(&["--profile=work", "agent", "-m", "hi"])),
+            args(&["--profile=work", "agent", "--local", "-m", "hi"])
+        );
         for unchanged in [
             &["agent", "--local", "-m", "hi"][..],
+            &["--profile", "agent"],
+            &["--dev", "agent", "exec", "do it"],
             &["agent", "-m", "hi", "--local"],
             &["agent", "exec", "do it"],
             &["tui"],
@@ -298,6 +355,11 @@ mod tests {
         assert_eq!(
             alpha,
             id(&["agent", "--agent=alpha", "--session-id", " 1234 "])
+        );
+        // OpenClaw agent ids are case-insensitive.
+        assert_eq!(
+            alpha,
+            id(&["agent", "--agent", " Alpha", "--session-id", "1234"])
         );
         assert_eq!(
             id(&["agent", "--session-id", " 1234"]),
