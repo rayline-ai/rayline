@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn existing_prod_default_is_not_reused_for_another_env() {
-        // The R0 bug: a prod `router.json` from an earlier run was reused by
+        // The original bug: a prod `router.json` from an earlier run was reused by
         // `--env dev`, sending the dev key to the prod router.
         let home = temp_home();
         write_dev_environment(&home);
