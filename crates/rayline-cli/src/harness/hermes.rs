@@ -2,13 +2,13 @@
 //! state: sessions, memories, skills). `key_env` names the key's env var and
 //! `${VAR}` is expanded in config values.
 //!
-//! Episode keying: Hermes sends its session id as `x-session-affinity`, which
-//! the gateway keys the episode on, and `-c` / `--resume` keeps it. Upstream
-//! Hermes (v2026.8.27) sends no custom headers on `anthropic_messages`; the
-//! atlasfutures fork (`rayline/session-headers`, router-infra#94) adds the
-//! header on both wires. The `rayline-resp` provider (`--provider
-//! rayline-resp`) speaks Responses. Each entry has its own base_url because
-//! Hermes looks up `extra_headers` by base_url.
+//! Episode keying: Hermes sends its session id as `x-session-affinity` on
+//! Responses, which the router keys the episode on, and `-c` / `--resume`
+//! keeps it. Hermes (v2026.8.27) sends no custom headers on
+//! `anthropic_messages`, so the default Messages provider carries no session
+//! id. The `rayline-resp` provider (`--provider rayline-resp`) speaks
+//! Responses. Each entry has its own base_url because Hermes looks up
+//! `extra_headers` by base_url.
 
 use serde_json::json;
 

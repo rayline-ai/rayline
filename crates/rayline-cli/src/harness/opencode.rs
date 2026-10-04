@@ -22,14 +22,14 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "model": model_ref,
         // The session-title side call otherwise goes to the user's global
         // `small_model` (another provider) or a guessed small model. Keep it on
-        // Rayline. The gateway branches it off the session's episode as a
-        // one-turn side call (router-infra#87).
+        // Rayline. The router treats it as a one-turn side call off the
+        // session's episode.
         "small_model": model_ref,
         "provider": {
             PROVIDER_ID: {
                 "name": format!("Rayline ({})", ctx.env_name),
-                // Messages is the only shape that reaches VSR; opencode's default
-                // for custom providers (chat completions) 404s at the gateway.
+                // opencode's default for custom providers (chat completions)
+                // 404s at the router, so use Messages.
                 "npm": "@ai-sdk/anthropic",
                 "options": {
                     "baseURL": ctx.v1_base(),

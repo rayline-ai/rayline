@@ -1,7 +1,7 @@
 //! omp (oh-my-pi): `PI_CODING_AGENT_DIR=<dir>` holds `models.yml` and
 //! `config.yml`. A named profile (`OMP_PROFILE`/`PI_PROFILE`) makes omp ignore
 //! that override, so both are removed. omp also reads Claude Code's config from
-//! `CLAUDE_CONFIG_DIR` (MCP servers, skills); the smoke runs showed a
+//! `CLAUDE_CONFIG_DIR` (MCP servers, skills); in testing, a
 //! `CLAUDE_CONFIG_DIR` inherited from `rayline claude` pulling another config
 //! into omp, so it is removed too. `apiKey` and header values name env vars.
 //!
