@@ -12,7 +12,10 @@
 //! some turns from models whose thinking carries no Anthropic signature; as
 //! text, that reasoning would reach the next model as something the assistant
 //! said. As thinking, the router can recognise it and leave it out for a
-//! model that cannot verify it.
+//! model that cannot verify it. It is on only for envs whose router does that
+//! (dev today; `RAYLINE_PI_ALLOW_EMPTY_SIGNATURE=1|0` overrides): a router
+//! that forwards an unsigned thinking block to an Anthropic upstream gets the
+//! request rejected.
 
 use serde_json::json;
 
@@ -22,8 +25,26 @@ use super::{
 };
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
+/// Runtime override for [`allow_empty_signature`]: `1` or `0`.
+pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNATURE";
+
+/// Envs whose router drops unsigned reasoning before an Anthropic Messages
+/// upstream. Elsewhere an unsigned thinking block would be forwarded as is and
+/// rejected, so the flag stays off.
+/// TODO: add "prod" once the prod router drops unsigned reasoning.
+const UNSIGNED_REASONING_ENVS: &[&str] = &["dev"];
+
+/// Whether `rayline pi` sets `compat.allowEmptySignature` for `env_name`:
+/// [`ALLOW_EMPTY_SIGNATURE_ENV`] if set to `1`/`0`, else the env default.
+pub(crate) fn allow_empty_signature(env_name: &str, override_value: Option<&str>) -> bool {
+    super::parse_switch(override_value).unwrap_or(UNSIGNED_REASONING_ENVS.contains(&env_name))
+}
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
+    let mut compat = json!({ "sendSessionAffinityHeaders": true });
+    if ctx.allow_empty_signature {
+        compat["allowEmptySignature"] = json!(true);
+    }
     let models = json!({
         "providers": {
             PROVIDER_ID: {
@@ -31,10 +52,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "api": "anthropic-messages",
                 "apiKey": format!("${KEY_ENV}"),
                 "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
-                "compat": {
-                    "sendSessionAffinityHeaders": true,
-                    "allowEmptySignature": true
-                },
+                "compat": compat,
                 "models": [{
                     "id": ROUTER_MODEL,
                     "name": format!("Rayline router ({})", ctx.env_name),
@@ -65,6 +83,50 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
 mod tests {
     use super::super::Harness;
     use super::super::tests::{TEST_URL, env_value, render};
+
+    fn render_models(dir: &std::path::Path, env_name: &str, allow: bool) -> serde_json::Value {
+        let ctx = super::super::RenderContext {
+            env_name,
+            router_url: TEST_URL,
+            config_dir: dir,
+            conversation_id: super::super::ConversationIdFallback::new(env_name, None),
+            allow_empty_signature: allow,
+        };
+        super::super::write_files(dir, &super::plan(&ctx).files).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn allow_empty_signature_defaults_by_env_and_override() {
+        use super::allow_empty_signature;
+        assert!(allow_empty_signature("dev", None));
+        assert!(!allow_empty_signature("prod", None));
+        assert!(!allow_empty_signature("staging", None));
+        assert!(allow_empty_signature("prod", Some("1")));
+        assert!(!allow_empty_signature("dev", Some("0")));
+        // Unrecognized values keep the env default.
+        assert!(!allow_empty_signature("prod", Some("maybe")));
+    }
+
+    #[test]
+    fn allow_empty_signature_is_rendered_only_when_on_and_rewritten_each_launch() {
+        let dir = super::super::tests::temp_dir("pi-sig");
+        let on = render_models(&dir, "dev", true);
+        assert_eq!(
+            on["providers"]["rayline"]["compat"]["allowEmptySignature"],
+            true
+        );
+        // The next launch (prod, or forced off) rewrites models.json without it.
+        let off = render_models(&dir, "prod", false);
+        let compat = &off["providers"]["rayline"]["compat"];
+        assert!(compat.get("allowEmptySignature").is_none(), "{compat}");
+        assert_eq!(compat["sendSessionAffinityHeaders"], true);
+        let on_again = render_models(&dir, "prod", true);
+        assert_eq!(
+            on_again["providers"]["rayline"]["compat"]["allowEmptySignature"],
+            true
+        );
+    }
 
     #[test]
     fn renders_models_and_default_settings() {

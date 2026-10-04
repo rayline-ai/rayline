@@ -73,13 +73,8 @@ impl ConversationIdFallback {
     /// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
     /// `0`/`false`/`off`; anything else is ignored).
     pub(crate) fn new(env_name: &str, override_value: Option<&str>) -> Self {
-        let forced = match override_value.map(|value| value.trim().to_ascii_lowercase()) {
-            Some(value) if matches!(value.as_str(), "1" | "true" | "on") => Some(true),
-            Some(value) if matches!(value.as_str(), "0" | "false" | "off") => Some(false),
-            _ => None,
-        };
         Self {
-            forced,
+            forced: parse_switch(override_value),
             env_needs_it: !NATIVE_SESSION_KEY_ENVS.contains(&env_name),
         }
     }
@@ -90,6 +85,15 @@ impl ConversationIdFallback {
     pub(crate) fn enabled(self, native_session_id: bool) -> bool {
         self.forced
             .unwrap_or(self.env_needs_it || !native_session_id)
+    }
+}
+
+/// A `1`/`true`/`on` or `0`/`false`/`off` override; anything else is `None`.
+pub(crate) fn parse_switch(value: Option<&str>) -> Option<bool> {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "1" | "true" | "on") => Some(true),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "off") => Some(false),
+        _ => None,
     }
 }
 
@@ -174,6 +178,9 @@ pub(crate) struct RenderContext<'a> {
     pub config_dir: &'a Path,
     /// When configs carry the per-launch `x-conversation-id` header.
     pub conversation_id: ConversationIdFallback,
+    /// pi only: whether to set `compat.allowEmptySignature`
+    /// ([`pi::allow_empty_signature`]).
+    pub allow_empty_signature: bool,
 }
 
 impl RenderContext<'_> {
@@ -277,6 +284,10 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         conversation_id: ConversationIdFallback::new(
             &env_name,
             std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
+        ),
+        allow_empty_signature: pi::allow_empty_signature(
+            &env_name,
+            std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
         ),
     };
     let plan = harness.plan(&ctx);
@@ -633,6 +644,7 @@ pub(crate) mod tests {
             router_url: TEST_URL,
             config_dir: &dir,
             conversation_id,
+            allow_empty_signature: pi::allow_empty_signature("dev", None),
         };
         let plan = harness.plan(&ctx);
         write_files(&dir, &plan.files).unwrap();
