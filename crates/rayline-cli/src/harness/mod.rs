@@ -13,7 +13,7 @@
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
 //! session id where it reads them: opencode and
-//! Hermes send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
+//! Hermes (on Responses only) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
 //! mode from omp 18.1.10), and pi and OpenClaw send `x-session-affinity` once
 //! their config sets `compat.sendSessionAffinityHeaders`. On Responses, pi's
 //! and OpenClaw's `prompt_cache_key` keys the session. A harness session is
@@ -518,12 +518,27 @@ fn yaml_key(key: &str) -> String {
 fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names = executable_names(binary_name, cfg!(windows));
-    std::env::split_paths(&path).find_map(|dir| {
-        names
-            .iter()
-            .map(|name| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    })
+    std::env::split_paths(&path).find_map(|dir| find_in_dir(&dir, &names))
+}
+
+/// The first of `names` in `dir` that is a runnable file. On Unix that means
+/// an execute bit is set, as a shell's lookup requires.
+pub(crate) fn find_in_dir(dir: &Path, names: &[String]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| is_runnable(candidate))
+}
+
+#[cfg(unix)]
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// File names to probe in each PATH dir, in order. On Windows only names with
@@ -791,6 +806,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn create_once_files_never_reference_the_conversation_id() {
+        // RAYLINE_CONV_ID is set from the rendered plan, so a file that is not
+        // rewritten each launch must never reference it.
+        for harness in Harness::ALL {
+            for fallback in [
+                ConversationIdFallback::new("dev", None),
+                ConversationIdFallback::new("prod", None),
+            ] {
+                let (_dir, plan) = render_with(harness, fallback);
+                for file in plan.files.iter().filter(|file| !file.overwrite) {
+                    assert!(
+                        !file.contents.contains(CONV_ID_ENV),
+                        "{}: {}",
+                        harness.name(),
+                        file.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn no_rendered_config_contains_a_key() {
         for harness in Harness::ALL {
             let (dir, plan) = render(harness);
@@ -822,6 +859,21 @@ pub(crate) mod tests {
             .find(|candidate| candidate.is_file());
         assert_eq!(found, Some(dir.join("pi.cmd")));
         assert_eq!(executable_names("pi", false), ["pi"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_skips_a_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let stale = temp_dir("noexec");
+        let good = temp_dir("exec");
+        fs::write(stale.join("pi"), "").unwrap();
+        fs::set_permissions(stale.join("pi"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(good.join("pi"), "").unwrap();
+        fs::set_permissions(good.join("pi"), fs::Permissions::from_mode(0o755)).unwrap();
+        let names = executable_names("pi", false);
+        assert_eq!(find_in_dir(&stale, &names), None);
+        assert_eq!(find_in_dir(&good, &names), Some(good.join("pi")));
     }
 
     #[test]
