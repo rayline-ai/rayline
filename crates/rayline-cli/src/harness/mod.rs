@@ -13,7 +13,7 @@
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
 //! session id where it reads them: opencode and
-//! Hermes (on Responses only) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
+//! Hermes (on Responses) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
 //! mode from omp 18.1.10), and pi and OpenClaw send `x-session-affinity` once
 //! their config sets `compat.sendSessionAffinityHeaders`. On Responses, pi's
 //! and OpenClaw's `prompt_cache_key` keys the session. A harness session is
@@ -21,7 +21,7 @@
 //!
 //! The per-launch conversation id ([`ConversationIdFallback`]) is the
 //! fallback for a gateway that does not read native ids (prod today), and for
-//! a wire that sends no native id (OpenClaw on Messages): every
+//! a wire that sends no native id (OpenClaw and Hermes on Messages): every
 //! launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as `x-conversation-id`,
 //! so one launch is one episode and a resume in a new launch starts a new one.
 //! The native compat flags stay on either way; the gateway ranks
@@ -583,10 +583,9 @@ pub(crate) mod tests {
     pub(crate) const TEST_URL: &str = "https://api-dev.rayline.ai";
 
     pub(crate) fn temp_dir(label: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // A counter, not the clock: parallel tests can read the same time.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "rayline-harness-{label}-{}-{unique}",
             std::process::id()
@@ -775,10 +774,10 @@ pub(crate) mod tests {
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
         assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
-        // OpenClaw is the exception: it sends no native id on Messages.
+        // OpenClaw and Hermes are the exceptions: no native id on Messages.
         for harness in Harness::ALL
             .into_iter()
-            .filter(|harness| *harness != Harness::OpenClaw)
+            .filter(|harness| !matches!(harness, Harness::OpenClaw | Harness::Hermes))
         {
             let (dir, plan) = render(harness);
             for file in &plan.files {
