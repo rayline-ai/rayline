@@ -304,12 +304,16 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         harness.name(),
         config_dir.display()
     );
+    let args = match harness {
+        Harness::OpenClaw => openclaw::launch_args(&request.args),
+        _ => request.args,
+    };
     Ok(build_command(
         &binary,
         &plan,
         &key,
         conv_id.as_deref(),
-        &request.args,
+        &args,
     ))
 }
 
@@ -387,9 +391,9 @@ pub(crate) fn build_command(
 /// otherwise a fresh UUID.
 pub(crate) fn conversation_id_for(harness: Harness, args: &[OsString]) -> String {
     match harness {
-        Harness::OpenClaw => openclaw::session_id_arg(args)
-            .map(|session| openclaw::stable_conversation_id(&session))
-            .unwrap_or_else(new_conversation_id),
+        Harness::OpenClaw => {
+            openclaw::session_conversation_id(args).unwrap_or_else(new_conversation_id)
+        }
         _ => new_conversation_id(),
     }
 }

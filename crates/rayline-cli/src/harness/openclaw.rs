@@ -40,21 +40,62 @@ pub(crate) const PROVIDER_ID: &str = "rayline";
 pub(crate) const RESPONSES_PROVIDER_ID: &str = "rayline-resp";
 
 /// The value of `--session-id <v>` / `--session-id=<v>` in OpenClaw's args
-/// (the last one wins; an empty value counts as none).
+/// (the last one wins; trimmed, as OpenClaw does; a blank value counts as none).
 pub(crate) fn session_id_arg(args: &[OsString]) -> Option<String> {
+    option_value(args, "--session-id")
+}
+
+/// The `--agent` value in OpenClaw's args, if any.
+pub(crate) fn agent_arg(args: &[OsString]) -> Option<String> {
+    option_value(args, "--agent")
+}
+
+/// The last `<name> <v>` / `<name>=<v>` value before `--`, trimmed.
+fn option_value(args: &[OsString], name: &str) -> Option<String> {
     let mut found = None;
     let mut args = args.iter().map(|arg| arg.to_string_lossy());
     while let Some(arg) = args.next() {
         if arg == "--" {
             break;
         }
-        if arg == "--session-id" {
-            found = args.next().map(|value| value.into_owned());
-        } else if let Some(value) = arg.strip_prefix("--session-id=") {
-            found = Some(value.to_owned());
+        if arg == name {
+            found = args.next().map(|value| value.trim().to_owned());
+        } else if let Some(value) = arg
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            found = Some(value.trim().to_owned());
         }
     }
     found.filter(|value| !value.is_empty())
+}
+
+/// The conversation id for a launch that names a session: OpenClaw scopes a
+/// `--session-id` to the `--agent` when one is given, so the id does too.
+pub(crate) fn session_conversation_id(args: &[OsString]) -> Option<String> {
+    let session = session_id_arg(args)?;
+    Some(match agent_arg(args) {
+        Some(agent) => stable_conversation_id(&format!("agent:{agent}:{session}")),
+        None => stable_conversation_id(&session),
+    })
+}
+
+/// The args OpenClaw runs with. `openclaw agent` sends its turn through a
+/// running Gateway, which uses its own config and environment, not this
+/// launch's; `--local` runs the turn in this process so the Rayline config
+/// applies. `agent exec` is already embedded.
+pub(crate) fn launch_args(args: &[OsString]) -> Vec<OsString> {
+    let mut args = args.to_vec();
+    let is_agent_turn = args.first().is_some_and(|arg| arg == "agent")
+        && args.get(1).is_none_or(|arg| arg != "exec");
+    let has_local = args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--local");
+    if is_agent_turn && !has_local {
+        args.insert(1, OsString::from("--local"));
+    }
+    args
 }
 
 /// `oc-` + the first 32 hex characters of sha256(session id).
@@ -222,14 +263,57 @@ mod tests {
     }
 
     #[test]
+    fn agent_turns_run_embedded_so_the_rayline_config_applies() {
+        use super::launch_args;
+        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
+            list.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert_eq!(
+            launch_args(&args(&["agent", "-m", "hi"])),
+            args(&["agent", "--local", "-m", "hi"])
+        );
+        for unchanged in [
+            &["agent", "--local", "-m", "hi"][..],
+            &["agent", "-m", "hi", "--local"],
+            &["agent", "exec", "do it"],
+            &["tui"],
+            &[],
+        ] {
+            assert_eq!(launch_args(&args(unchanged)), args(unchanged));
+        }
+    }
+
+    #[test]
+    fn stable_id_is_scoped_to_the_agent_and_trimmed() {
+        use super::super::conversation_id_for;
+        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
+            list.iter().map(std::ffi::OsString::from).collect()
+        };
+        let id = |list: &[&str]| conversation_id_for(Harness::OpenClaw, &args(list));
+        let alpha = id(&["agent", "--agent", "alpha", "--session-id", "1234"]);
+        assert_ne!(
+            alpha,
+            id(&["agent", "--agent", "beta", "--session-id", "1234"])
+        );
+        assert_eq!(
+            alpha,
+            id(&["agent", "--agent=alpha", "--session-id", " 1234 "])
+        );
+        assert_eq!(
+            id(&["agent", "--session-id", " 1234"]),
+            id(&["agent", "--session-id", "1234"])
+        );
+    }
+
+    #[test]
     fn session_id_gives_a_stable_conversation_id() {
         use super::super::conversation_id_for;
         use super::stable_conversation_id;
-        let id = stable_conversation_id("hc-launcher-oc-1");
-        // `printf hc-launcher-oc-1 | shasum -a 256 | cut -c1-32`
-        assert_eq!(id, "oc-fd54be9c6897de49f2fe715ad462412a");
-        assert_ne!(id, stable_conversation_id("hc-launcher-oc-2"));
-        let args: Vec<std::ffi::OsString> = ["agent", "--session-id", "hc-launcher-oc-1"]
+        let id = stable_conversation_id("session-1");
+        // `printf session-1 | shasum -a 256 | cut -c1-32`
+        assert_eq!(id, "oc-84097828fc31a8c8d29210df48901a85");
+        assert_ne!(id, stable_conversation_id("session-2"));
+        let args: Vec<std::ffi::OsString> = ["agent", "--session-id", "session-1"]
             .iter()
             .map(std::ffi::OsString::from)
             .collect();
