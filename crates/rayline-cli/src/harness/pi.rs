@@ -5,6 +5,14 @@
 //! `x-session-affinity` on Messages (pi 0.87.1 and 1.0.0; off by default for
 //! non-OpenRouter endpoints), which the gateway keys the episode on. `-c` and
 //! `--resume` reuse the session id, so a resumed session keeps its episode.
+//!
+//! `compat.allowEmptySignature` makes pi resend a thinking block that came
+//! back without a signature as thinking (`signature: ""`) rather than as a
+//! visible text block, which is pi's default for Messages. The router serves
+//! some turns from models whose thinking carries no Anthropic signature; as
+//! text, that reasoning would reach the next model as something the assistant
+//! said. As thinking, the router can recognise it and leave it out for a
+//! model that cannot verify it.
 
 use serde_json::json;
 
@@ -23,7 +31,10 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "api": "anthropic-messages",
                 "apiKey": format!("${KEY_ENV}"),
                 "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
-                "compat": { "sendSessionAffinityHeaders": true },
+                "compat": {
+                    "sendSessionAffinityHeaders": true,
+                    "allowEmptySignature": true
+                },
                 "models": [{
                     "id": ROUTER_MODEL,
                     "name": format!("Rayline router ({})", ctx.env_name),
@@ -70,6 +81,7 @@ mod tests {
         assert_eq!(provider["api"], "anthropic-messages");
         assert_eq!(provider["apiKey"], "$RAYLINE_KEY");
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
+        assert_eq!(provider["compat"]["allowEmptySignature"], true);
         assert_eq!(provider["headers"], serde_json::json!({}));
         let model = &provider["models"][0];
         assert_eq!(model["id"], "rayline-router");
