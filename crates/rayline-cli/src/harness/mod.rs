@@ -8,12 +8,11 @@
 //! args. The key is never written to disk: every config references it from the
 //! `RAYLINE_KEY` env var, which only the child process sees.
 //!
-//! The configs are the ones that passed the 2026-10-02 live smoke runs against
-//! dev (router-infra #80): Anthropic Messages, model `rayline-router`,
+//! Every config uses Anthropic Messages, model `rayline-router`,
 //! `contextWindow` 200000 / `maxTokens` 32000.
 //!
-//! Episode keying: the gateway keys an ARC episode on each harness's own
-//! session id (`RAYLINE_HARNESS_SESSION_KEYS`, router-infra#87): opencode and
+//! Episode keying: the router keys a routing episode on each harness's own
+//! session id where it reads them: opencode and
 //! Hermes send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
 //! mode from omp 18.1.10), and pi and OpenClaw send `x-session-affinity` once
 //! their config sets `compat.sendSessionAffinityHeaders`. On Responses, pi's
@@ -55,11 +54,10 @@ pub const CONTEXT_WINDOW: u64 = 200_000;
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
 pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
-/// Envs whose gateway keys episodes on native harness session ids
-/// (`RAYLINE_HARNESS_SESSION_KEYS`, router-infra#87); the per-launch
-/// `x-conversation-id` fallback is off there.
-/// TODO: add "prod" (turning the fallback off there) once
-/// `RAYLINE_HARNESS_SESSION_KEYS` ships to the prod gateway.
+/// Envs whose router keys episodes on native harness session ids; the
+/// per-launch `x-conversation-id` fallback is off there.
+/// TODO: add "prod" (turning the fallback off there) once the prod router
+/// reads native session ids.
 const NATIVE_SESSION_KEY_ENVS: &[&str] = &["dev"];
 
 /// When a config sends the per-launch `x-conversation-id`.
@@ -515,24 +513,27 @@ fn yaml_key(key: &str) -> String {
 
 fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let names = executable_names(binary_name, cfg!(windows));
     std::env::split_paths(&path).find_map(|dir| {
-        let candidate = dir.join(binary_name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe = dir.join(format!("{binary_name}.exe"));
-            if exe.is_file() {
-                return Some(exe);
-            }
-            let cmd = dir.join(format!("{binary_name}.cmd"));
-            if cmd.is_file() {
-                return Some(cmd);
-            }
-        }
-        None
+        names
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
     })
+}
+
+/// File names to probe in each PATH dir, in order. On Windows only names with
+/// a runnable extension count: npm puts an extensionless sh shim next to the
+/// `.cmd` one, and CreateProcess cannot run the shim.
+pub(crate) fn executable_names(binary_name: &str, windows: bool) -> Vec<String> {
+    if windows {
+        ["exe", "cmd", "bat", "com"]
+            .iter()
+            .map(|ext| format!("{binary_name}.{ext}"))
+            .collect()
+    } else {
+        vec![binary_name.to_owned()]
+    }
 }
 
 #[cfg(unix)]
@@ -801,6 +802,22 @@ pub(crate) mod tests {
                 harness.name()
             );
         }
+    }
+
+    #[test]
+    fn windows_lookup_skips_the_extensionless_npm_shim() {
+        // npm's global bin dir holds `pi` (a sh script), `pi.cmd` and
+        // `pi.ps1`; only `pi.cmd` runs under Windows' CreateProcess.
+        let dir = temp_dir("pathext");
+        for name in ["pi", "pi.cmd", "pi.ps1"] {
+            fs::write(dir.join(name), "").unwrap();
+        }
+        let found = executable_names("pi", true)
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file());
+        assert_eq!(found, Some(dir.join("pi.cmd")));
+        assert_eq!(executable_names("pi", false), ["pi"]);
     }
 
     #[test]
