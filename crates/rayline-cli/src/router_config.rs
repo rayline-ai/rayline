@@ -682,7 +682,7 @@ fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> 
 }
 
 /// Whether a `base_url` host is the hosted Rayline Cloud Router (prod or dev).
-fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
+pub(crate) fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
     matches!(
         base_url.and_then(host_of).as_deref(),
         Some("api.rayline.ai") | Some("api-dev.rayline.ai")

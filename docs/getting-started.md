@@ -341,10 +341,12 @@ pure-keyed version of this split: one OpenRouter endpoint serving two models, wi
 
 The same applies to the hosted cloud router: the default
 `~/.config/rayline/router.json` needs only its `main` entry, and subagents follow
-whatever model the Rayline dashboard selects for that route. With `--env <name>`,
-`rayline codex` generates and reads `~/.config/rayline/router.<name>.json`
-instead, pointed at that environment's router, so a non-prod key never reaches
-the prod router.
+whatever model the Rayline dashboard selects for that route. With a non-prod
+`--env <name>` and no `--config`, `rayline codex` generates and reads
+`~/.config/rayline/router.<name>.json` instead, pointed at that environment's
+router, so a non-prod key never reaches the prod router. The file is created
+once and never rewritten; if you customized `router.json` for a non-prod
+environment before, copy those routes into `router.<name>.json`.
 
 ## Connecting Provider Endpoints
 

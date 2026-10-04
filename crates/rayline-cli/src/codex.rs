@@ -163,8 +163,9 @@ pub(crate) async fn resolve_cloud_router_key(
 /// environment's router (the same `resolve_env` + `resolve_hosted_environment`
 /// resolution `rayline claude` uses), and each environment has its own file, so
 /// the router URL always matches the environment whose `rlk-` key
-/// [`resolve_cloud_router_key`] provisions. An unknown environment is an error
-/// rather than a silent fallback to prod.
+/// [`resolve_cloud_router_key`] provisions. An unknown environment, or one whose
+/// router is not a hosted Rayline router, is an error rather than a silent
+/// fallback to prod.
 ///
 /// Only the default `--auth auto` opts in. Explicit `--auth subscription` keeps
 /// the ChatGPT-subscription default, and `--auth none` keeps the local default —
@@ -181,6 +182,15 @@ pub(crate) fn resolve_codex_config_path(
     let env = crate::status::resolve_env(env_name, Some(home));
     let hosted = crate::status::resolve_hosted_environment(&env, Some(home))
         .map_err(|error| io::Error::other(error.to_string()))?;
+    // Key provisioning and the Responses rewrite only recognise the hosted
+    // router hosts, so a default pointed anywhere else could never authenticate.
+    if !crate::router_config::endpoint_base_url_is_hosted_rcr(Some(&hosted.router_url)) {
+        return Err(io::Error::other(format!(
+            "environment '{env}' routes to {}, which the default codex config does not \
+             support; pass --config with a router config for it",
+            hosted.router_url
+        )));
+    }
     Ok(Some(crate::router_config::ensure_default_config(
         home,
         &env,
@@ -696,6 +706,35 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("staging"), "{error}");
         assert!(!crate::router_config::default_config_path(&home).exists());
+        assert!(!crate::router_config::default_config_path_for_env(&home, "staging").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn env_with_a_non_hosted_router_is_an_error() {
+        // The codex default only knows how to reach the hosted router hosts;
+        // any other router_url would get no key and no Responses rewrite.
+        let home = temp_home();
+        let dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "environments": {
+                    "staging": {
+                        "router_url": "https://router.example.test",
+                        "cli_auth_url": "https://platform.example.test/cli-auth"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("staging"))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("router.example.test"), "{message}");
+        assert!(message.contains("--config"), "{message}");
         assert!(!crate::router_config::default_config_path_for_env(&home, "staging").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
