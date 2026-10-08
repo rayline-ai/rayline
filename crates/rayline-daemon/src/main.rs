@@ -439,8 +439,12 @@ fn tokens_per_second_before(line: &str, marker: &str) -> Option<f64> {
 async fn run_serve(args: ServeArgs) -> Result<()> {
     let metrics = RouterMetrics::new("rayline-router");
     let metrics_sink: SharedMetricsSink = metrics.clone();
-    let metrics_listener = bind_metrics_control(args.metrics_port).await?;
-    spawn_metrics_control(metrics, metrics_listener);
+    // Best-effort, as in proxy mode: a metrics bind failure (another rld may
+    // hold the port) must not stop the router from serving (#82).
+    match bind_metrics_control(args.metrics_port).await {
+        Ok(listener) => spawn_metrics_control(metrics, listener),
+        Err(error) => warn!("router metrics disabled: {error:#}"),
+    }
 
     let data_dir = args
         .data_dir
