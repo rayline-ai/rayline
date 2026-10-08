@@ -2345,7 +2345,15 @@ fn spawn_router(
 ) -> io::Result<StartedRouter> {
     let paths = RouterPaths::new(home);
     std::fs::create_dir_all(paths.data_dir())?;
-    let metrics_port = choose_serve_metrics_port();
+    let mut data_ports = vec![
+        request.adapter_port,
+        request.injector_port,
+        request.local_router_port,
+    ];
+    if request.enable_proxy {
+        data_ports.push(request.proxy_port);
+    }
+    let metrics_port = choose_serve_metrics_port(&data_ports);
     let mut requested_meta = router_meta(home, request, Some(bin_path), router_api_key);
     // Record the port this daemon is told to bind, so `rayline top` and a
     // forwarding proxy find it when it is not the default.
@@ -2823,7 +2831,27 @@ async fn serve_metrics_forward_url(home: &Path, client: &reqwest::Client) -> Opt
         return None;
     }
     let serve_running = is_serve_daemon_running(&paths, client).await;
-    serve_metrics_url(serve_running, &serve_meta)
+    let url = serve_metrics_url(serve_running, &serve_meta)?;
+    // The meta can still name a port serve lost to another process, until
+    // serve's launcher reconciles it (#82): forward only to a port serve owns.
+    let port = parse_optional_port(serve_meta.get("metrics_port"))?;
+    if !metrics_port_owned_by_serve(&paths, client, port).await {
+        return None;
+    }
+    Some(url)
+}
+
+/// Whether the metrics server on `port` is the serve daemon the pid file
+/// records, as its `/healthz` pid says.
+async fn metrics_port_owned_by_serve(
+    paths: &RouterPaths,
+    client: &reqwest::Client,
+    port: u16,
+) -> bool {
+    match read_pid(&paths.pid_file) {
+        Some(serve_pid) => metrics_port_owner_pid(client, port).await == Some(serve_pid),
+        None => false,
+    }
 }
 
 /// Pure decision: the serve metrics-control URL when a serve daemon is live and
@@ -3275,7 +3303,7 @@ mod tests {
 
     #[test]
     fn serve_metrics_port_keeps_the_preferred_port_when_free() {
-        let port = pick_metrics_port(20813, true, || panic!("no ephemeral port is needed"));
+        let port = pick_metrics_port(20813, true, &[], || panic!("no ephemeral port is needed"));
         assert_eq!(port, 20813);
     }
 
@@ -3289,6 +3317,7 @@ mod tests {
         let port = pick_metrics_port(
             held_port,
             local_port_is_free(held_port),
+            &[],
             ephemeral_local_port,
         );
         assert_ne!(port, held_port);
@@ -3297,7 +3326,19 @@ mod tests {
 
     #[test]
     fn serve_metrics_port_falls_back_to_preferred_without_an_ephemeral_port() {
-        assert_eq!(pick_metrics_port(20813, false, || None), 20813);
+        assert_eq!(pick_metrics_port(20813, false, &[], || None), 20813);
+    }
+
+    #[test]
+    fn serve_metrics_port_never_takes_a_data_port() {
+        // #82: with RAYLINE_METRICS_PORT set to the local-router port, serve
+        // would bind metrics there first and then fail to bind its router.
+        let mut offers = vec![20811, 50123].into_iter();
+        let port = pick_metrics_port(20811, true, &[20811, 20812], || offers.next());
+        assert_eq!(
+            port, 50123,
+            "an ephemeral port equal to a data port is skipped"
+        );
     }
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3806,15 +3847,20 @@ mod tests {
         // meta now belongs to the replacement and must not be edited.
         let home = unique_test_dir("reconcile-serve-metrics-replaced");
         let paths = RouterPaths::new(&home);
-        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_port = released.local_addr().unwrap().port();
-        drop(released);
+        // The replacement reuses the same metrics port, so only the pid-file
+        // check, not the port comparison, keeps its meta intact.
         let replacement_port = healthz_stub(5151).await;
         serve_meta_with_metrics_port(&paths, replacement_port, 5151);
 
         let mut output = String::new();
-        reconcile_serve_metrics_meta(&paths, 4242, Some(dead_port), &quick_client(), &mut output)
-            .await;
+        reconcile_serve_metrics_meta(
+            &paths,
+            4242,
+            Some(replacement_port),
+            &quick_client(),
+            &mut output,
+        )
+        .await;
 
         let after = read_meta(&paths.meta_file);
         assert_eq!(
@@ -3822,6 +3868,22 @@ mod tests {
             Some(replacement_port.to_string().as_str()),
             "the replacement serve's metrics port was removed"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_metrics_only_to_a_port_serve_owns() {
+        // #82: before reconciliation removes a lost port, a proxy launcher can
+        // read it from serve's meta; it must not forward to another process.
+        let home = unique_test_dir("forward-metrics-owner");
+        let paths = RouterPaths::new(&home);
+        let foreign = healthz_stub(999_999).await;
+        serve_meta_with_metrics_port(&paths, foreign, 4242);
+        assert!(!metrics_port_owned_by_serve(&paths, &quick_client(), foreign).await);
+
+        let owned = healthz_stub(4242).await;
+        serve_meta_with_metrics_port(&paths, owned, 4242);
+        assert!(metrics_port_owned_by_serve(&paths, &quick_client(), owned).await);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -5031,27 +5093,43 @@ fn resolve_metrics_port(isolated: bool) -> u16 {
 /// (`RAYLINE_METRICS_PORT`, else the default) when it is free, else a free
 /// ephemeral port. Another rld, such as a running `rayline claude` proxy, may
 /// already hold the default, and a second launcher must still start (#82).
-fn choose_serve_metrics_port() -> u16 {
+/// `data_ports` are the ports this serve binds for routing; metrics never takes
+/// one, or serve's own router bind would fail.
+fn choose_serve_metrics_port(data_ports: &[u16]) -> u16 {
     let preferred = resolve_metrics_port(false);
     pick_metrics_port(
         preferred,
         local_port_is_free(preferred),
+        data_ports,
         ephemeral_local_port,
     )
 }
 
-/// The preferred port when it is free; otherwise an ephemeral port, falling
-/// back to the preferred one when none can be had (the daemon then runs
-/// without metrics rather than failing).
+/// How many ephemeral ports to try before giving up on one that is not a
+/// data port.
+const EPHEMERAL_METRICS_PORT_ATTEMPTS: usize = 8;
+
+/// The preferred port when it is free and not a data port; otherwise an
+/// ephemeral port that is not a data port, falling back to the preferred one
+/// when none can be had (the daemon then runs without metrics rather than
+/// failing).
 fn pick_metrics_port(
     preferred: u16,
     preferred_is_free: bool,
-    ephemeral: impl FnOnce() -> Option<u16>,
+    data_ports: &[u16],
+    mut ephemeral: impl FnMut() -> Option<u16>,
 ) -> u16 {
-    if preferred_is_free {
+    if preferred_is_free && !data_ports.contains(&preferred) {
         return preferred;
     }
-    ephemeral().unwrap_or(preferred)
+    for _ in 0..EPHEMERAL_METRICS_PORT_ATTEMPTS {
+        match ephemeral() {
+            Some(port) if !data_ports.contains(&port) => return port,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    preferred
 }
 
 fn local_port_is_free(port: u16) -> bool {
