@@ -258,7 +258,7 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
         .model
         .as_deref()
         .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
-    let mut command = Command::new("codex");
+    let mut command = codex_command();
     command
         .arg("-c")
         .arg("model_provider=\"rayline\"")
@@ -293,6 +293,25 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
     command.args(request.codex_args);
 
     exec_or_status(&mut command)
+}
+
+/// Keep the router key out of Codex's environment (#84). Codex reaches the
+/// local router, which holds the key and authenticates the hosted leg itself,
+/// so Codex never needs it. Codex snapshots its environment for the shells it
+/// spawns (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be
+/// written to disk in plain text. The launcher reads an explicit
+/// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router.
+pub(crate) fn withhold_router_key(command: &mut Command) {
+    command.env_remove("RAYLINE_ROUTER_API_KEY");
+}
+
+/// A `codex` child process with the router key withheld (#84). Every Codex
+/// spawn goes through here (the run, the version probe and the app launch),
+/// so none can inherit the key.
+pub(crate) fn codex_command() -> Command {
+    let mut command = Command::new("codex");
+    withhold_router_key(&mut command);
+    command
 }
 
 fn toml_string(value: &str) -> String {
@@ -435,7 +454,7 @@ pub fn subscription_router_config_json(subagents_local: bool) -> serde_json::Val
 }
 
 fn codex_cli_version_header() -> Option<String> {
-    let output = Command::new("codex").arg("--version").output().ok()?;
+    let output = codex_command().arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -473,8 +492,8 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 mod tests {
     use super::{
         CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
-        EffectiveCodexAuthMode, parse_codex_version_text, resolve_cloud_router_key,
-        resolve_codex_config_path, subscription_router_config_json,
+        EffectiveCodexAuthMode, codex_command, parse_codex_version_text, resolve_cloud_router_key,
+        resolve_codex_config_path, subscription_router_config_json, withhold_router_key,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -883,6 +902,60 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sub);
+    }
+
+    /// #84: every Codex child is built by `codex_command`, which withholds the
+    /// router key, so no spawn site can forget it: the version probe and the
+    /// app launch included.
+    #[test]
+    fn every_codex_spawn_goes_through_codex_command() {
+        let sources = [
+            ("codex.rs", include_str!("codex.rs")),
+            ("codex_app.rs", include_str!("codex_app.rs")),
+        ];
+        let needle = concat!("Command::new(", "\"codex\")");
+        let total: usize = sources
+            .iter()
+            .map(|(_, text)| text.matches(needle).count())
+            .sum();
+        assert_eq!(
+            total, 1,
+            "a Codex child is spawned outside codex_command (found {total} spawn sites)"
+        );
+    }
+
+    #[test]
+    fn codex_command_withholds_the_router_key() {
+        let command = codex_command();
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RAYLINE_ROUTER_API_KEY" && value.is_none()),
+            "codex_command does not remove RAYLINE_ROUTER_API_KEY"
+        );
+    }
+
+    /// #84: a router key in the launcher's environment must not reach Codex,
+    /// which snapshots its environment to disk for the shells it spawns.
+    #[cfg(unix)]
+    #[test]
+    fn codex_child_never_inherits_the_router_key() {
+        let var = "RAYLINE_ROUTER_API_KEY";
+        let previous = std::env::var_os(var);
+        unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
+        let mut command = std::process::Command::new("/usr/bin/env");
+        withhold_router_key(&mut command);
+        let output = command.output().expect("run env");
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            !printed.contains(var),
+            "the child environment still carries {var}"
+        );
     }
 }
 
