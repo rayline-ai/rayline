@@ -955,7 +955,13 @@ async fn handle_metrics_control(
     match (req.method().clone(), req.uri().path()) {
         (Method::GET, "/healthz") => json_response(
             StatusCode::OK,
-            serde_json::json!({"ok": true, "runtime": "rayline-router-metrics"}),
+            // The pid says which process owns this port, so a launcher can tell
+            // its own serve from another process that bound it first (#82).
+            serde_json::json!({
+                "ok": true,
+                "runtime": "rayline-router-metrics",
+                "pid": std::process::id(),
+            }),
         ),
         (Method::GET, "/v1/router/top/snapshot") => {
             json_response(StatusCode::OK, serde_json::json!(metrics.snapshot()))

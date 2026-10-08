@@ -2124,17 +2124,25 @@ async fn start_from_home_with_client(
     )
     .await?;
     let serve_metrics_port = parse_optional_port(started.meta.get("metrics_port"));
-    reconcile_serve_metrics_meta(&paths, serve_metrics_port, client, &mut output).await;
+    reconcile_serve_metrics_meta(&paths, started.pid, serve_metrics_port, client, &mut output)
+        .await;
     Ok(output)
 }
 
-/// Once serve is ready, drop its advertised `metrics_port` when nothing answers
-/// there: the daemon binds metrics best-effort, and another process can take
-/// the chosen port between the CLI's probe and the daemon's bind. Without the
-/// entry a proxy self-hosts its metrics instead of forwarding them to a port
-/// serve does not own (#82).
+/// Once serve is ready, drop its advertised `metrics_port` unless serve itself
+/// answers there: the daemon binds metrics best-effort, and another process
+/// can take the chosen port between the CLI's probe and the daemon's bind.
+/// Without the entry a proxy self-hosts its metrics instead of forwarding them
+/// to a port serve does not own (#82).
+///
+/// Ownership is the pid the metrics server reports, not merely an answer:
+/// another metrics server on the port also answers. The meta is edited under
+/// the router lock, and only while the pid file still names the serve this
+/// launcher started, because the lock is released before readiness and
+/// another launcher may have replaced serve meanwhile.
 async fn reconcile_serve_metrics_meta(
     paths: &RouterPaths,
+    serve_pid: i32,
     metrics_port: Option<u16>,
     client: &reqwest::Client,
     output: &mut String,
@@ -2142,12 +2150,21 @@ async fn reconcile_serve_metrics_meta(
     let Some(port) = metrics_port else {
         return;
     };
-    if metrics_port_is_serving(client, port).await {
+    if metrics_port_owner_pid(client, port).await == Some(serve_pid) {
+        return;
+    }
+    let Ok(_lock) = acquire_router_lock(&paths.lock_file) else {
+        return;
+    };
+    if read_pid(&paths.pid_file) != Some(serve_pid) {
         return;
     }
     let mut meta = read_meta(&paths.meta_file);
+    if parse_optional_port(meta.get("metrics_port")) != Some(port) {
+        return;
+    }
     if meta.remove("metrics_port").is_some() {
-        let _ = std::fs::write(&paths.meta_file, format_meta(&meta));
+        let _ = atomic_write(&paths.meta_file, format_meta(&meta).as_bytes());
         output.push_str(&format!(
             "warning: {} could not serve metrics on :{port}; `{} top` metrics are disabled for this session.\n",
             daemon_name(),
@@ -3682,13 +3699,14 @@ mod tests {
         meta.insert("router_url".to_owned(), "https://r".to_owned());
         meta.insert("metrics_port".to_owned(), dead_port.to_string());
         std::fs::write(&paths.meta_file, format_meta(&meta)).unwrap();
+        std::fs::write(&paths.pid_file, "4242").unwrap();
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
         let mut output = String::new();
-        reconcile_serve_metrics_meta(&paths, Some(dead_port), &client, &mut output).await;
+        reconcile_serve_metrics_meta(&paths, 4242, Some(dead_port), &client, &mut output).await;
 
         let after = read_meta(&paths.meta_file);
         assert!(!after.contains_key("metrics_port"));
@@ -3698,6 +3716,112 @@ mod tests {
         );
         assert!(output.contains("disabled"));
         assert_eq!(serve_metrics_url(true, &after), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A metrics-control stub answering `/healthz` as the daemon does, naming
+    /// `pid` as its owner, for as many requests as arrive.
+    async fn healthz_stub(pid: u32) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body =
+                    format!("{{\"ok\":true,\"runtime\":\"rayline-router-metrics\",\"pid\":{pid}}}");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        port
+    }
+
+    fn serve_meta_with_metrics_port(paths: &RouterPaths, port: u16, pid: i32) {
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = BTreeMap::new();
+        meta.insert("router_url".to_owned(), "https://r".to_owned());
+        meta.insert("metrics_port".to_owned(), port.to_string());
+        std::fs::write(&paths.meta_file, format_meta(&meta)).unwrap();
+        std::fs::write(&paths.pid_file, pid.to_string()).unwrap();
+    }
+
+    fn quick_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_serve_metrics_port_another_process_won() {
+        // #82: another metrics server bound the port between the probe and
+        // serve's own bind. It answers, but it is not serve, so proxies must
+        // not forward to it.
+        let home = unique_test_dir("reconcile-serve-metrics-foreign");
+        let paths = RouterPaths::new(&home);
+        let port = healthz_stub(999_999).await;
+        serve_meta_with_metrics_port(&paths, port, 4242);
+
+        let mut output = String::new();
+        reconcile_serve_metrics_meta(&paths, 4242, Some(port), &quick_client(), &mut output).await;
+
+        let after = read_meta(&paths.meta_file);
+        assert!(
+            !after.contains_key("metrics_port"),
+            "a metrics port another process owns must not stay advertised"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_serve_metrics_port_serve_owns() {
+        let home = unique_test_dir("reconcile-serve-metrics-own");
+        let paths = RouterPaths::new(&home);
+        let port = healthz_stub(4242).await;
+        serve_meta_with_metrics_port(&paths, port, 4242);
+
+        let mut output = String::new();
+        reconcile_serve_metrics_meta(&paths, 4242, Some(port), &quick_client(), &mut output).await;
+
+        let after = read_meta(&paths.meta_file);
+        assert_eq!(
+            after.get("metrics_port").map(String::as_str),
+            Some(port.to_string().as_str())
+        );
+        assert!(output.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_replacement_serves_meta_alone() {
+        // #82: the lock is released before readiness, so another launcher can
+        // restart serve meanwhile. The started serve's port is closed, but the
+        // meta now belongs to the replacement and must not be edited.
+        let home = unique_test_dir("reconcile-serve-metrics-replaced");
+        let paths = RouterPaths::new(&home);
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = released.local_addr().unwrap().port();
+        drop(released);
+        let replacement_port = healthz_stub(5151).await;
+        serve_meta_with_metrics_port(&paths, replacement_port, 5151);
+
+        let mut output = String::new();
+        reconcile_serve_metrics_meta(&paths, 4242, Some(dead_port), &quick_client(), &mut output)
+            .await;
+
+        let after = read_meta(&paths.meta_file);
+        assert_eq!(
+            after.get("metrics_port").map(String::as_str),
+            Some(replacement_port.to_string().as_str()),
+            "the replacement serve's metrics port was removed"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -4984,6 +5108,20 @@ async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u1
         .first()
         .copied()
         .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT)
+}
+
+/// The pid of the process whose metrics-control server answers on `port`, as
+/// its `/healthz` reports it; `None` when nothing answers or no pid is given.
+async fn metrics_port_owner_pid(client: &reqwest::Client, port: u16) -> Option<i32> {
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    body.get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| i32::try_from(pid).ok())
 }
 
 /// Whether a metrics-control server is answering snapshot requests on `port`.
