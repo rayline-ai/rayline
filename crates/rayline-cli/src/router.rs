@@ -2353,11 +2353,17 @@ fn spawn_router(
     if request.enable_proxy {
         data_ports.push(request.proxy_port);
     }
-    let metrics_port = choose_serve_metrics_port(&data_ports);
+    let chosen_metrics_port = choose_serve_metrics_port(&data_ports);
     let mut requested_meta = router_meta(home, request, Some(bin_path), router_api_key);
     // Record the port this daemon is told to bind, so `rayline top` and a
-    // forwarding proxy find it when it is not the default.
-    requested_meta.insert("metrics_port".to_owned(), metrics_port.to_string());
+    // forwarding proxy find it when it is not the default. With no usable
+    // port, serve is given its preferred one, which is a data port; serve
+    // refuses to bind metrics there and runs without them, and no port is
+    // advertised.
+    if let Some(port) = chosen_metrics_port {
+        requested_meta.insert("metrics_port".to_owned(), port.to_string());
+    }
+    let metrics_port = chosen_metrics_port.unwrap_or_else(|| resolve_metrics_port(false));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -3304,7 +3310,7 @@ mod tests {
     #[test]
     fn serve_metrics_port_keeps_the_preferred_port_when_free() {
         let port = pick_metrics_port(20813, true, &[], || panic!("no ephemeral port is needed"));
-        assert_eq!(port, 20813);
+        assert_eq!(port, Some(20813));
     }
 
     #[test]
@@ -3320,13 +3326,23 @@ mod tests {
             &[],
             ephemeral_local_port,
         );
+        let port = port.expect("an ephemeral port");
         assert_ne!(port, held_port);
         assert!(local_port_is_free(port), "the chosen port must be bindable");
     }
 
     #[test]
+    fn serve_metrics_port_is_none_rather_than_a_data_port() {
+        // #82: the preferred port is a data port and every ephemeral offer is
+        // one too; returning the preferred port would let metrics take it.
+        let port = pick_metrics_port(20811, true, &[20811, 20812], || Some(20812));
+        assert_eq!(port, None);
+        assert_eq!(pick_metrics_port(20811, false, &[20811], || None), None);
+    }
+
+    #[test]
     fn serve_metrics_port_falls_back_to_preferred_without_an_ephemeral_port() {
-        assert_eq!(pick_metrics_port(20813, false, &[], || None), 20813);
+        assert_eq!(pick_metrics_port(20813, false, &[], || None), Some(20813));
     }
 
     #[test]
@@ -3336,7 +3352,8 @@ mod tests {
         let mut offers = vec![20811, 50123].into_iter();
         let port = pick_metrics_port(20811, true, &[20811, 20812], || offers.next());
         assert_eq!(
-            port, 50123,
+            port,
+            Some(50123),
             "an ephemeral port equal to a data port is skipped"
         );
     }
@@ -3520,20 +3537,14 @@ mod tests {
 
     #[test]
     fn resolve_metrics_port_reads_zero_as_unset() {
-        unsafe {
-            std::env::set_var("RAYLINE_METRICS_PORT", "0");
-        }
-        assert_eq!(
-            resolve_metrics_port(false),
-            rayline_metrics::DEFAULT_METRICS_PORT
-        );
-        unsafe {
-            std::env::set_var("RAYLINE_METRICS_PORT", "20900");
-        }
-        assert_eq!(resolve_metrics_port(false), 20900);
-        unsafe {
-            std::env::remove_var("RAYLINE_METRICS_PORT");
-        }
+        // Parsed without touching the process environment, which other tests
+        // read concurrently.
+        let default = rayline_metrics::DEFAULT_METRICS_PORT;
+        assert_eq!(metrics_port_from_env(Some("0"), default), default);
+        assert_eq!(metrics_port_from_env(Some(""), default), default);
+        assert_eq!(metrics_port_from_env(Some("nope"), default), default);
+        assert_eq!(metrics_port_from_env(None, default), default);
+        assert_eq!(metrics_port_from_env(Some("20900"), default), 20900);
     }
 
     #[test]
@@ -5078,9 +5089,15 @@ fn resolve_metrics_port(isolated: bool) -> u16 {
             rayline_metrics::DEFAULT_METRICS_PORT,
         )
     };
-    // Port 0 would let the OS pick a port nobody records, so it reads as unset.
-    match std::env::var(env_var) {
-        Ok(value) if !value.is_empty() => value
+    metrics_port_from_env(std::env::var(env_var).ok().as_deref(), default_port)
+}
+
+/// A metrics-port override's value, or `default_port` when it is unset, empty,
+/// unparsable or 0. Port 0 would let the OS pick a port nobody records, so it
+/// reads as unset.
+fn metrics_port_from_env(value: Option<&str>, default_port: u16) -> u16 {
+    match value {
+        Some(value) if !value.is_empty() => value
             .parse::<u16>()
             .ok()
             .filter(|port| *port != 0)
@@ -5095,7 +5112,7 @@ fn resolve_metrics_port(isolated: bool) -> u16 {
 /// already hold the default, and a second launcher must still start (#82).
 /// `data_ports` are the ports this serve binds for routing; metrics never takes
 /// one, or serve's own router bind would fail.
-fn choose_serve_metrics_port(data_ports: &[u16]) -> u16 {
+fn choose_serve_metrics_port(data_ports: &[u16]) -> Option<u16> {
     let preferred = resolve_metrics_port(false);
     pick_metrics_port(
         preferred,
@@ -5110,26 +5127,26 @@ fn choose_serve_metrics_port(data_ports: &[u16]) -> u16 {
 const EPHEMERAL_METRICS_PORT_ATTEMPTS: usize = 8;
 
 /// The preferred port when it is free and not a data port; otherwise an
-/// ephemeral port that is not a data port, falling back to the preferred one
-/// when none can be had (the daemon then runs without metrics rather than
-/// failing).
+/// ephemeral port that is not a data port. With neither, the preferred port
+/// when it is not a data port (the daemon then runs without metrics if it is
+/// held, rather than failing), else `None`: no metrics port is usable.
 fn pick_metrics_port(
     preferred: u16,
     preferred_is_free: bool,
     data_ports: &[u16],
     mut ephemeral: impl FnMut() -> Option<u16>,
-) -> u16 {
+) -> Option<u16> {
     if preferred_is_free && !data_ports.contains(&preferred) {
-        return preferred;
+        return Some(preferred);
     }
     for _ in 0..EPHEMERAL_METRICS_PORT_ATTEMPTS {
         match ephemeral() {
-            Some(port) if !data_ports.contains(&port) => return port,
+            Some(port) if !data_ports.contains(&port) => return Some(port),
             Some(_) => continue,
             None => break,
         }
     }
-    preferred
+    (!data_ports.contains(&preferred)).then_some(preferred)
 }
 
 fn local_port_is_free(port: u16) -> bool {
