@@ -2337,6 +2337,20 @@ struct StartedProxy {
     output: String,
 }
 
+/// Record the metrics port serve is told to bind, or none at all: `router_meta`
+/// may already carry a default entry, which must not stay advertised when serve
+/// runs without metrics (#82).
+fn advertise_serve_metrics_port(meta: &mut BTreeMap<String, String>, port: Option<u16>) {
+    match port {
+        Some(port) => {
+            meta.insert("metrics_port".to_owned(), port.to_string());
+        }
+        None => {
+            meta.remove("metrics_port");
+        }
+    }
+}
+
 fn spawn_router(
     home: &Path,
     request: &RouterStartRequest,
@@ -2360,9 +2374,7 @@ fn spawn_router(
     // port, serve is given its preferred one, which is a data port; serve
     // refuses to bind metrics there and runs without them, and no port is
     // advertised.
-    if let Some(port) = chosen_metrics_port {
-        requested_meta.insert("metrics_port".to_owned(), port.to_string());
-    }
+    advertise_serve_metrics_port(&mut requested_meta, chosen_metrics_port);
     let metrics_port = chosen_metrics_port.unwrap_or_else(|| resolve_metrics_port(false));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -3329,6 +3341,17 @@ mod tests {
         let port = port.expect("an ephemeral port");
         assert_ne!(port, held_port);
         assert!(local_port_is_free(port), "the chosen port must be bindable");
+    }
+
+    #[test]
+    fn serve_meta_advertises_no_metrics_port_when_none_is_usable() {
+        let mut meta = BTreeMap::new();
+        meta.insert("metrics_port".to_owned(), "20813".to_owned());
+        advertise_serve_metrics_port(&mut meta, None);
+        assert!(!meta.contains_key("metrics_port"));
+
+        advertise_serve_metrics_port(&mut meta, Some(50123));
+        assert_eq!(meta.get("metrics_port").map(String::as_str), Some("50123"));
     }
 
     #[test]
