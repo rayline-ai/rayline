@@ -135,6 +135,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     let mut command = Command::new("codex");
     command.env("CODEX_HOME", &home).arg("app");
     command.args(&request.codex_args);
+    crate::codex::withhold_router_key(&mut command);
     match command.status() {
         // A missing code means the child was killed by a signal — treat it as
         // failure (matching the Codex CLI path), not silent success.

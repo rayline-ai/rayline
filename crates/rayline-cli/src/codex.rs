@@ -291,8 +291,19 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
         }
     }
     command.args(request.codex_args);
+    withhold_router_key(&mut command);
 
     exec_or_status(&mut command)
+}
+
+/// Keep the router key out of Codex's environment (#84). Codex reaches the
+/// local router, which holds the key and authenticates the hosted leg itself,
+/// so Codex never needs it. Codex snapshots its environment for the shells it
+/// spawns (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be
+/// written to disk in plain text. The launcher reads an explicit
+/// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router.
+pub(crate) fn withhold_router_key(command: &mut Command) {
+    command.env_remove("RAYLINE_ROUTER_API_KEY");
 }
 
 fn toml_string(value: &str) -> String {
@@ -474,7 +485,7 @@ mod tests {
     use super::{
         CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
         EffectiveCodexAuthMode, parse_codex_version_text, resolve_cloud_router_key,
-        resolve_codex_config_path, subscription_router_config_json,
+        resolve_codex_config_path, subscription_router_config_json, withhold_router_key,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -883,6 +894,29 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sub);
+    }
+
+    /// #84: a router key in the launcher's environment must not reach Codex,
+    /// which snapshots its environment to disk for the shells it spawns.
+    #[cfg(unix)]
+    #[test]
+    fn codex_child_never_inherits_the_router_key() {
+        let var = "RAYLINE_ROUTER_API_KEY";
+        let previous = std::env::var_os(var);
+        unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
+        let mut command = std::process::Command::new("/usr/bin/env");
+        withhold_router_key(&mut command);
+        let output = command.output().expect("run env");
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            !printed.contains(var),
+            "the child environment still carries {var}"
+        );
     }
 }
 
