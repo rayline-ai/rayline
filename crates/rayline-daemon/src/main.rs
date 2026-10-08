@@ -436,11 +436,35 @@ fn tokens_per_second_before(line: &str, marker: &str) -> Option<f64> {
         .and_then(|part| part.parse::<f64>().ok())
 }
 
+/// The ports `serve` binds for routing; metrics must not take one of them.
+fn serve_data_ports(args: &ServeArgs) -> Vec<u16> {
+    let mut ports = vec![
+        args.adapter_port,
+        args.injector_port,
+        args.local_router_port,
+    ];
+    ports.extend(args.proxy_port);
+    ports
+}
+
 async fn run_serve(args: ServeArgs) -> Result<()> {
     let metrics = RouterMetrics::new("rayline-router");
     let metrics_sink: SharedMetricsSink = metrics.clone();
-    let metrics_listener = bind_metrics_control(args.metrics_port).await?;
-    spawn_metrics_control(metrics, metrics_listener);
+    // Best-effort, as in proxy mode: a metrics bind failure (another rld may
+    // hold the port) must not stop the router from serving (#82). Metrics never
+    // takes one of serve's own data ports, or the router's bind would fail.
+    let data_ports = serve_data_ports(&args);
+    if data_ports.contains(&args.metrics_port) {
+        warn!(
+            "router metrics disabled: port {} is one of this router's data ports",
+            args.metrics_port
+        );
+    } else {
+        match bind_metrics_control(args.metrics_port).await {
+            Ok(listener) => spawn_metrics_control(metrics, listener),
+            Err(error) => warn!("router metrics disabled: {error:#}"),
+        }
+    }
 
     let data_dir = args
         .data_dir
@@ -951,7 +975,13 @@ async fn handle_metrics_control(
     match (req.method().clone(), req.uri().path()) {
         (Method::GET, "/healthz") => json_response(
             StatusCode::OK,
-            serde_json::json!({"ok": true, "runtime": "rayline-router-metrics"}),
+            // The pid says which process owns this port, so a launcher can tell
+            // its own serve from another process that bound it first (#82).
+            serde_json::json!({
+                "ok": true,
+                "runtime": "rayline-router-metrics",
+                "pid": std::process::id(),
+            }),
         ),
         (Method::GET, "/v1/router/top/snapshot") => {
             json_response(StatusCode::OK, serde_json::json!(metrics.snapshot()))
@@ -1378,6 +1408,32 @@ mod tests {
         match Cli::try_parse_from(argv).unwrap().cmd {
             Cmd::Serve(args) => args,
             _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn serve_data_ports_include_every_routing_port() {
+        // #82: metrics must not bind a port serve needs for routing.
+        let bin = RAYLINE_DAEMON_BIN_NAME;
+        let args = parse_serve(&[
+            bin,
+            "serve",
+            "--model-repo",
+            "r",
+            "--model-file",
+            "f.gguf",
+            "--adapter-port",
+            "21001",
+            "--injector-port",
+            "21002",
+            "--local-router-port",
+            "21003",
+            "--proxy-port",
+            "21004",
+        ]);
+        let ports = serve_data_ports(&args);
+        for port in [21001, 21002, 21003, 21004] {
+            assert!(ports.contains(&port), "{port} is missing from {ports:?}");
         }
     }
 
