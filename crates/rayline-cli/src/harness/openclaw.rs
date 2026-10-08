@@ -1,5 +1,6 @@
 //! OpenClaw: `OPENCLAW_CONFIG_PATH=<dir>/openclaw.json` (state stays in the
-//! user's `~/.openclaw`). `${VAR}` is OpenClaw's config substitution.
+//! user's `~/.openclaw`). `${VAR}` is OpenClaw's config substitution; the API
+//! key is an env SecretRef instead, so OpenClaw never caches its value (#83).
 //!
 //! `api` must be explicit: OpenClaw's default is chat completions, which 404s
 //! at the gateway. Memory search is off because its default embeddings
@@ -149,7 +150,11 @@ pub(crate) fn stable_conversation_id(session_id: &str) -> String {
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    let api_key = format!("${{{KEY_ENV}}}");
+    // A structured env SecretRef, not the `${VAR}` shorthand: OpenClaw resolves
+    // a `${VAR}` string while loading the config and then writes the resolved
+    // value into its agent model cache (`agents/<id>/agent/models.json`). For a
+    // SecretRef it writes only the variable's name there (#83).
+    let api_key = json!({ "source": "env", "provider": "default", "id": KEY_ENV });
     let conv_ref = format!("${{{CONV_ID_ENV}}}");
     // No native session id on Messages (see the module docs).
     let messages_headers = ctx.conversation_headers_for(&conv_ref, false);
@@ -229,7 +234,9 @@ mod tests {
         assert_eq!(config["models"]["mode"], "merge");
         assert_eq!(provider["baseUrl"], TEST_URL);
         assert_eq!(provider["api"], "anthropic-messages");
-        assert_eq!(provider["apiKey"], "${RAYLINE_KEY}");
+        let key_ref =
+            serde_json::json!({ "source": "env", "provider": "default", "id": "RAYLINE_KEY" });
+        assert_eq!(provider["apiKey"], key_ref);
         // dev: Messages still carries the per-launch id, Responses does not.
         assert_eq!(
             provider["headers"],
@@ -242,7 +249,7 @@ mod tests {
         let responses = &config["models"]["providers"]["rayline-resp"];
         assert_eq!(responses["baseUrl"], format!("{TEST_URL}/v1"));
         assert_eq!(responses["api"], "openai-responses");
-        assert_eq!(responses["apiKey"], "${RAYLINE_KEY}");
+        assert_eq!(responses["apiKey"], key_ref);
         assert_eq!(responses["headers"], serde_json::json!({}));
         assert_eq!(responses["models"][0]["id"], "rayline-router");
         assert_eq!(

@@ -153,6 +153,24 @@ rayline router top
 rayline router stop
 ```
 
+## OpenClaw
+
+`rayline openclaw` runs OpenClaw against the Rayline router with a generated
+config. It gives the router key to OpenClaw as an environment SecretRef, so the
+key stays out of OpenClaw's files.
+
+If you configure OpenClaw by hand, do the same. Write the provider's `apiKey`
+as a SecretRef object, not as the `${VAR}` shorthand:
+
+```json
+"apiKey": { "source": "env", "provider": "default", "id": "RAYLINE_KEY" }
+```
+
+OpenClaw resolves a `${RAYLINE_KEY}` string when it loads the config, and then
+writes the resolved key into its agent model cache
+(`~/.openclaw/agents/<agent>/agent/models.json`) in plain text. For a SecretRef
+it writes only the variable's name there.
+
 ## Choosing Where Requests Go
 
 Routing comes down to three independent flags on `rayline claude`. You'll rarely
