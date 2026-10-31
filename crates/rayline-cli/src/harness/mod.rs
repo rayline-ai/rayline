@@ -19,9 +19,9 @@
 //! `maxTokens` 32000 against the hosted router. The main agent defaults to ARC
 //! Sage (`arc-sage-1.0`) and, where the harness has a separate
 //! small/background model role, that role to ARC Swift (`arc-swift-1.0`); each
-//! provider also lists the Legacy Rules Router (`rayline-router`), which the
-//! harness's own model picker or flag selects ([`LaunchModels`]). Under
-//! `raydock hybrid run` every renderer keeps `rayline-router` (the execution
+//! provider except hosted omp also lists the Legacy Rules Router
+//! (`rayline-router`), selected through the harness's model picker or flag.
+//! Under `raydock hybrid run` every renderer keeps `rayline-router` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
 //! output than the execution core admits has every turn refused.

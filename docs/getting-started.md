@@ -44,6 +44,104 @@ raydock router stop                  # stop it when done
 See [examples/cloud](../examples/cloud) and [examples/local](../examples/local)
 for runnable Python and TypeScript clients.
 
+## oh-my-pi (omp)
+
+Install [oh-my-pi](https://github.com/can1357/oh-my-pi#install), then launch it
+through Raydock:
+
+```bash
+raydock omp
+```
+
+On first use, Raydock signs you into Rayline and provisions the hosted router
+key. No provider YAML, exported API key, local inference server, or proxy setup
+is required. Requests go to **Rayline Platform in the cloud** and are billed to
+your Rayline account, not an Anthropic subscription.
+
+The launcher registers a custom **`rayline` provider** over Anthropic Messages
+with `auth: apiKey`; it does not impersonate Anthropic or Claude Code. The
+default, slow, and plan roles use **ARC Sage**; smol uses **ARC Swift**. These
+are role assignments, not measured speed or intelligence rankings. ARC chooses
+the underlying model and reasoning effort for each request.
+
+### Choose a model and resume
+
+Use omp's model picker, or select a model for one launch:
+
+```bash
+raydock omp --model rayline/arc-swift-1.0
+raydock omp --continue
+```
+
+Role choices saved in omp survive later launches. With omp **18.1.10 or newer**,
+its native session ID also keeps the routing episode together when resuming;
+upgrade if Raydock warns about an older version.
+
+### What the picker shows
+
+Raydock supplies the ARC fixed rates in USD per million tokens:
+
+| Model | Input | Output | Cache read | Cache write |
+| --- | ---: | ---: | ---: | ---: |
+| ARC Sage | $1 | $5 | $0.05 | $1.25 |
+| ARC Swift | $0.05 | $0.25 | $0.005 | $0.0625 |
+
+These are effective card 26 (2026-10-27). See
+[current ARC pricing](https://docs.rayline.ai/arc/pricing) and check
+[Rayline Usage](https://platform.rayline.ai) for actual charges. omp's local
+cost estimates use the rate card bundled with your Raydock release.
+
+Hosted ARC entries advertise text input, a 200,000-token context window and
+the launcher's existing 32,000-token output budget. The output budget is a
+client setting, not a guarantee that every routed model can produce that many
+tokens. Client-controlled thinking is disabled because ARC selects effort.
+Intelligence and speed columns may be empty: no benchmark scores are supplied,
+and speed measurements depend on omp and the requests actually served.
+
+The hosted omp picker lists only **ARC Sage** and **ARC Swift**. The old
+`rayline-router` Legacy model is no longer offered. Hybrid routing is separate:
+its execution core still uses `rayline-router` as an active virtual model.
+Hybrid has no single ARC tier rate; if omp displays it as free, use your
+upstream billing records instead. Hybrid runtime capabilities are unchanged.
+
+### Configuration and troubleshooting
+
+Raydock keeps its isolated omp configuration and sessions under
+`~/.config/rayline/harness/omp/<environment>/` (`prod` by default):
+
+- `models.yml` is managed by Raydock and refreshed on every launch, including
+  pricing corrections. Do not edit it for persistent customizations.
+- `config.yml` is seeded once; your saved role choices are preserved. An
+  untouched old Legacy-only seed is migrated to ARC.
+- The generated key is stored in owner-only configuration, not exported to
+  omp's tool subprocesses. Do not share the generated file.
+- `OMP_PROFILE`, `PI_PROFILE`, and `CLAUDE_CONFIG_DIR` are removed from the
+  launched child's environment so another profile does not override this setup.
+  Your calling shell is unchanged.
+
+If ARC still appears free, update Raydock and **restart through `raydock omp`**.
+To inspect the generated metadata without sending an inference request:
+
+```bash
+raydock omp models rayline --json --no-extensions
+```
+
+Sage should report input/output costs of `1`/`5`; Swift `0.05`/`0.25`.
+If another model is selected, check explicit CLI flags and project overrides.
+For your usual non-Rayline configuration, launch `omp` normally outside the
+Raydock-managed environment.
+
+### Manual direct API configuration
+
+Prefer the launcher unless you need to own the provider configuration.
+Follow the [direct API guide](https://docs.rayline.ai/tools/omp) in a separate
+configuration directory, using `api: anthropic-messages`, `auth: apiKey`,
+`baseUrl: https://api.rayline.ai` (no `/v1`), and an environment-variable
+**name** such as `RAYLINE_API_KEY` for `apiKey`. Include the four `cost` fields
+above for each ARC model; omitted costs can appear free in omp. Keep credentials
+out of project files. The guide's 2,048-token example is a response budget,
+not the launcher's output setting.
+
 ## Codex CLI And App
 
 Rayline can also expose a local OpenAI Responses-compatible endpoint for Codex.
@@ -259,12 +357,12 @@ harness gives them their own model setting:
 | `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` | `--model rayline-router`, or set the route models in `router.json` to `rayline-router` |
 | `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | `-m rayline/rayline-router` |
 | `raydock pi` | `arc-sage-1.0` | — | `--model rayline/rayline-router`, or pi's model picker |
-| `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | pick `rayline/rayline-router` for a role |
+| `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | Not offered |
 | `raydock hermes` | `arc-sage-1.0` | — | `--model rayline-router` (per run) |
 | `raydock openclaw` | `arc-sage-1.0` | — | switch the session's model to `rayline/rayline-router` (per run) |
 
-Each generated harness config lists all three models, so the harness's own
-picker offers ARC Sage, ARC Swift and the Legacy Rules Router. A model you set
+Hosted omp lists only ARC Sage and ARC Swift; the other generated harness
+configs also list the Legacy Rules Router. A model you set
 yourself is kept: `--model` (before or after `--`) or `ANTHROPIC_MODEL` for
 Claude Code (subagents then inherit it, as before), a cloud-only `--config`'s
 `routes.main` and `routes.subagent` models (with `--route all`; without a
